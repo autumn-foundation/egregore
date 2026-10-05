@@ -10,6 +10,9 @@ pub mod accuracy;
 pub mod adapters;
 /// Antigravity transcript JSONL importer.
 pub mod antigravity;
+/// Criterion benchmark capture as verification-domain `BenchmarkRun` records
+/// (issue #237).
+pub mod bench_capture;
 /// Evidence bundle export, verification, and inspection (issue #68).
 pub mod bundle;
 /// Citation-completeness audit over public query workflows (issue #65).
@@ -20,6 +23,9 @@ pub mod claude_code;
 pub mod cli;
 /// Codex session/rollout JSONL importer (M3 agent-memory source).
 pub mod codex;
+/// Capture `cargo llvm-cov` runs as citable verification-domain
+/// `CoverageReport` records (issue #230).
+pub mod coverage_capture;
 /// Owning-Cargo-package attribution for code-graph facts (issue #117).
 pub mod crate_attribution;
 /// Acceptance-criterion verification-coverage census (issue #115).
@@ -29,8 +35,13 @@ pub mod criteria_coverage;
 pub mod daemon;
 /// Decision record generation for user-context candidates.
 pub mod decide;
+/// Design-doc (ADR/PRD/Plan) markdown importer (issue #149).
+pub mod doc_ingest;
 /// Semantic enrichment and embedding boundaries.
 pub mod embeddings;
+/// Encrypted local store mode (issue #54).
+#[cfg(feature = "embedded-aletheiadb")]
+pub mod encrypted_store;
 /// Error and result types.
 pub mod error;
 /// Typed evidence write workflows for observations, command evidence, artifacts, and verification.
@@ -78,22 +89,45 @@ pub mod manifest_deps;
 /// MCP server exposing read-only evidence-query tools (issue #53).
 #[cfg(feature = "embedded-aletheiadb")]
 pub mod mcp;
+/// Frozen MCP tool I/O contract: versioned schemas for the `eg mcp` tool
+/// payloads (issue #194).
+#[cfg(feature = "embedded-aletheiadb")]
+pub mod mcp_contract;
+/// Store-wide agent-memory evidence health sweep (issue #185).
+///
+/// Per-link `resolves_live`/`drifted`/`dangling` classification plus
+/// denormalized-array vs stored-edge integrity violations.
+pub mod memory_evidence_health;
 /// Agent-memory health report to flag reviewability risk (issue #94).
 pub mod memory_health;
 /// Agent-memory recall evaluation harness (issue #91).
 pub mod memory_recall_eval;
+/// Agent-memory record retirement from recall (issue #156).
+pub mod memory_retire;
 /// Parser orchestration.
 pub mod parser;
 /// Local setup preflight report for the `eg doctor` command (issue #75).
 pub mod preflight;
+/// Checked-in per-repo project configuration — `egregore.toml` (issue #261).
+pub mod project_config;
+/// Capture a local Verus proof run as citable `ProofResult` + `CommandRun`
+/// records (issue #69).
+pub mod proof_capture;
 /// Protected raw-artifact capture and retrieval (issue #60).
 pub mod protected;
 /// Agent-facing graph query helpers.
 pub mod query;
+/// Structural query latency budget and scaling regression gate (issue #120).
+pub mod query_budget;
+/// Cold query-latency budget measurement for time-to-first-symbol-answer (issue #255).
+pub mod query_latency;
 /// Redaction policy engine (`docs/schema/redaction.md` v1).
 pub mod redaction;
 /// At-import redaction report (issue #266).
 pub mod redaction_report;
+/// In-place re-embedding of an `--embed` store under a new local model (issue #167).
+#[cfg(feature = "embeddings")]
+pub mod reembed;
 /// Offline repair workflow for Egregore stores (issue #49).
 #[cfg(feature = "embedded-aletheiadb")]
 pub mod repair;
@@ -103,12 +137,20 @@ pub mod repo_evict;
 pub mod review_coverage;
 /// Commit-time schema-constraint evaluation and declaration (issue #486).
 pub mod schema_constraints;
+/// JSON Schema (draft 2020-12) export for persisted record contracts (issue #226).
+pub mod schema_export;
 /// Record schema-version compatibility checks.
 pub mod schema_version;
 /// SCIP code-intelligence export (issue #233).
 pub mod scip;
+/// Calibrated confidence floor and abstention for semantic search (issue #263).
+pub mod semantic_confidence;
 /// Semantic search relevance evaluation harness (issue #58).
 pub mod semantic_eval;
+/// Write-time supersession / contradiction authoring for `eg write observation` (issue #184).
+pub mod supersede_write;
+/// Time-to-first-citable-answer product gate (issue #57).
+pub mod symbol_latency;
 /// Transitive memory supersession and contradiction resolution (issue #92).
 pub mod temporal_status;
 /// Capture `cargo test` / libtest JSON runs as citable `TestRun` records (issue #165).
@@ -121,8 +163,12 @@ pub mod traj;
 pub mod validate;
 /// Evidence-freshness verdicts for verification records (issue #111).
 pub mod verification_freshness;
+/// Byte-for-byte scan reproducibility comparison (issue #239).
+pub mod verify_scan;
 /// Transcripts watcher.
 pub mod watch;
+/// Read-only working-tree diff computation for diff-scoped briefings (issue #214).
+pub mod worktree_diff;
 
 use std::{collections::BTreeMap, path::Path, sync::LazyLock};
 
@@ -131,7 +177,12 @@ pub use claude_code::import_claude_code;
 pub use codex::import_codex;
 pub use decide::{DecideRequest, decide_candidate};
 pub use error::{CodegraphError, Result};
-pub use history::{scan_repository_history, scan_repository_history_with_override};
+pub use history::{
+    HistoryResumeOutcome, HistoryResumePoint, HistoryWindow, history_replay_tip_id,
+    history_replay_tip_repository_ids, history_resume_point, scan_repository_history,
+    scan_repository_history_resumed, scan_repository_history_with_override,
+    scan_repository_history_with_window,
+};
 pub use ir::{
     AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, CallResolution,
     DependencyDeclarationPayload, Domain, EdgeLabel, EgregoreGit, EmbeddingModel,
@@ -141,18 +192,19 @@ pub use ir::{
     PatchHandle, Producer, ProducerKind, RepositoryIdentityPayload, SCHEMA_VERSION,
     SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE, SEMANTIC_SCHEMA_VERSION, ScanCoveragePayload,
     SelectionBasis, SemanticDriftMetadata, SnapshotHead, SourceSnapshotPayload, SourceSpan,
-    TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION, UserContextFields, UserContextScope,
+    SymbolRole, TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION, UserContextFields, UserContextScope,
     VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id, artifact_stable_id, log_stable_id,
     project_stable_id, semantic_stable_id, stable_id, user_context_stable_id,
     verification_stable_id,
 };
 pub use local_project::import_local_tasks;
 pub use query::{
-    ChangesContext, ChangesError, PublicApiDeltas, PublicApiDeltasOptions, RangeDeltas,
-    RangeDeltasError, RepositoryIndex, RepositorySelectorError, SubsystemContext,
-    SubsystemPrefixError, SymbolContext, UnresolvedRef, active_policy, audit_trail,
-    changes_context, is_candidate_suppressed, path_is_under_prefix, pending_candidates,
-    public_api_deltas, range_deltas, subsystem_context, symbol_context,
+    ChangesContext, ChangesError, PolicyEntry, PolicyStatus, PublicApiDeltas,
+    PublicApiDeltasOptions, RangeDeltas, RangeDeltasError, RepositoryIndex,
+    RepositorySelectorError, SubsystemContext, SubsystemPrefixError, SymbolContext, UnresolvedRef,
+    active_policy, audit_trail, changes_context, is_candidate_suppressed, path_glob_matches,
+    path_is_under_prefix, pending_candidates, policy_for_anchor, policy_scope_applies,
+    policy_scope_for_record, public_api_deltas, range_deltas, subsystem_context, symbol_context,
 };
 pub use schema_version::{
     RecordLineRead, RecordReadError, RecordVersion, UNKNOWN_SCHEMA_VERSION_CODE,
@@ -217,6 +269,7 @@ pub fn scan_repository_with_override(
         repo_id_override,
         &[],
         Some(&generation),
+        None,
     )
 }
 
@@ -244,6 +297,7 @@ pub fn scan_repository_with_exclusions(
         repo_id_override,
         snapshot_exclusions,
         Some(&generation),
+        None,
     )
 }
 
@@ -260,8 +314,47 @@ pub fn scan_repository_at_with_override(
 ) -> Result<Graph> {
     // Explicit-time entry (fixed-timestamp callers such as tests and audit):
     // derive `coverage_generation` from `transaction_time` for deterministic,
-    // byte-identical output across re-runs with the same override (issue #406).
-    scan_repository_at_with_override_inner(repo_path, transaction_time, repo_id_override, &[], None)
+    // byte-identical output across re-runs with the same override (issue #406),
+    // and stamp `producer_started_at` with the pinned time so no wall-clock
+    // instant leaks into a time-pinned scan (issue #261).
+    scan_repository_at_with_override_inner(
+        repo_path,
+        transaction_time,
+        repo_id_override,
+        &[],
+        None,
+        Some(transaction_time),
+    )
+}
+
+/// Like [`scan_repository_at_with_override`] but excludes repo-relative paths
+/// from the dirty probe when stamping the snapshot.
+///
+/// This is the entry point the `eg scan` CLI uses when `egregore.toml` pins
+/// `scan.transaction_time` (issue #261): the pinned instant governs the
+/// transaction time, the coverage-generation stamp, and `producer_started_at`,
+/// so two runs sharing the checked-in config produce byte-for-byte identical
+/// graph JSONL. With no pin the CLI keeps using
+/// [`scan_repository_with_exclusions`] (wall-clock), which is unchanged.
+///
+/// # Errors
+///
+/// Returns an error when the repository path is missing, is not a directory, or
+/// source discovery cannot read the filesystem.
+pub fn scan_repository_at_with_exclusions(
+    repo_path: impl AsRef<Path>,
+    transaction_time: &str,
+    repo_id_override: Option<&str>,
+    snapshot_exclusions: &[String],
+) -> Result<Graph> {
+    scan_repository_at_with_override_inner(
+        repo_path,
+        transaction_time,
+        repo_id_override,
+        snapshot_exclusions,
+        None,
+        Some(transaction_time),
+    )
 }
 
 fn scan_repository_at_with_override_inner(
@@ -270,6 +363,7 @@ fn scan_repository_at_with_override_inner(
     repo_id_override: Option<&str>,
     snapshot_exclusions: &[String],
     coverage_generation: Option<&str>,
+    producer_started_at: Option<&str>,
 ) -> Result<Graph> {
     LazyLock::force(&PROCESS_STARTED_AT);
     let repo_root = repo_path.as_ref();
@@ -305,7 +399,7 @@ fn scan_repository_at_with_override_inner(
                     graph.push(record.with_valid_time_inferred(transaction_time));
                 }
                 if !facts.is_empty() {
-                    facts_by_file.insert(source_file.repo_relative_path.clone(), facts);
+                    facts_by_file.insert(source_file.repo_relative_path.clone(), *facts);
                 }
             }
             // A non-UTF-8 or unreadable file is skipped (issue #438): record its
@@ -337,6 +431,33 @@ fn scan_repository_at_with_override_inner(
     {
         graph.push(record.with_valid_time_inferred(transaction_time));
     }
+    // Repo-wide macro-invocation resolution (issue #148): each
+    // `macro_invocation` site resolves against the repo-wide pool of
+    // `macro_rules!` definitions. A unique match mints a resolved `CALLS`
+    // edge from the invoking scope to the macro symbol; anything else keeps
+    // the pre-existing `unsupported macro invocation` Diagnostic.
+    for record in languages::cross_file::cross_file_macro_records(&repository_id, &facts_by_file) {
+        graph.push(record.with_valid_time_inferred(transaction_time));
+    }
+    // Declared Cargo manifests, harvested BEFORE the import-target pass: the
+    // pass resolves absolute `<crate_name>::…` imports against owning-package
+    // names. Harvesting is a pure function of the repo root, so moving it
+    // ahead of the dependency scan changes nothing downstream.
+    let manifest_facts = manifest_deps::scan_manifest_package_facts(repo_root)?;
+    let attribution = crate_attribution::CrateAttributionIndex::from_facts(manifest_facts);
+    // Inbound IMPORTS edges to imported Module/File targets (issue #444):
+    // each resolvable Rust `use` mints `File —IMPORTS→ Module|File` from the
+    // importing file to the imported module, so "who imports module X" is
+    // traversable without `jq` over the JSONL. Fail-closed: unresolvable
+    // imports mint no edge.
+    for record in languages::cross_file::cross_file_import_target_edges(
+        &repository_id,
+        graph.records(),
+        &facts_by_file,
+        &attribution,
+    ) {
+        graph.push(record.with_valid_time_inferred(transaction_time));
+    }
     // Same-file resolution labeling (issue #134): stamp per-file CALLS edges
     // backed by Tree-sitter call sites with the shared resolution status.
     languages::cross_file::label_same_file_call_resolutions(graph.records_mut(), &facts_by_file);
@@ -344,6 +465,17 @@ fn scan_repository_at_with_override_inner(
     // module file is extracted with no view of the gating attribute, so the
     // repo-wide pass rewrites its panic-risk sites to test context.
     languages::cross_file::apply_out_of_line_test_scope(graph.records_mut(), &facts_by_file);
+    // Out-of-line `#[cfg(test)] mod x;` File-role stamping (issue #238):
+    // the module file's path-derived `Production` role is upgraded to `Test`
+    // by the same test-only-module resolution. Roles are re-stamped on every
+    // scan, never cached.
+    languages::cross_file::apply_out_of_line_test_roles(graph.records_mut(), &facts_by_file);
+    // Out-of-line `#[cfg(...)] mod x;` gate propagation (issue #190): the
+    // module file is extracted with no view of the gating attribute, so the
+    // repo-wide pass prepends each declaration's gate chain to every
+    // File/Symbol/Module record of the target file. Recomputed every scan,
+    // never cached; the stamping is idempotent.
+    languages::cross_file::apply_out_of_line_cfg_gates(graph.records_mut(), &facts_by_file);
 
     // Declared Cargo dependencies (issue #180): every manifest's directly-
     // declared dependencies become deterministic, citable graph facts joined
@@ -360,9 +492,8 @@ fn scan_repository_at_with_override_inner(
     // must see EVERY `File`-producing extractor's output — per-file source
     // extraction above and manifest extraction just now — the same ordering
     // constraint `reconcile_scan_coverage` was placed for. Attribution is never
-    // an identity input, so no record ID moves.
-    let manifest_facts = manifest_deps::scan_manifest_package_facts(repo_root)?;
-    let attribution = crate_attribution::CrateAttributionIndex::from_facts(manifest_facts);
+    // an identity input, so no record ID moves. The index was built above for
+    // the import-target pass; only the stamping runs here.
     crate_attribution::apply_crate_attribution(graph.records_mut(), &attribution);
 
     // Scan-coverage reconciliation (issue #135): finalize the tally against the
@@ -387,7 +518,15 @@ fn scan_repository_at_with_override_inner(
     }
 
     let languages = languages_in_graph(&graph);
-    Ok(graph.stamp_producer(&code_graph_producer(&languages)))
+    // A pinned transaction time also pins `producer_started_at` (issue #261):
+    // an explicit-time scan is a deterministic operation, so stamping
+    // wall-clock here would leak a per-run instant into the JSONL. Wall-clock
+    // scans (no pin) keep the historical `PROCESS_STARTED_AT` behavior.
+    let mut producer = code_graph_producer(&languages);
+    if let Some(pinned) = producer_started_at {
+        pinned.clone_into(&mut producer.producer_started_at);
+    }
+    Ok(graph.stamp_producer(&producer))
 }
 
 /// Wall-clock time captured at the start of the first scan in this process.
@@ -617,10 +756,12 @@ pub(crate) fn scan_coverage_records(
 /// carrying a deterministic `Diagnostic` node and the accounting the caller
 /// threads into scan coverage so the file is honestly counted UNINDEXED.
 pub(crate) enum SourceFileScanOutcome {
-    /// The file decoded and extracted normally.
+    /// The file decoded and extracted normally. `facts` is boxed so the
+    /// large [`FileFacts`] struct does not bloat the enum variant (the same
+    /// boxing the `Skipped` variant already applies to its diagnostic node).
     Extracted {
         records: Vec<GraphRecord>,
-        facts: languages::cross_file::FileFacts,
+        facts: Box<languages::cross_file::FileFacts>,
     },
     /// The file was skipped (non-UTF-8 or unreadable). `diagnostic` names the
     /// repo-relative path and the fixed decode/read-failure reason;
@@ -720,7 +861,53 @@ pub(crate) fn scan_source_file_records(
         });
     };
     let (records, facts) = scan_source_text_records(source_file, source, repository_id)?;
-    Ok(SourceFileScanOutcome::Extracted { records, facts })
+    Ok(SourceFileScanOutcome::Extracted {
+        records,
+        facts: Box::new(facts),
+    })
+}
+
+/// Derives the path-signal test-vs-production role for a `File` record
+/// (issue #238 signal c): `Test` when the repo-relative path's first segment
+/// is `tests` or `benches` (Cargo's integration-test and bench roots),
+/// `Production` otherwise. Segment comparison is separator-agnostic, so `\`
+/// checkouts classify identically to `/` ones.
+fn file_role_for_path(repo_relative_path: &str) -> SymbolRole {
+    let is_test_root = languages::common::path_segments(repo_relative_path)
+        .first()
+        .is_some_and(|segment| segment == "tests" || segment == "benches");
+    if is_test_root {
+        SymbolRole::Test
+    } else {
+        SymbolRole::Production
+    }
+}
+
+/// Whole-file [`SourceSpan`] minted on the `File` node (issue #212): the file's
+/// true line count, so positional queries report `line_out_of_range` against
+/// the file's actual last line instead of the last recorded symbol span.
+///
+/// Line counting follows `str::lines` semantics — a trailing newline does not
+/// create an extra line, and lone trailing blank lines do count. An empty file
+/// yields a degenerate zero-length span with `end_line == 0`, so every
+/// positive line is out of range for it. The span covers the LF-normalized
+/// source the extractor parses, keeping the count identical across CRLF/LF
+/// checkouts (issue #242).
+fn whole_file_span(source: &str) -> SourceSpan {
+    let mut line_count = 0usize;
+    let mut last_line_len = 0usize;
+    for line in source.lines() {
+        line_count += 1;
+        last_line_len = line.len();
+    }
+    SourceSpan {
+        start_byte: 0,
+        end_byte: source.len(),
+        start_line: 1,
+        end_line: line_count,
+        start_column: Some(0),
+        end_column: Some(last_line_len),
+    }
 }
 
 pub(crate) fn scan_source_text_records(
@@ -728,7 +915,13 @@ pub(crate) fn scan_source_text_records(
     source: &str,
     repository_id: &str,
 ) -> Result<(Vec<GraphRecord>, languages::cross_file::FileFacts)> {
-    let source_lf = source.replace("\r\n", "\n");
+    // Normalize line endings at the scan funnel (issue #242): CRLF and lone
+    // CR both become LF up front so the File-node summary text below is
+    // canonical, and the parse boundary (`extract_file_source`) normalizes
+    // idempotently again before Tree-sitter. A CRLF checkout and an LF
+    // checkout of the same commit therefore yield byte-identical spans,
+    // symbol text, signatures, summaries, and content hashes.
+    let source_lf = languages::normalize_line_endings(source);
     let source = &source_lf;
     let mut graph = Graph::new();
     let repo_relative_path = source_file.repo_relative_path.clone();
@@ -742,20 +935,43 @@ pub(crate) fn scan_source_text_records(
         }
         languages::Language::Go => crate::languages::go::normalize_file_code(source),
     };
-    graph.push(GraphRecord::node(
-        file_id.clone(),
-        NodeKind::File,
-        Some(repo_relative_path.clone()),
-        None,
-        Some(repo_relative_path.clone()),
-        format!(
-            "{} source file {repo_relative_path}\nSource:\n{normalized}",
-            language.display_name()
-        ),
-    ));
+    graph.push(
+        GraphRecord::node(
+            file_id.clone(),
+            NodeKind::File,
+            Some(repo_relative_path.clone()),
+            Some(whole_file_span(source)),
+            Some(repo_relative_path.clone()),
+            format!(
+                "{} source file {repo_relative_path}\nSource:\n{normalized}",
+                language.display_name()
+            ),
+        )
+        // Test-vs-production role, path signal (issue #238 signal c): a file
+        // under a top-level `tests/` or `benches/` root is test, everything else
+        // production. Out-of-line `#[cfg(test)] mod x;` targets are upgraded to
+        // test by the repo-wide `apply_out_of_line_test_roles` pass, which runs
+        // after all files are extracted.
+        .with_role(file_role_for_path(&repo_relative_path)),
+    );
     parser::add_repository_file_edge(&mut graph, repository_id, &file_id);
     let facts =
         parser::extract_source_text(source_file, source, &file_id, repository_id, &mut graph)?;
+    // Conditional-compilation gates on the `File` node (issue #190): the
+    // extractor exported the file's `#![cfg(...)]` / `#![cfg_attr(...)]`
+    // inner-attribute gates on `FileFacts`; stamp them on the File node
+    // emitted above so the file's own record carries the same gate every
+    // symbol in it inherits. The File node is the first record this funnel
+    // pushes, found by its stable id. Additive, never an identity input.
+    if !facts.file_cfg_gates.is_empty()
+        && let Some(file_record) = graph
+            .records_mut()
+            .iter_mut()
+            .find(|record| record.id() == file_id)
+    {
+        let stamped = file_record.clone().with_cfg(facts.file_cfg_gates.clone());
+        *file_record = stamped;
+    }
     Ok((graph.records().to_vec(), facts))
 }
 
@@ -788,9 +1004,53 @@ pub(crate) fn normalize_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        GraphRecord, NodeKind, SourceFileScanOutcome, fs::SourceFile, scan_source_file_records,
+        GraphRecord, NodeKind, SourceFileScanOutcome, SymbolRole, file_role_for_path,
+        fs::SourceFile, scan_source_file_records,
     };
 
+    /// Issue #238: `File` path-signal roles classify `tests/` and `benches/`
+    /// roots as test, everything else as production, on either separator.
+    #[test]
+    fn file_role_for_path_classifies_test_roots() {
+        assert_eq!(file_role_for_path("tests/integration.rs"), SymbolRole::Test);
+        assert_eq!(file_role_for_path("benches/bench.rs"), SymbolRole::Test);
+        assert_eq!(
+            file_role_for_path("tests\\integration.rs"),
+            SymbolRole::Test
+        );
+        assert_eq!(file_role_for_path("benches\\bench.rs"), SymbolRole::Test);
+        assert_eq!(file_role_for_path("src/lib.rs"), SymbolRole::Production);
+        assert_eq!(file_role_for_path("src\\lib.rs"), SymbolRole::Production);
+        // A mere prefix is not a root: `testing/` is production.
+        assert_eq!(file_role_for_path("testing/foo.rs"), SymbolRole::Production);
+    }
+
+    /// Issue #212: the `File` node's whole-file span reports the file's true
+    /// line count — `str::lines` semantics, so a trailing newline adds no
+    /// extra line, while trailing blank lines do count. An empty file yields
+    /// the degenerate zero-length span (`end_line == 0`).
+    #[test]
+    fn whole_file_span_counts_lines_like_str_lines() {
+        let span = super::whole_file_span("a\nb\nc");
+        assert_eq!((span.start_line, span.end_line), (1, 3));
+        assert_eq!((span.start_byte, span.end_byte), (0, 5));
+        assert_eq!(span.end_column, Some(1));
+
+        // Trailing newline: still 3 lines, not 4.
+        let span = super::whole_file_span("a\nb\nc\n");
+        assert_eq!((span.start_line, span.end_line), (1, 3));
+        assert_eq!((span.start_byte, span.end_byte), (0, 6));
+
+        // Trailing blank lines count.
+        let span = super::whole_file_span("a\n\n");
+        assert_eq!((span.start_line, span.end_line), (1, 2));
+        assert_eq!(span.end_column, Some(0));
+
+        // Empty file: degenerate span, every positive line out of range.
+        let span = super::whole_file_span("");
+        assert_eq!((span.start_line, span.end_line), (1, 0));
+        assert_eq!((span.start_byte, span.end_byte), (0, 0));
+    }
     /// Issue #438: an unreadable source file (here the reader is pointed at a
     /// directory, so `std::fs::read` returns an io error deterministically and
     /// without permission games) yields a `Skipped` outcome carrying an

@@ -61,7 +61,7 @@ same input is byte-identical.
    | `DEFINES` | `Symbol` |
    | `CONTAINS` | `File`, `Module`, `Commit`, `Change`, `PanicRiskSite`, `DebtMarker` (issue #218 debt-comment markers) |
    | `CALLS`, `MENTIONS` | `Symbol`, `Diagnostic` (unresolved-call markers) |
-   | `IMPORTS` | `Import` |
+   | `IMPORTS` | `Import` (containment shape), `Module`/`File` (issue #444 import-target shape) |
    | `FINGERPRINTED_AS` | `ErrorSignature` (issue #319 log domain) |
    | `CAPTURED_FROM` | `LogSource` |
    | `AGGREGATES` | `ErrorSignature` |

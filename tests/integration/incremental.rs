@@ -3,7 +3,7 @@
 use std::fs;
 
 use aletheia_egregore::incremental::{scan_repository_incremental, scan_repository_incremental_at};
-use aletheia_egregore::{GraphRecord, NodeKind, SCHEMA_VERSION, SourceSpan, stable_id};
+use aletheia_egregore::{EdgeLabel, GraphRecord, NodeKind, SCHEMA_VERSION, SourceSpan, stable_id};
 
 #[test]
 fn incremental_reuses_unchanged_files_and_tombstones_removed_files() {
@@ -79,6 +79,8 @@ fn incremental_ignores_old_cache_when_extractor_output_schema_changes() {
             end_byte: 28,
             start_line: 1,
             end_line: 1,
+            start_column: None,
+            end_column: None,
         },
         "bar".to_owned(),
         "Rust function bar".to_owned(),
@@ -364,4 +366,75 @@ fn incremental_tombstones_stale_repository_when_identity_changes() {
         )),
         "must emit a tombstone for the stale Repository node when identity changes"
     );
+}
+
+/// Issue #444: the import-target pass folds into the same recomputed
+/// cross-file record stream as CALLS/IMPLEMENTS, so removing an import must
+/// tombstone its `File —IMPORTS→ Module|File` edge on the next incremental
+/// scan instead of leaving it live.
+#[test]
+fn incremental_tombstones_stale_import_target_edges() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    let src = repo.join("src");
+    fs::create_dir_all(&src).expect("fixture src dir should be created");
+    fs::write(src.join("lib.rs"), "pub mod b;\n").expect("fixture should write");
+    fs::write(src.join("b.rs"), "pub fn f() {}\n").expect("fixture should write");
+    let consumer = src.join("consumer.rs");
+    fs::write(&consumer, "use crate::b;\n").expect("fixture should write");
+    let cache_path = temp.path().join("codegraph-cache.json");
+
+    let first = scan_repository_incremental(&repo, &cache_path).expect("first scan should work");
+    let first_target_edges = import_target_edge_ids(first.graph.records());
+    assert_eq!(
+        first_target_edges.len(),
+        1,
+        "the first scan should mint exactly one import-target edge"
+    );
+    let edge_id = &first_target_edges[0];
+
+    // Remove the import; the next incremental scan must retire the edge.
+    fs::write(&consumer, "pub fn no_imports_here() {}\n").expect("fixture should rewrite");
+    let second = scan_repository_incremental(&repo, &cache_path).expect("second scan should work");
+
+    assert!(
+        second.graph.records().iter().any(
+            |record| matches!(record, GraphRecord::Tombstone { deleted_id, .. } if deleted_id == edge_id)
+        ),
+        "removing the import must tombstone its import-target edge"
+    );
+    assert!(
+        !import_target_edge_ids(second.graph.records()).contains(edge_id),
+        "the tombstoned edge must not be re-emitted as live"
+    );
+}
+
+/// The target-side IMPORTS edges the issue-#444 pass mints: an `IMPORTS` edge
+/// whose target is a Module/File node. The extractor's containment-shaped
+/// `File —IMPORTS→ Import` edges (target kind `Import`) are excluded.
+fn import_target_edge_ids(records: &[GraphRecord]) -> Vec<String> {
+    let node_kind: std::collections::BTreeMap<&str, NodeKind> = records
+        .iter()
+        .filter_map(|record| match record {
+            GraphRecord::Node { id, kind, .. } => Some((id.as_str(), *kind)),
+            GraphRecord::Edge { .. } | GraphRecord::Tombstone { .. } => None,
+        })
+        .collect();
+    records
+        .iter()
+        .filter_map(|record| match record {
+            GraphRecord::Edge {
+                id,
+                label: EdgeLabel::Imports,
+                target,
+                ..
+            } if node_kind
+                .get(target.as_str())
+                .is_some_and(|kind| *kind == NodeKind::Module || *kind == NodeKind::File) =>
+            {
+                Some(id.clone())
+            }
+            _ => None,
+        })
+        .collect()
 }

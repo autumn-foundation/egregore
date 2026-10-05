@@ -27,6 +27,8 @@ const fn span(start_line: usize, end_line: usize) -> SourceSpan {
         end_byte: 100,
         start_line,
         end_line,
+        start_column: None,
+        end_column: None,
     }
 }
 
@@ -6130,8 +6132,13 @@ fn pin_validation_precedes_all_output() {
 // an `impl crate::T for Foo` in the helper could not resolve a trait `T` defined
 // in the entry file — a MISSING IMPLEMENTS edge. The cross-file pass now consults
 // the `mod` inclusion graph and reassigns a SINGLE-includer helper's crate root
-// to the including entry. A helper included by 2+ entry crates stays
-// conservatively unresolved (no-wrong-edge invariant).
+// to the including entry. A helper included by 2+ entry crates is DUPLICATED
+// once per including entry crate root (issue #401): cargo compiles the helper
+// once per including test/example/bench target, so each duplicate resolves
+// strictly within its own crate root (#394 isolation) — one edge per real
+// compilation, still no wrong edge. A helper that is ITSELF an aux entry target
+// (`tests/common.rs`, which cargo also compiles as its own test target) stays
+// conservatively unresolved.
 // ---------------------------------------------------------------------------
 
 /// Scans `tree` and returns its graph records plus the IMPLEMENTS edge targets.
@@ -6285,12 +6292,15 @@ fn real_scan_bench_helper_module_resolves_to_entry_crate_trait() {
 }
 
 #[test]
-fn real_scan_shared_test_helper_module_stays_conservatively_unresolved() {
+fn real_scan_shared_test_helper_module_resolves_per_including_crate() {
     let temp = tempfile::tempdir().expect("temp dir");
     let tests = temp.path().join("tests");
     fs::create_dir_all(tests.join("common")).expect("mkdir tests/common");
     // TWO entry test crates each `mod common;` and each define their own root
-    // `trait T`. The shared helper is reachable from 2+ distinct entry crates.
+    // `trait T`. Cargo compiles the shared helper once per including test
+    // target, so the cross-file IMPLEMENTS pass duplicates the helper's facts
+    // per includer crate root (issue #401): one edge per real compilation, each
+    // confined to its own crate root (#394 isolation) — never a wrong edge.
     fs::write(
         tests.join("a.rs"),
         concat!("pub trait T { fn go(&self); }\n", "mod common;\n"),
@@ -6311,11 +6321,48 @@ fn real_scan_shared_test_helper_module_stays_conservatively_unresolved() {
     .expect("write tests/common/mod.rs");
 
     let (records, targets) = scan_records(temp.path());
-    // The helper belongs to neither crate unambiguously (2 includers), so the
-    // conservative bound mints NO edge — a missing edge, never a wrong one.
+    let a_t = trait_id_in_file(&records, "tests/a.rs");
+    let b_t = trait_id_in_file(&records, "tests/b.rs");
     assert!(
-        targets.is_empty(),
-        "a helper shared by 2+ entry crates must stay unresolved: {records:?}"
+        targets.contains(&a_t),
+        "the shared helper impl must edge-back to `tests/a.rs`'s `T`: {records:?}"
+    );
+    assert!(
+        targets.contains(&b_t),
+        "the shared helper impl must edge-back to `tests/b.rs`'s `T`: {records:?}"
+    );
+
+    // The `implementors` query lists the helper's `Foo` under EACH entry
+    // crate's `T` (one real compilation per including target).
+    let stdout = egregore()
+        .args(["query", "implementors", "T", "--graph"])
+        .arg(temp.path().join("graph.jsonl"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let implementors: Vec<(String, String)> = String::from_utf8(stdout)
+        .expect("utf8")
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("valid JSON"))
+        .filter_map(|r| {
+            let trait_id = r["trait_record_id"].as_str()?.to_owned();
+            let implementing_type = r["implementing_type"].as_str()?.to_owned();
+            (trait_id == a_t || trait_id == b_t).then_some((trait_id, implementing_type))
+        })
+        .collect();
+    assert!(
+        implementors
+            .iter()
+            .any(|(t, ty)| t == &a_t && ty.ends_with("Foo")),
+        "entry crate a's `T` must list the helper's `Foo` implementor: {implementors:?}"
+    );
+    assert!(
+        implementors
+            .iter()
+            .any(|(t, ty)| t == &b_t && ty.ends_with("Foo")),
+        "entry crate b's `T` must list the helper's `Foo` implementor: {implementors:?}"
     );
 }
 

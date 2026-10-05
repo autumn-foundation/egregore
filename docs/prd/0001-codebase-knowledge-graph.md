@@ -105,7 +105,7 @@ Initial edge labels:
 |-------|-----------|---------|
 | `CONTAINS` | Repository/Directory/File/Module -> child | Hierarchical ownership |
 | `DEFINES` | File/Module -> Symbol | Definition lives here |
-| `IMPORTS` | File/Module -> Import | Import declaration appears here |
+| `IMPORTS` | File/Module -> Import (containment: the declaration site); File -> Module/File (issue #444: the resolved import target) | Import declaration appears here; the module/file the import resolves to |
 | `REFERENCES` | Symbol/Import -> Symbol | Best-effort syntactic reference (same-file); comment and string-literal text never matches (issue #134) |
 | `CALLS` | Symbol -> Symbol/Diagnostic | Function or method call; resolved repo-wide across files for Rust and labeled with a `resolution` status (see below) |
 | `IMPLEMENTS` | Symbol -> Symbol | Impl/trait relationship where syntactically resolvable |

@@ -23,6 +23,8 @@ const fn mk_span(start_line: usize, end_line: usize) -> SourceSpan {
         end_byte: 42,
         start_line,
         end_line,
+        start_column: None,
+        end_column: None,
     }
 }
 
@@ -106,6 +108,7 @@ fn edge(id: &str, label: EdgeLabel, source: &str, target: &str) -> GraphRecord {
         frame_index: None,
         is_exhaustive: None,
         basis: None,
+        call_site_spans: None,
         temporal: None,
         summary: "SENTINEL_EDGE_SUMMARY".to_owned(),
         producer: None,

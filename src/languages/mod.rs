@@ -115,3 +115,64 @@ pub fn detect_path(path: &Path) -> Option<Language> {
 pub fn is_supported_source(path: &Path) -> bool {
     detect_path(path).is_some()
 }
+
+/// Normalizes line endings so scans are byte-stable across checkouts (issue
+/// #242).
+///
+/// CRLF (`\r\n`) and lone CR (`\r`) both become LF (`\n`). Each language's
+/// `extract_file_source` applies this at its parse boundary — before
+/// Tree-sitter sees the source — so byte spans, symbol text, signatures,
+/// summaries, and content hashes are computed over canonical content no
+/// matter which line-ending convention the checkout used (Git
+/// `core.autocrlf=true` on Windows vs LF elsewhere). The scan funnel in
+/// `crate::scan_source_text_records` normalizes once more ahead of it for the
+/// File-node summary text; normalization is idempotent, so the parse
+/// boundary's pass costs already-normalized callers only the fast path.
+///
+/// This mirrors the byte-level `normalize_newlines` used for log artifacts
+/// (`crate::log_graph`), but operates on decoded source text at the scan
+/// boundary.
+#[must_use]
+pub fn normalize_line_endings(source: &str) -> String {
+    if !source.contains('\r') {
+        return source.to_owned();
+    }
+    source.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_line_endings;
+
+    #[test]
+    fn crlf_becomes_lf() {
+        assert_eq!(normalize_line_endings("a\r\nb\r\n"), "a\nb\n");
+    }
+
+    #[test]
+    fn lone_cr_becomes_lf() {
+        assert_eq!(normalize_line_endings("a\rb\r"), "a\nb\n");
+    }
+
+    #[test]
+    fn mixed_endings_normalize() {
+        assert_eq!(normalize_line_endings("a\r\nb\rc\n"), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn lf_source_passes_through_unchanged() {
+        let source = "fn main() {\n    println!(\"hi\");\n}\n";
+        assert_eq!(normalize_line_endings(source), source);
+    }
+
+    #[test]
+    fn empty_source_normalizes_to_empty() {
+        assert_eq!(normalize_line_endings(""), "");
+    }
+
+    #[test]
+    fn normalization_is_idempotent() {
+        let once = normalize_line_endings("a\r\nb\rc\n");
+        assert_eq!(normalize_line_endings(&once), once);
+    }
+}

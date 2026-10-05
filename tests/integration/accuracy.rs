@@ -50,15 +50,28 @@ fn test_accuracy_command_passes_with_expected_metrics() {
     assert_eq!(defines_metrics["precision"].as_f64().unwrap(), 1.0);
     assert_eq!(defines_metrics["recall"].as_f64().unwrap(), 1.0);
 
-    // Diagnostic node for macro should be present
+    // The repo-local macro invocation now resolves to a CALLS edge instead of
+    // a Diagnostic (issue #148): the fixture's my_macro! is uniquely defined
+    // in the same file, so no "unsupported macro invocation" diagnostic is
+    // emitted for it. With no Diagnostic labels left, the class is absent
+    // from the metrics map (or reports zero true/false positives).
     let diagnostic_metrics = &report["metrics"]["nodes"]["Diagnostic"];
-    assert_eq!(diagnostic_metrics["true_positives"].as_u64().unwrap(), 1);
+    if !diagnostic_metrics.is_null() {
+        assert_eq!(diagnostic_metrics["true_positives"].as_u64().unwrap(), 0);
+        assert_eq!(diagnostic_metrics["false_positives"].as_u64().unwrap(), 0);
+    }
+
+    // The macro definition is extracted as a Symbol with symbol_kind "macro".
+    let macro_symbol = &report["failures"]["nodes"]["Symbol"];
+    assert_eq!(macro_symbol["false_positives"].as_array().unwrap().len(), 0);
+    assert_eq!(macro_symbol["false_negatives"].as_array().unwrap().len(), 0);
 
     // Verify comment and string-literal decoy calls emitted 0 CALLS edges
     // The actual lib.rs contains "free_function(10);" inside a comment and "free_function(20);" in a string literal.
-    // The CALLS edges true_positives should be exactly 1 (trait_method calls free_function), and false_positives 0.
+    // The CALLS edges true_positives should be exactly 2 (trait_method calls free_function,
+    // plus the resolved top-level my_macro! invocation), and false_positives 0.
     let calls_metrics = &report["metrics"]["edges"]["CALLS"];
-    assert_eq!(calls_metrics["true_positives"].as_u64().unwrap(), 1);
+    assert_eq!(calls_metrics["true_positives"].as_u64().unwrap(), 2);
     assert_eq!(calls_metrics["false_positives"].as_u64().unwrap(), 0);
 }
 

@@ -642,13 +642,24 @@ fn ingest_planted() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let graph = temp.path().join("embeddable.graph.jsonl");
     fs::write(&graph, embeddable_lines().join("\n")).expect("write graph");
     let data_dir = temp.path().join("store");
-    egregore()
-        .arg("ingest")
-        .arg(&graph)
-        .args(["--adapter", "embedded", "--data-dir"])
-        .arg(&data_dir)
-        .assert()
-        .success();
+    // Ingest rejects a citation whose target is only a tombstone (issue #241),
+    // so the target is written live first and retracted in a later ingest —
+    // the "write the record, retract it later" path the store really takes.
+    let tombstone = tombstone_line("verification:v1:tombed");
+    let (retraction, live): (Vec<String>, Vec<String>) = embeddable_lines()
+        .into_iter()
+        .partition(|line| *line == tombstone);
+    for (name, lines) in [("live", live), ("retraction", retraction)] {
+        let batch = temp.path().join(format!("{name}.graph.jsonl"));
+        fs::write(&batch, lines.join("\n")).expect("write batch");
+        egregore()
+            .arg("ingest")
+            .arg(&batch)
+            .args(["--adapter", "embedded", "--data-dir"])
+            .arg(&data_dir)
+            .assert()
+            .success();
+    }
     (temp, data_dir, graph)
 }
 

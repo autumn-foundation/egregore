@@ -8,6 +8,7 @@ pub(crate) fn query_symbol_via_daemon(
     as_of: Option<&str>,
     repo: Option<&str>,
     format: OutputFormat,
+    role: RoleFilter,
 ) -> Result<()> {
     let client = DaemonClient::from_data_dir(data_dir)
         .with_context(|| format!("failed to connect to daemon at {}", data_dir.display()))?;
@@ -29,14 +30,34 @@ pub(crate) fn query_symbol_via_daemon(
     if repo.is_none() && (at.is_some() || as_of.is_some()) {
         fail_on_unscoped_daemon_repo_collision(&records);
     }
+    // Role scope (issue #238) applies client-side: the daemon verbs predate
+    // the selector and return every matching record; the CLI narrows to the
+    // requested role. A record without a `role` field (store predates
+    // issue #238) matches only `RoleFilter::All`.
+    let records: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|rec| role.matches(daemon_record_role(rec)))
+        .collect();
     if records.is_empty() {
         eprintln!("error: no match found for symbol `{name}`");
         std::process::exit(2);
     }
-    for rec in &records {
+    for rec in records {
         print_daemon_symbol_record(rec, format)?;
     }
     Ok(())
+}
+
+/// Reads the test-vs-production role from a daemon-returned record
+/// (`serde_json::Value`). `None` when the record carries no `role` field —
+/// the daemon's store predates issue #238 — or the value is unrecognized.
+#[cfg(feature = "embedded-aletheiadb")]
+pub(crate) fn daemon_record_role(rec: &serde_json::Value) -> Option<crate::ir::SymbolRole> {
+    match rec.get("role").and_then(|v| v.as_str()) {
+        Some("test") => Some(crate::ir::SymbolRole::Test),
+        Some("production") => Some(crate::ir::SymbolRole::Production),
+        _ => None,
+    }
 }
 
 /// Prints a daemon symbol/file record (`serde_json::Value`) in the requested format.
@@ -55,7 +76,32 @@ pub(crate) fn print_daemon_symbol_record(
             let commit = rec["git_commit"]
                 .as_str()
                 .map_or(String::new(), |c| format!(" [{c}]"));
-            println!("{name} ({kind}) @ {path}:{line}{commit}");
+            // Test-vs-production role (issue #238); absent on records from a
+            // store that predates it, and then printed as nothing — never a
+            // fabricated value.
+            let role_suffix =
+                daemon_record_role(rec).map_or(String::new(), |r| format!(" [{}]", r.as_str()));
+            // Conditional-compilation gates (issue #190); absent on records
+            // from a store that predates it or on ungated items, and then
+            // printed as nothing — never a fabricated gate. The ` && ` join
+            // mirrors the conjunction semantics; the JSON array is
+            // authoritative.
+            let cfg_suffix =
+                rec.get("cfg")
+                    .and_then(|value| value.as_array())
+                    .map_or(String::new(), |gates| {
+                        let joined = gates
+                            .iter()
+                            .filter_map(|gate| gate.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" && ");
+                        if joined.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [cfg: {joined}]")
+                        }
+                    });
+            println!("{name} ({kind}) @ {path}:{line}{commit}{role_suffix}{cfg_suffix}");
         }
     }
     Ok(())
@@ -76,8 +122,14 @@ pub(crate) fn query_symbol_all(
     freshness_code: Option<&(String, &'static str)>,
     corpus_mode: query::CorpusMode,
     corpus_mode_source: query::CorpusModeSource,
+    role: RoleFilter,
 ) -> Result<()> {
     let deleted = current_deleted_ids(records);
+    // Issue #472: targets of ACTIVE repository-eviction tombstones are suppressed
+    // from this current-state lane, including their temporal snapshots. Ordinary
+    // `forget` tombstones keep the issue #231 temporal exemption — only eviction
+    // tombstones suppress history.
+    let evicted = crate::repo_evict::active_eviction_tombstoned_ids(records);
     // HEAD-anchor keep-last coalescing (issue #456): the ID-level HEAD-anchor
     // pre-filter (`non_head_current_record_ids`, applied by the CLI dispatch)
     // drops symbol IDs whose EVERY version is off-HEAD (`gone`), but retains a
@@ -132,6 +184,16 @@ pub(crate) fn query_symbol_all(
         .iter()
         .enumerate()
         .filter(|(_, r)| {
+            // Issue #472: suppress temporal snapshots with active eviction tombstones.
+            if let GraphRecord::Node {
+                id,
+                temporal: Some(_),
+                ..
+            } = r
+                && evicted.contains(id.as_str())
+            {
+                return false;
+            }
             if let GraphRecord::Node {
                 id, temporal: None, ..
             } = r
@@ -151,6 +213,10 @@ pub(crate) fn query_symbol_all(
         results.retain(|r| r.repository_id == Some(repo));
     }
     retain_package_scope(&mut results, package);
+    // Role scope (issue #238) narrows AFTER row projection like the package
+    // scope above, and is likewise order-preserving. A row whose record
+    // predates issue #238 (role unknown) survives only `RoleFilter::All`.
+    results.retain(|r| role.matches(r.role.copied()));
 
     if results.is_empty() {
         eprintln!("error: no match found for symbol `{name}`");
@@ -166,6 +232,74 @@ pub(crate) fn query_symbol_all(
     stamp_symbol_corpus(&mut results, corpus_mode, corpus_mode_source);
     for result in &results {
         print_result(result, format)?;
+    }
+    print_linked_design_docs(records, &results, format)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// linked design docs (issue #149)
+// ---------------------------------------------------------------------------
+
+/// One explicitly-linked design doc (ADR/PRD/Plan) surfaced by `query symbol`.
+///
+/// Carries the artifact record id, kind, repo-relative path, and BLAKE3
+/// content hash — never body text.
+#[derive(Serialize)]
+pub(crate) struct DesignDocRow<'a> {
+    record_id: &'a str,
+    doc_kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<&'a str>,
+    repo_relative_path: &'a str,
+    content_hash: &'a str,
+    relation: &'static str,
+}
+
+impl PrintText for DesignDocRow<'_> {
+    fn as_text(&self) -> String {
+        let title = self
+            .title
+            .map_or_else(|| "(untitled)".to_owned(), |t| format!("\"{t}\""));
+        format!(
+            "design-doc: {} ({}) @ {} [{}] blake3:{} {}",
+            self.record_id,
+            self.doc_kind,
+            self.repo_relative_path,
+            self.relation,
+            self.content_hash,
+            title
+        )
+    }
+}
+
+/// Prints the design docs explicitly linked to the matched symbols, after the
+/// symbol rows. With no governing docs nothing prints: honest empty, never
+/// fabricated.
+fn print_linked_design_docs(
+    records: &[GraphRecord],
+    results: &[SymbolResult<'_>],
+    format: OutputFormat,
+) -> Result<()> {
+    let symbol_ids: std::collections::BTreeSet<&str> =
+        results.iter().map(|r| r.record_id).collect();
+    let links = crate::doc_ingest::linked_design_docs(
+        records,
+        &symbol_ids,
+        &std::collections::BTreeSet::new(),
+    );
+    for link in links {
+        print_result(
+            &DesignDocRow {
+                record_id: link.record_id,
+                doc_kind: link.doc_kind,
+                title: link.title,
+                repo_relative_path: link.repo_relative_path,
+                content_hash: link.content_hash,
+                relation: link.relation,
+            },
+            format,
+        )?;
     }
     Ok(())
 }
@@ -216,6 +350,24 @@ pub(crate) fn symbol_result<'a>(
     }
 }
 
+/// Stamps the temporal `valid_time` on a `SymbolResult` from its record's
+/// temporal metadata (issue #181). Called only by the temporal lanes
+/// (`query symbol --at`/`--as-of`); ordinary current-state rows leave
+/// `valid_time` absent.
+pub(crate) fn stamp_valid_time<'a>(result: &mut SymbolResult<'a>, record: &'a GraphRecord) {
+    if let GraphRecord::Node {
+        temporal,
+        valid_time,
+        ..
+    } = record
+    {
+        result.valid_time = temporal
+            .as_ref()
+            .map(|t| t.valid_time.as_str())
+            .or(valid_time.as_deref());
+    }
+}
+
 /// Builds a `SymbolResult` row for any `Symbol` node record, without a name
 /// predicate. Shared by the exact-name (`query symbol`) and partial-name
 /// (`query symbols`, issue #102) paths so both emit the same row shape.
@@ -258,6 +410,10 @@ pub(crate) fn symbol_row<'a>(
         signature: signature.as_deref(),
         doc: doc.as_deref(),
         git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
+        // `valid_time` is stamped only by the temporal lanes (`--at`/`--as-of`,
+        // issue #181): ordinary current-state rows do not carry it, keeping
+        // their output and token cost unchanged.
+        valid_time: None,
         // Only a claim the resolver could have produced is presentable, read
         // through the ONE record-level boundary the text render and the package
         // catalog also use, so no two surfaces can disagree about one record and
@@ -274,6 +430,21 @@ pub(crate) fn symbol_row<'a>(
         corpus_mode: None,
         corpus_mode_source: None,
         corpus_disclaimer: None,
+        role: record.role(),
+        // Conditional-compilation gates (issue #190): the row IS the
+        // symbol's record, so its gate chain rides along like every other
+        // `eg query symbol` field. Absent for ungated symbols and for
+        // records that predate issue #190 — never fabricated.
+        cfg: record.cfg(),
+        // Structural complexity (issue #162): the row IS the symbol's
+        // record, so its score rides along like every other `eg query
+        // symbol` field. Absent for non-callables and for records that
+        // predate issue #162 — never fabricated.
+        complexity: record.complexity(),
+        // Answer completeness (issue #121): the shared constructor is the
+        // exhaustive default — lanes that list every match keep it.
+        // Selecting lanes (`--at`, `--as-of`) overwrite it after the pick.
+        completeness: RowCompleteness::exhaustive(),
     })
 }
 
@@ -299,9 +470,23 @@ pub(crate) fn query_symbols_matching(
     package: Option<&str>,
 ) -> Result<()> {
     let deleted = current_deleted_ids(records);
+    // Issue #472: targets of ACTIVE repository-eviction tombstones are suppressed
+    // from this current-state lane, including their temporal snapshots. Ordinary
+    // `forget` tombstones keep the issue #231 temporal exemption (the
+    // `temporal: None` gate below) — only eviction tombstones suppress history.
+    let evicted = crate::repo_evict::active_eviction_tombstoned_ids(records);
     let mut results: Vec<SymbolResult<'_>> = records
         .iter()
         .filter(|r| {
+            if let GraphRecord::Node {
+                id,
+                temporal: Some(_),
+                ..
+            } = r
+                && evicted.contains(id.as_str())
+            {
+                return false;
+            }
             if let GraphRecord::Node {
                 id, temporal: None, ..
             } = r
@@ -360,6 +545,7 @@ pub(crate) fn query_symbol_at(
     selected_repo: Option<&str>,
     package: Option<&str>,
     freshness_code: Option<&(String, &'static str)>,
+    role: RoleFilter,
 ) -> Result<()> {
     // The ambiguity check is repository-scoped: a prefix that collides only
     // across the repository boundary is unambiguous within the selected repo.
@@ -387,6 +573,10 @@ pub(crate) fn query_symbol_at(
     if let Some(selector) = package {
         matches.retain(|r| r.owning_package().map(|(name, _)| name) == Some(selector));
     }
+    // Role scope (issue #238) likewise narrows candidates before the winner
+    // is chosen: `--role test` must be able to select the test-named symbol
+    // when a production same-named symbol would otherwise sort first.
+    matches.retain(|r| role.matches(r.role().copied()));
     if let Some(repo) = selected_repo {
         matches.retain(|r| index.owner_of(r.id()) == Some(repo));
     } else {
@@ -400,6 +590,10 @@ pub(crate) fn query_symbol_at(
         }
     }
 
+    // Issue #121: `--at` is a single-winner selection — bind the candidate
+    // count before the pick so the printed row can report what the
+    // selection narrowed.
+    let candidates = matches.len();
     match matches.into_iter().next() {
         None => {
             eprintln!("error: no match found for symbol `{name}` at commit `{prefix}`");
@@ -417,6 +611,9 @@ pub(crate) fn query_symbol_at(
                     std::process::exit(2);
                 };
                 stamp_freshness(std::slice::from_mut(&mut result), freshness_code);
+                // `--at` is a temporal lane (issue #181): stamp the valid-time
+                // axis the selector resolved.
+                stamp_valid_time(&mut result, record);
                 // `--at` pins a single commit: the corpus is commit-pinned,
                 // chosen by the selector (issue #427).
                 stamp_symbol_corpus(
@@ -424,6 +621,9 @@ pub(crate) fn query_symbol_at(
                     query::CorpusMode::CommitPinned,
                     query::CorpusModeSource::Selector,
                 );
+                // Issue #121: one row was picked from `candidates` — the
+                // stamp reports the selection, not a complete listing.
+                result.completeness = RowCompleteness::single_winner(candidates);
                 print_result(&result, format)?;
             }
         }
@@ -462,6 +662,27 @@ impl PrintText for SymbolResult<'_> {
         }
         if let Some(doc) = self.doc {
             let _ = write!(text, "\n  doc: {doc}");
+        }
+        // Test-vs-production role (issue #238). An ABSENT field prints
+        // NOTHING: the record predates issue #238, so its role is unknown,
+        // and rendering "production" would fabricate a negative fact.
+        if let Some(role) = self.role {
+            let _ = write!(text, "\n  role: {}", role.as_str());
+        }
+        // Conditional-compilation gates (issue #190). An ABSENT field prints
+        // NOTHING: the record predates issue #190 or the item is ungated, and
+        // rendering a gate would fabricate a compilation fact. The chain
+        // reads outermost gate first; the ` && ` join mirrors the conjunction
+        // semantics — the JSON array is authoritative.
+        if let Some(gates) = self.cfg {
+            let _ = write!(text, "\n  cfg: {}", gates.join(" && "));
+        }
+        // Structural complexity (issue #162). An ABSENT field prints
+        // NOTHING: the record predates issue #162 or the symbol is not a
+        // callable, so its score is unknown/inapplicable, and rendering a
+        // minimum would fabricate a code fact.
+        if let Some(score) = self.complexity {
+            let _ = write!(text, "\n  complexity: {score}");
         }
         // Owning Cargo package (issue #117). An ABSENT field prints NOTHING:
         // the record predates issue #117, so its attribution is unknown, and

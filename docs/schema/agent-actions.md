@@ -286,13 +286,16 @@ invalid/unverified instead of becoming a false success memory.
 
 The artifact domain is introduced by this slice's `PatchArtifact` shape. The
 following durable-document shapes are reserved by name so producers cannot
-collide, but their full payload specs belong to future producer slices:
+collide. The `ADR`, `PRD`, and `Plan` shapes are implemented by the design-doc
+importer (issue #149); their full payload spec lives in
+`docs/schema/doc-ingest.md`. The remaining shapes still belong to future
+producer slices:
 
 | Shape | One-line reservation |
 |-------|----------------------|
-| `ADR` | Architecture decision document artifact. |
-| `PRD` | Product requirements document artifact. |
-| `Plan` | Implementation or project plan artifact. |
+| `ADR` | Architecture decision document artifact. Implemented by issue #149 (`NodeKind::Adr`, wire name `"ADR"`). |
+| `PRD` | Product requirements document artifact. Implemented by issue #149 (`NodeKind::Prd`, wire name `"PRD"`). |
+| `Plan` | Implementation or project plan artifact. Implemented by issue #149 (`NodeKind::PlanDoc`, wire name `"PlanDoc"` — `Plan` is already the project-domain task-plan kind). |
 | `Transcript` | Raw or normalized session transcript artifact. |
 | `BenchmarkReport` | Human-readable benchmark report artifact. |
 | `ReleaseNote` | Release-note artifact. |

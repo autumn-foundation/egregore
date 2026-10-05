@@ -1,0 +1,1538 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "Evidence-backed symbol context, trust-separated by domain (issue #194).",
+  "properties": {
+    "artifacts": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "author": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "base_commit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "body_handle": {
+            "additionalProperties": true,
+            "properties": {
+              "bytes": {
+                "type": "integer"
+              },
+              "hash": {
+                "type": "string"
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "edit_kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "evidence_links": {
+            "items": {
+              "additionalProperties": true,
+              "properties": {
+                "confidence": {
+                  "type": "string"
+                },
+                "relation": {
+                  "type": "string"
+                },
+                "target_domain": {
+                  "type": "string"
+                },
+                "target_record_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "evidence_quality": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "executed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "exit_code": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "patch_bytes_hash": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "patch_bytes_size": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "patch_handle": {
+            "additionalProperties": true,
+            "properties": {
+              "path": {
+                "type": "string"
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "patch_status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "producer_session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "record_id": {
+            "type": "string"
+          },
+          "repo_relative_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_artifact_hash": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_artifact_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stderr_handle": {
+            "additionalProperties": true,
+            "properties": {
+              "bytes": {
+                "type": "integer"
+              },
+              "hash": {
+                "type": "string"
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "stdout_handle": {
+            "additionalProperties": true,
+            "properties": {
+              "bytes": {
+                "type": "integer"
+              },
+              "hash": {
+                "type": "string"
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "system_native_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target_files": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "trust": {
+            "enum": [
+              "source_derived",
+              "verification_evidence",
+              "agent_verified",
+              "agent_unverified",
+              "agent_contradicted",
+              "project_state",
+              "artifact",
+              "runtime_observation",
+              "other"
+            ],
+            "type": "string"
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "validation_summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "verification_kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "record_id",
+          "kind",
+          "trust"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "decisions": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "agent_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "confidence": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "decision_text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "evidence_handles": {
+            "items": {
+              "additionalProperties": true,
+              "properties": {
+                "relation": {
+                  "type": "string"
+                },
+                "target_kind": {
+                  "type": "string"
+                },
+                "target_record_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "relation",
+                "target_record_id",
+                "target_kind"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "observed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provenance_handle": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rationale_summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "record_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "summary": {
+            "type": "string"
+          },
+          "trust": {
+            "enum": [
+              "source_derived",
+              "verification_evidence",
+              "agent_verified",
+              "agent_unverified",
+              "agent_contradicted",
+              "project_state",
+              "artifact",
+              "runtime_observation",
+              "other"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "record_id",
+          "kind",
+          "trust",
+          "decision_text",
+          "rationale_summary"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "drift_history": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "after_commit": {
+            "type": "string"
+          },
+          "after_valid_time": {
+            "type": "string"
+          },
+          "before_commit": {
+            "type": "string"
+          },
+          "before_valid_time": {
+            "type": "string"
+          },
+          "embedding_model": {
+            "type": "string"
+          },
+          "record_id": {
+            "type": "string"
+          },
+          "repo_relative_path": {
+            "type": "string"
+          },
+          "score": {
+            "type": "number"
+          },
+          "span": {
+            "additionalProperties": true,
+            "properties": {
+              "end_byte": {
+                "type": "integer"
+              },
+              "end_column": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "end_line": {
+                "type": "integer"
+              },
+              "start_byte": {
+                "type": "integer"
+              },
+              "start_column": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "start_line": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "start_byte",
+              "end_byte",
+              "start_line",
+              "end_line"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "trust": {
+            "enum": [
+              "source_derived",
+              "verification_evidence",
+              "agent_verified",
+              "agent_unverified",
+              "agent_contradicted",
+              "project_state",
+              "artifact",
+              "runtime_observation",
+              "other"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "record_id",
+          "trust",
+          "score",
+          "before_commit",
+          "after_commit",
+          "before_valid_time",
+          "after_valid_time",
+          "embedding_model"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "freshness": {
+      "additionalProperties": true,
+      "properties": {
+        "current_dirty": {
+          "type": "boolean"
+        },
+        "current_head": {
+          "additionalProperties": true,
+          "properties": {
+            "sha": {
+              "type": "string"
+            },
+            "state": {
+              "enum": [
+                "commit",
+                "no_git",
+                "unborn_head"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        "fresh": {
+          "type": "boolean"
+        },
+        "message": {
+          "type": "string"
+        },
+        "repo_path": {
+          "type": "string"
+        },
+        "repository_id": {
+          "type": "string"
+        },
+        "stored_snapshot": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "properties": {
+                "dirty": {
+                  "type": "boolean"
+                },
+                "head": {
+                  "additionalProperties": true,
+                  "properties": {
+                    "sha": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "enum": [
+                        "commit",
+                        "no_git",
+                        "unborn_head"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "state"
+                  ],
+                  "type": "object"
+                },
+                "repository_id": {
+                  "type": "string"
+                },
+                "scanned_at": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "head",
+                "dirty",
+                "repository_id",
+                "scanned_at"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Explicit marker for a pre-stamping store — never a silent absence, never a false `fresh`.",
+              "properties": {
+                "state": {
+                  "const": "pre_stamping"
+                }
+              },
+              "required": [
+                "state"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "verdict": {
+          "enum": [
+            "fresh",
+            "stale_head",
+            "stale_dirty",
+            "unknown"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "verdict",
+        "fresh",
+        "repository_id",
+        "repo_path",
+        "stored_snapshot",
+        "current_head",
+        "current_dirty",
+        "message"
+      ],
+      "type": "object"
+    },
+    "observations": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "agent_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "confidence": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "evidence_links": {
+            "items": {
+              "additionalProperties": true,
+              "properties": {
+                "confidence": {
+                  "type": "string"
+                },
+                "relation": {
+                  "type": "string"
+                },
+                "target_domain": {
+                  "type": "string"
+                },
+                "target_record_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "exit_code": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "failure_kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "observed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provenance_handle": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "record_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "trust": {
+            "enum": [
+              "source_derived",
+              "verification_evidence",
+              "agent_verified",
+              "agent_unverified",
+              "agent_contradicted",
+              "project_state",
+              "artifact",
+              "runtime_observation",
+              "other"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "record_id",
+          "kind",
+          "trust"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "ok": {
+      "const": true
+    },
+    "policy": {
+      "description": "Active approved user-context policy whose scope applies to the symbol (issue #169). Always present; empty when no in-scope policy applies.",
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "active_from": {
+            "type": "string"
+          },
+          "approval_decision_id": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "record_id": {
+            "type": "string"
+          },
+          "scope": {
+            "additionalProperties": true,
+            "properties": {
+              "language": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "lifecycle_phase": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "path_glob": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "repo": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          },
+          "status": {
+            "type": "string"
+          },
+          "trust": {
+            "enum": [
+              "source_derived",
+              "verification_evidence",
+              "agent_verified",
+              "agent_unverified",
+              "agent_contradicted",
+              "project_state",
+              "artifact",
+              "runtime_observation",
+              "other"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "record_id",
+          "kind",
+          "body",
+          "approval_decision_id",
+          "active_from",
+          "status",
+          "trust",
+          "scope"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "project_state": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "author": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "base_commit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "body_handle": {
+            "additionalProperties": true,
+            "properties": {
+              "bytes": {
+                "type": "integer"
+              },
+              "hash": {
+                "type": "string"
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "edit_kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "evidence_links": {
+            "items": {
+              "additionalProperties": true,
+              "properties": {
+                "confidence": {
+                  "type": "string"
+                },
+                "relation": {
+                  "type": "string"
+                },
+                "target_domain": {
+                  "type": "string"
+                },
+                "target_record_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "evidence_quality": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "executed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "exit_code": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "patch_bytes_hash": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "patch_bytes_size": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "patch_handle": {
+            "additionalProperties": true,
+            "properties": {
+              "path": {
+                "type": "string"
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "patch_status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "producer_session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "record_id": {
+            "type": "string"
+          },
+          "repo_relative_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_artifact_hash": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_artifact_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stderr_handle": {
+            "additionalProperties": true,
+            "properties": {
+              "bytes": {
+                "type": "integer"
+              },
+              "hash": {
+                "type": "string"
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "stdout_handle": {
+            "additionalProperties": true,
+            "properties": {
+              "bytes": {
+                "type": "integer"
+              },
+              "hash": {
+                "type": "string"
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "system_native_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target_files": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "trust": {
+            "enum": [
+              "source_derived",
+              "verification_evidence",
+              "agent_verified",
+              "agent_unverified",
+              "agent_contradicted",
+              "project_state",
+              "artifact",
+              "runtime_observation",
+              "other"
+            ],
+            "type": "string"
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "validation_summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "verification_kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "record_id",
+          "kind",
+          "trust"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "source_facts": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "git_commit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "record_id": {
+            "type": "string"
+          },
+          "repo_relative_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "span": {
+            "additionalProperties": true,
+            "properties": {
+              "end_byte": {
+                "type": "integer"
+              },
+              "end_column": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "end_line": {
+                "type": "integer"
+              },
+              "start_byte": {
+                "type": "integer"
+              },
+              "start_column": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "start_line": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "start_byte",
+              "end_byte",
+              "start_line",
+              "end_line"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "symbol_kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "trust": {
+            "enum": [
+              "source_derived",
+              "verification_evidence",
+              "agent_verified",
+              "agent_unverified",
+              "agent_contradicted",
+              "project_state",
+              "artifact",
+              "runtime_observation",
+              "other"
+            ],
+            "type": "string"
+          },
+          "valid_time": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "record_id",
+          "kind",
+          "trust"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "store_coverage": {
+      "additionalProperties": true,
+      "properties": {
+        "agent_memory": {
+          "type": "boolean"
+        },
+        "artifact": {
+          "type": "boolean"
+        },
+        "code_graph": {
+          "type": "boolean"
+        },
+        "project": {
+          "type": "boolean"
+        },
+        "verification": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code_graph",
+        "agent_memory",
+        "project",
+        "artifact",
+        "verification"
+      ],
+      "type": "object"
+    },
+    "symbol_name": {
+      "type": "string"
+    },
+    "topology_edges": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "git_commit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "label": {
+            "type": "string"
+          },
+          "record_id": {
+            "type": "string"
+          },
+          "source_id": {
+            "type": "string"
+          },
+          "summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target_id": {
+            "type": "string"
+          },
+          "trust": {
+            "enum": [
+              "source_derived",
+              "verification_evidence",
+              "agent_verified",
+              "agent_unverified",
+              "agent_contradicted",
+              "project_state",
+              "artifact",
+              "runtime_observation",
+              "other"
+            ],
+            "type": "string"
+          },
+          "valid_time": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "record_id",
+          "trust",
+          "label",
+          "source_id",
+          "target_id"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "unresolved": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "relation": {
+            "type": "string"
+          },
+          "source_record_id": {
+            "type": "string"
+          },
+          "target_domain": {
+            "type": "string"
+          },
+          "target_handle": {
+            "type": "string"
+          },
+          "verification_status": {
+            "const": "unresolved"
+          }
+        },
+        "required": [
+          "source_record_id",
+          "target_handle",
+          "relation",
+          "target_domain",
+          "verification_status"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "verification_evidence": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "author": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "base_commit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "body_handle": {
+            "additionalProperties": true,
+            "properties": {
+              "bytes": {
+                "type": "integer"
+              },
+              "hash": {
+                "type": "string"
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "edit_kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "evidence_links": {
+            "items": {
+              "additionalProperties": true,
+              "properties": {
+                "confidence": {
+                  "type": "string"
+                },
+                "relation": {
+                  "type": "string"
+                },
+                "target_domain": {
+                  "type": "string"
+                },
+                "target_record_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "evidence_quality": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "executed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "exit_code": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "patch_bytes_hash": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "patch_bytes_size": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "patch_handle": {
+            "additionalProperties": true,
+            "properties": {
+              "path": {
+                "type": "string"
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "patch_status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "producer_session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "record_id": {
+            "type": "string"
+          },
+          "repo_relative_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_artifact_hash": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_artifact_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stderr_handle": {
+            "additionalProperties": true,
+            "properties": {
+              "bytes": {
+                "type": "integer"
+              },
+              "hash": {
+                "type": "string"
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "stdout_handle": {
+            "additionalProperties": true,
+            "properties": {
+              "bytes": {
+                "type": "integer"
+              },
+              "hash": {
+                "type": "string"
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "system_native_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target_files": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "trust": {
+            "enum": [
+              "source_derived",
+              "verification_evidence",
+              "agent_verified",
+              "agent_unverified",
+              "agent_contradicted",
+              "project_state",
+              "artifact",
+              "runtime_observation",
+              "other"
+            ],
+            "type": "string"
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "validation_summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "verification_kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "record_id",
+          "kind",
+          "trust"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "ok",
+    "symbol_name",
+    "source_facts",
+    "topology_edges",
+    "observations",
+    "decisions",
+    "project_state",
+    "artifacts",
+    "verification_evidence",
+    "drift_history",
+    "unresolved",
+    "policy",
+    "store_coverage",
+    "freshness"
+  ],
+  "title": "Egregore MCP tool response: symbol_context",
+  "type": "object"
+}

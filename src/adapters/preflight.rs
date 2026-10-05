@@ -176,8 +176,12 @@ pub fn estimate_interned_strings(records: &[GraphRecord]) -> InternEstimate {
                 dependency,
                 log,
                 scan_coverage,
+                history_replay_window,
+                history_replay_tip,
                 embedding_model,
                 text,
+                decision_text,
+                rationale_summary,
                 superseded_by,
                 agent_id,
                 agent_kind,
@@ -269,6 +273,17 @@ pub fn estimate_interned_strings(records: &[GraphRecord]) -> InternEstimate {
                 schema_version: _,
                 span: _,
                 draft: _,
+                deprecated: _,
+                lint_suppression: _,
+                // Conditional-compilation gates (issue #190): recorded as a
+                // single `cfg_json` blob at write time, like
+                // `lint_suppression`; not individually interned.
+                cfg: _,
+                entry_point: _,
+                role: _,
+                // Structural complexity (issue #162): a plain `u32` written
+                // as a string property, not interned.
+                complexity: _,
             } => {
                 node_count += 1;
                 values.insert(id.clone());
@@ -285,6 +300,8 @@ pub fn estimate_interned_strings(records: &[GraphRecord]) -> InternEstimate {
                     note,
                     content_signature,
                     text,
+                    decision_text,
+                    rationale_summary,
                     superseded_by,
                     agent_id,
                     agent_kind,
@@ -374,6 +391,8 @@ pub fn estimate_interned_strings(records: &[GraphRecord]) -> InternEstimate {
                 insert_json(&mut values, dependency.as_deref());
                 insert_json(&mut values, log.as_deref());
                 insert_json(&mut values, scan_coverage.as_deref());
+                insert_json(&mut values, history_replay_window.as_deref());
+                insert_json(&mut values, history_replay_tip.as_ref());
                 insert_json(&mut values, embedding_model.as_deref());
                 insert_json(&mut values, body_handle.as_deref());
                 insert_json(&mut values, route.as_ref());
@@ -526,6 +545,8 @@ mod tests {
                 end_byte: 1,
                 start_line: 1,
                 end_line: 1,
+                start_column: None,
+                end_column: None,
             },
             name.to_owned(),
             format!("summary for {id}"),

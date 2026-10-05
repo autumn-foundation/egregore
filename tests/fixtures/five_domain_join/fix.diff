@@ -1,0 +1,10 @@
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -20,6 +20,7 @@
+ /// real passing run behind it instead of a fabricated stream.
+ pub fn five_domain_probe() -> &'static str {
+-    "egregore-join-probe"
++    // Gate artifact: sentinel extraction for the five-domain join proof.
++    "egregore-join-probe"
+ }

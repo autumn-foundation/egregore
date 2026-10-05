@@ -37,11 +37,15 @@
 //! duplicate (caller, target) pairs collapse to one edge preferring the
 //! strongest status.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::ir::{CallResolution, EdgeLabel, GraphRecord, NodeKind, SourceSpan, stable_id};
+use crate::crate_attribution::CrateAttributionIndex;
+use crate::ir::{
+    CallResolution, EdgeLabel, GraphRecord, NodeKind, SourceSpan, SymbolRole, stable_id,
+};
 use crate::languages::rust::is_impl_target_kind;
 
 /// A callable definition exported by a per-file extractor for repo-wide
@@ -70,6 +74,85 @@ pub struct DefinitionFact {
     #[serde(default)]
     pub is_trait_method: bool,
     /// Repo-relative path of the defining file.
+    pub repo_relative_path: String,
+}
+
+/// A block-local `fn` definition (issue #422).
+///
+/// Declared inside a function or closure BODY, hence lexically unreachable
+/// from other scopes. It is NOT pooled into the flat module-level
+/// [`DefinitionFact`] index (issue #413 round 3 closed that wrong-edge
+/// vector); it is carried separately so the resolver can recall it ONLY for
+/// calls in its own lexical scope.
+///
+/// The scope gate is [`BlockLocalDefinitionFact::enclosing_scope_id`]: this
+/// def is a candidate solely for a bare (`Direct`) call whose `caller_id`
+/// equals the enclosing scope (calls in the enclosing function/method body,
+/// including closures and nested blocks, which inherit the enclosing caller
+/// id) or equals the def's own id (a recursive call inside its own body). A
+/// bare call from any OTHER scope never sees it — the #413 guard.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BlockLocalDefinitionFact {
+    /// Stable record ID of the Symbol node.
+    pub id: String,
+    /// Qualified display name (module-qualified, e.g. `alpha::helper`).
+    pub qualified_name: String,
+    /// Unqualified name (last path segment).
+    pub simple_name: String,
+    /// Symbol kind: `function` or `test` (a block-local `fn` is never a
+    /// `method` — issue #413 corrected that attribution).
+    pub symbol_kind: String,
+    /// Stable record ID of the lexically-enclosing function/method/test
+    /// symbol whose body contains this definition.
+    pub enclosing_scope_id: String,
+    /// Repo-relative path of the defining file.
+    pub repo_relative_path: String,
+}
+
+/// A `macro_rules!` definition exported by the Rust extractor for repo-wide
+/// macro-invocation resolution (issue #148).
+///
+/// The macro's body is NEVER carried: the trust boundary is parsed source
+/// only, and macro bodies are not expanded.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MacroDefinitionFact {
+    /// Stable record ID of the macro Symbol node.
+    pub id: String,
+    /// Unqualified macro name, as written after `macro_rules!`.
+    pub simple_name: String,
+    /// Module-qualified display name (e.g. `helpers::greet`).
+    pub qualified_name: String,
+    /// Repo-relative path of the defining file.
+    pub repo_relative_path: String,
+}
+
+/// A `macro_invocation` site whose resolution is deferred to the repo-wide
+/// macro pass (issue #148).
+///
+/// Per-file extraction records the site but emits nothing for it: the
+/// repo-wide [`cross_file_macro_records`] pass mints either a resolved
+/// `CALLS` edge to the unique repo-defined macro or the pre-existing
+/// `unsupported macro invocation` Diagnostic.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MacroInvocationFact {
+    /// Stable record ID of the invoking scope: the lexically-enclosing
+    /// function symbol when the site sits inside one, else the enclosing
+    /// module or the file itself.
+    pub caller_id: String,
+    /// Display name of the invoking scope.
+    pub caller_name: String,
+    /// Invocation as written, e.g. `println!` or `crate::helpers::greet!`.
+    pub invocation_display: String,
+    /// Simple macro name: the last `::` segment with the trailing `!`
+    /// stripped.
+    pub simple_name: String,
+    /// Span of the invocation site.
+    pub span: SourceSpan,
+    /// Walk-order ordinal per invocation display, so a site that stays
+    /// unresolved mints the same Diagnostic ID the pre-#148 per-file
+    /// extractor minted (external-macro diagnostics stay byte-identical).
+    pub diagnostic_disambiguator: u64,
+    /// Repo-relative path of the invoking file.
     pub repo_relative_path: String,
 }
 
@@ -144,6 +227,14 @@ pub struct CallSiteFact {
     /// (today's unnarrowed method fan-out, unchanged).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiver_type: Option<String>,
+    /// Trait whose method is being dispatched (e.g., `Iterator` for
+    /// `iter.next()` where the receiver's type implements `Iterator`).
+    /// Used to narrow method call candidates to implementations of this
+    /// trait. `None` for non-method calls or when the trait cannot be
+    /// determined. `#[serde(default)]` so a pre-#267 cache deserializes
+    /// with `None` (today's method fan-out, unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_trait: Option<String>,
     /// Source span of the call expression.
     pub span: SourceSpan,
 }
@@ -237,6 +328,18 @@ pub struct OutOfLineModFact {
     /// resolved against the wrong directory.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub under_inline_path_override: bool,
+    /// The declaration's full conditional-compilation gate chain
+    /// (issue #190): the declaring file's `#![cfg(...)]` inner attributes,
+    /// then enclosing gated items/modules outermost-first, then the `mod x;`
+    /// item's own `#[cfg(...)]` / `#[cfg_attr(...)]` predicates. The
+    /// repo-wide [`apply_out_of_line_cfg_gates`] pass prepends this chain to
+    /// every record of the target file, so the module file's symbols carry
+    /// the same gate the declaration does. Empty when the declaration is
+    /// ungated — an ungated declaration contributes no inherited gates
+    /// (mirroring the dual-use production-precedence rule: a file also
+    /// loaded ungated compiles without the gate).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cfg_gates: Vec<String>,
 }
 
 /// An IMPLEMENTS-eligible trait/type definition exported for the repo-wide
@@ -384,6 +487,11 @@ pub struct FileFacts {
     /// Callable definitions in the file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub definitions: Vec<DefinitionFact>,
+    /// Block-local `fn` definitions in the file (issue #422). Lexically
+    /// scoped: candidates only for calls in their own enclosing scope, never
+    /// pooled into [`FileFacts::definitions`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub block_local_definitions: Vec<BlockLocalDefinitionFact>,
     /// Call sites found inside recorded symbol bodies.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub call_sites: Vec<CallSiteFact>,
@@ -413,6 +521,23 @@ pub struct FileFacts {
     /// self-dispatch call-resolution join (issue #414).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub impl_trait_relations: Vec<ImplTraitRelationFact>,
+    /// `macro_rules!` definitions in the file (issue #148), for the
+    /// repo-wide macro-invocation resolution pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub macro_definitions: Vec<MacroDefinitionFact>,
+    /// `macro_invocation` sites in the file (issue #148), deferred to the
+    /// repo-wide macro-invocation resolution pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub macro_invocations: Vec<MacroInvocationFact>,
+    /// Normalized `#[cfg(...)]` / `#[cfg_attr(...)]` predicates from `#![…]`
+    /// inner attributes at the file top level (issue #190). Not a cross-file
+    /// resolution fact — it rides `FileFacts` as the single channel from the
+    /// per-file extractor back to the scan funnel, which stamps it on the
+    /// `File` node. Skipped when empty so the incremental cache format is
+    /// unchanged for ungated files; deliberately NOT part of `is_empty` (a
+    /// file can carry gates without exporting resolution facts).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_cfg_gates: Vec<String>,
 }
 
 impl FileFacts {
@@ -421,6 +546,7 @@ impl FileFacts {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.definitions.is_empty()
+            && self.block_local_definitions.is_empty()
             && self.call_sites.is_empty()
             && self.construct_sites.is_empty()
             && self.route_registration_sites.is_empty()
@@ -429,7 +555,473 @@ impl FileFacts {
             && self.pending_impls.is_empty()
             && self.use_trait_imports.is_empty()
             && self.impl_trait_relations.is_empty()
+            && self.macro_definitions.is_empty()
+            && self.macro_invocations.is_empty()
     }
+}
+
+// ── Import-path segment parsing ────────────────────────────────────────────
+//
+// Shared with the `eg query who-imports` lane (`query::who_imports`): the
+// scan-time IMPORTS-target pass below and the query lane reduce an Import
+// node's raw `name` to module-path segments with one implementation. These
+// live in `languages::cross_file` — not in `query` — because the scan
+// pipeline must not depend on the query layer.
+
+/// Strips an optional leading Rust visibility + `use` keyword prefix from an
+/// Import node's raw `name`, anchored at the very start.
+///
+/// The Rust extractor's `import_name` only trims a leading BARE `use`, so a
+/// public re-export keeps its visibility on the Import node `name`:
+/// `pub use crate::internal::Widget;` mints the literal name
+/// `pub use crate::internal::Widget` (issue #449 Codex finding). Left as-is, the
+/// first segment split on `::` becomes `pub use crate`, so every `crate::…`
+/// re-export site is missed. This helper drops the keyword prefix before the
+/// split: an optional `pub` visibility token (including a `pub(crate)` /
+/// `pub(super)` / `pub(self)` / `pub(in path)` restriction) followed by the
+/// `use` keyword, or a bare leading `use `. Only the anchored keyword prefix is
+/// consumed — `pub` and `use` are reserved words and can never be module
+/// segments, and a segment that merely starts with the substring `use` (e.g.
+/// `used`) is not stripped — so this never over-strips a real path.
+#[must_use]
+pub fn strip_use_prefix(name: &str) -> &str {
+    let trimmed = name.trim_start();
+    // Optionally consume a leading `pub` visibility token, including a
+    // `pub(...)` restriction. A bare `pub` counts only when followed by
+    // whitespace or a `(` — otherwise it is part of a longer token and left be.
+    let after_vis = trimmed
+        .strip_prefix("pub")
+        .map_or(trimmed, |rest| match rest.chars().next() {
+            // Skip the balanced `(...)` restriction (visibility restrictions do
+            // not nest, so the first `)` closes it).
+            Some('(') => rest.find(')').map_or(rest, |idx| &rest[idx + 1..]),
+            Some(c) if c.is_whitespace() => rest,
+            _ => trimmed,
+        })
+        .trim_start();
+    // Strip only when the `use` keyword is actually present (and is a whole
+    // keyword, not the prefix of a longer identifier); otherwise the name is
+    // already a bare path — return it unchanged.
+    match after_vis.strip_prefix("use") {
+        Some(rest) if rest.chars().next().is_none_or(char::is_whitespace) => rest.trim_start(),
+        _ => name,
+    }
+}
+
+/// Reduces an Import node's raw `name` path text to its module-path segment
+/// list.
+///
+/// A group import `a::b::{C, D}` reduces to the common module prefix `a::b`; a
+/// glob `a::b::*` reduces to `a::b`; a trailing ` as <alias>` rename is
+/// stripped. A leading `pub`/visibility + `use` (or bare `use`) keyword prefix
+/// left on a re-export node's `name` by the extractor is stripped first (see
+/// [`strip_use_prefix`]). Empty segments (from a trailing `::`) and `*` are
+/// dropped.
+#[must_use]
+pub fn parse_import_segments(name: &str) -> Vec<String> {
+    // Drop any leading `[pub[(...)]] use` keyword prefix a re-export node kept.
+    let name = strip_use_prefix(name);
+    // Group import: everything before the first `{` is the common module
+    // prefix; the braced leaves (and any leaf renames inside them) are dropped.
+    let head = name.find('{').map_or(name, |idx| &name[..idx]);
+    // Non-group rename: strip a trailing ` as <alias>` (a group's leaf renames
+    // already went with the braces above).
+    let head = head.find(" as ").map_or(head, |idx| &head[..idx]);
+    head.split("::")
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "*")
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Returns `true` for the file a crate-root group's imports resolve against:
+/// the single file the group's module tree hangs off. Prefix-aware, so
+/// workspace members (`crates/foo/src/lib.rs`) classify exactly like
+/// single-crate layouts.
+fn is_crate_entry_file(path: &str) -> bool {
+    let (_, remainder) = split_crate_prefix(path);
+    let segments: Vec<&str> = remainder.iter().map(String::as_str).collect();
+    let is_rs_file = |name: &str| {
+        std::path::Path::new(name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+    };
+    match segments.as_slice() {
+        ["build.rs"] | ["src", "lib.rs" | "main.rs"] => true,
+        ["src", "bin", rest @ ..] | ["examples" | "tests" | "benches", rest @ ..] => match rest {
+            [file] => is_rs_file(file),
+            [_, "main.rs"] => true,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// What an import-target `IMPORTS` edge points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportTargetKind {
+    /// An inline `mod name { … }`: the edge targets its `Module` node.
+    Module,
+    /// An out-of-line `mod name;` (or the crate root itself): the edge targets
+    /// the module body's `File` node.
+    File,
+}
+
+/// One resolved import target: the edge target plus its display handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedImportTarget {
+    target_id: String,
+    /// Crate-root-relative module path (`a::b`) for a module target, the
+    /// repo-relative file path for a file target.
+    display: String,
+}
+
+/// Deterministic resolution index for the issue-#444 import-target pass.
+struct ImportTargetIndex {
+    repository_id: String,
+    /// Every scanned repo-relative path, so out-of-line module targets resolve
+    /// only to files the scan actually indexed.
+    known_paths: std::collections::BTreeSet<String>,
+    /// Inline `Module` nodes keyed by `(file, file-relative qualified name)`.
+    inline_modules: BTreeMap<(String, String), String>,
+    /// `(file, qualified name)` pairs claimed by two Module nodes: never
+    /// resolved (fail closed).
+    ambiguous_modules: std::collections::BTreeSet<(String, String)>,
+    /// Crate-root group id → its single entry file. Groups with zero or
+    /// several entry files (the `src/lib.rs` + `src/main.rs` pooling bound,
+    /// issue #394) are absent: their imports resolve nothing.
+    entries: BTreeMap<String, String>,
+    /// Crate name → owning group id, for absolute `<crate_name>::…` imports.
+    /// A name claimed by two groups is dropped (ambiguous).
+    name_to_group: BTreeMap<String, String>,
+}
+
+impl ImportTargetIndex {
+    /// Claims `name` for `group`, dropping it as ambiguous when another group
+    /// already claimed it.
+    fn claim_name(
+        name_to_group: &mut BTreeMap<String, String>,
+        ambiguous: &mut std::collections::BTreeSet<String>,
+        name: String,
+        group: &str,
+    ) {
+        if ambiguous.contains(&name) {
+            return;
+        }
+        match name_to_group.get(&name) {
+            None => {
+                name_to_group.insert(name, group.to_owned());
+            }
+            Some(existing) if existing == group => {}
+            Some(_) => {
+                name_to_group.remove(&name);
+                ambiguous.insert(name);
+            }
+        }
+    }
+
+    fn build(
+        repository_id: &str,
+        records: &[GraphRecord],
+        facts_by_file: &BTreeMap<String, FileFacts>,
+        attribution: &CrateAttributionIndex,
+    ) -> Self {
+        let mut known_paths: std::collections::BTreeSet<String> =
+            facts_by_file.keys().cloned().collect();
+        let mut inline_modules: BTreeMap<(String, String), String> = BTreeMap::new();
+        let mut ambiguous_modules: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        for record in records {
+            if let GraphRecord::Node {
+                id,
+                kind,
+                repo_relative_path: Some(path),
+                name,
+                language,
+                ..
+            } = record
+            {
+                known_paths.insert(path.clone());
+                if *kind == NodeKind::Module
+                    && language.as_deref() == Some("rust")
+                    && let Some(module_name) = name
+                {
+                    let key = (path.clone(), module_name.clone());
+                    if inline_modules.insert(key.clone(), id.clone()).is_some() {
+                        ambiguous_modules.insert(key);
+                    }
+                }
+            }
+        }
+
+        // Crate-root groups over Rust files; the entry file anchors each
+        // group's module walk.
+        let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for path in &known_paths {
+            let is_rs = std::path::Path::new(path)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"));
+            if !is_rs {
+                continue;
+            }
+            groups
+                .entry(crate_root_id(path))
+                .or_default()
+                .push(path.clone());
+        }
+        let mut entries: BTreeMap<String, String> = BTreeMap::new();
+        for (group_id, files) in &groups {
+            let mut entry_files = files.iter().filter(|p| is_crate_entry_file(p));
+            if let (Some(entry), None) = (entry_files.next(), entry_files.next()) {
+                entries.insert(group_id.clone(), entry.clone());
+            }
+        }
+
+        // Crate-name → group claims.
+        let mut name_to_group: BTreeMap<String, String> = BTreeMap::new();
+        let mut ambiguous_names: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for (group_id, entry) in &entries {
+            let base = group_id.rsplit("::").next().unwrap_or(group_id.as_str());
+            let aux_target = base
+                .strip_prefix("bin:")
+                .or_else(|| base.strip_prefix("example:"))
+                .or_else(|| base.strip_prefix("test:"))
+                .or_else(|| base.strip_prefix("bench:"));
+            if let Some(target) = aux_target {
+                // An auxiliary target compiles as its OWN crate named for the
+                // target (`examples/demo.rs` → the `demo` crate).
+                Self::claim_name(
+                    &mut name_to_group,
+                    &mut ambiguous_names,
+                    target.replace('-', "_"),
+                    group_id,
+                );
+                continue;
+            }
+            if base == "build" {
+                // `build.rs` is its own crate, but an absolute `<pkg>::…`
+                // import written there names the LIBRARY crate, not the build
+                // script — claiming the package name here would resolve wrong.
+                continue;
+            }
+            // Primary crate: the manifest-stamped owning package name (raw and
+            // cargo-normalized, so `use foo_bar::…` reaches package `foo-bar`)
+            // plus the path-derived workspace-directory name for graphs whose
+            // records predate attribution.
+            if let Some((package, _manifest)) =
+                attribution.attribution_for(entry).owning_package_for(entry)
+            {
+                Self::claim_name(
+                    &mut name_to_group,
+                    &mut ambiguous_names,
+                    package.to_owned(),
+                    group_id,
+                );
+                Self::claim_name(
+                    &mut name_to_group,
+                    &mut ambiguous_names,
+                    package.replace('-', "_"),
+                    group_id,
+                );
+            }
+            if let Some(derived) = crate_name_of(entry) {
+                Self::claim_name(&mut name_to_group, &mut ambiguous_names, derived, group_id);
+            }
+        }
+
+        Self {
+            repository_id: repository_id.to_owned(),
+            known_paths,
+            inline_modules,
+            ambiguous_modules,
+            entries,
+            name_to_group,
+        }
+    }
+
+    /// The stable `File` node id the scan mints for `path`
+    /// (`lib.rs` `scan_source_text_records`).
+    fn file_node_id(&self, path: &str) -> String {
+        stable_id(&["node", "file", self.repository_id.as_str(), path])
+    }
+
+    /// Resolves one Rust import to its imported Module/File target, or `None`
+    /// when any step is ungrounded. Fail-closed throughout: no edge is better
+    /// than a wrong edge.
+    fn resolve_import(
+        &self,
+        importer_path: &str,
+        raw_name: &str,
+        facts_by_file: &BTreeMap<String, FileFacts>,
+    ) -> Option<ResolvedImportTarget> {
+        let segments = parse_import_segments(raw_name);
+        let first = segments.first()?;
+        // `self::` / `super::` are module-relative: the graph carries no anchor
+        // for the importing file's own module path at scan time, so these
+        // stay unresolved (documented gap, matching the who-imports lane).
+        if first == "self" || first == "super" {
+            return None;
+        }
+        // `crate::…` resolves within the importing file's own crate-root
+        // group — no crate name needed. An absolute `<name>::…` resolves to
+        // the single group claiming the name; external crates (`std`,
+        // `serde`, …) and ambiguous names resolve nothing.
+        let group_id = if first == "crate" {
+            crate_root_id(importer_path)
+        } else {
+            self.name_to_group.get(first)?.clone()
+        };
+        let entry = self.entries.get(&group_id)?;
+
+        // Walk the module segments from the entry file. `module_path` is the
+        // crate-root-relative path of the module currently descended into;
+        // `file_module_path` is the crate-root-relative path of the module
+        // whose body the current file holds (a prefix of `module_path`).
+        let mut file = entry.clone();
+        let mut module_path: Vec<String> = Vec::new();
+        let mut file_module_path: Vec<String> = Vec::new();
+        let mut visited_files: Vec<String> = vec![file.clone()];
+        // The deepest resolvable module: `None` until the first module
+        // segment resolves; a trailing symbol leaf (`Baz` in `crate::a::Baz`)
+        // keeps the enclosing module as the target.
+        let mut target: Option<(ImportTargetKind, String)> = None;
+        for seg in &segments[1..] {
+            let rel_start = file_module_path.len();
+            if module_path.len() < rel_start {
+                return None;
+            }
+            let mut child_rel: Vec<String> = module_path[rel_start..].to_vec();
+            child_rel.push(seg.clone());
+            let child_name = child_rel.join("::");
+            let key = (file.clone(), child_name);
+            let inline_id = if self.ambiguous_modules.contains(&key) {
+                None
+            } else {
+                self.inline_modules.get(&key)
+            };
+            let out_of_line: Vec<&OutOfLineModFact> =
+                facts_by_file.get(&file).map_or(Vec::new(), |facts| {
+                    facts
+                        .out_of_line_mods
+                        .iter()
+                        .filter(|fact| {
+                            fact.name == *seg
+                                && fact.inline_module_path == module_path[rel_start..].to_vec()
+                        })
+                        .collect()
+                });
+            match (inline_id, out_of_line.as_slice()) {
+                (Some(id), []) => {
+                    // A purely inline module: no out-of-line declaration
+                    // competes for the name.
+                    module_path.push(seg.clone());
+                    target = Some((ImportTargetKind::Module, id.clone()));
+                }
+                (_, [fact]) => {
+                    // Out-of-line `mod name;` wins over the declaration's own
+                    // Module node (the extractor mints both): the imported
+                    // items live in the body file, so the edge targets it.
+                    let next = resolve_out_of_line_target(&file, fact, &self.known_paths)?;
+                    // A `#[path]` cycle would loop the walk: fail closed.
+                    if visited_files.contains(&next) {
+                        return None;
+                    }
+                    visited_files.push(next.clone());
+                    module_path.push(seg.clone());
+                    file.clone_from(&next);
+                    file_module_path.clone_from(&module_path);
+                    target = Some((ImportTargetKind::File, self.file_node_id(&next)));
+                }
+                // Unresolvable, or contradictory (two competing declarations):
+                // stop at the deepest resolved module.
+                _ => break,
+            }
+        }
+
+        let (target_id, display) = match target {
+            Some((ImportTargetKind::Module, id)) => (id, module_path.join("::")),
+            Some((ImportTargetKind::File, id)) => (id, file.clone()),
+            None => {
+                // The import named the crate root itself (`use mycrate;`):
+                // target the entry file. Anything else with no resolved
+                // module segment resolves nothing.
+                if segments.len() == 1 {
+                    (self.file_node_id(entry), entry.clone())
+                } else {
+                    return None;
+                }
+            }
+        };
+        Some(ResolvedImportTarget { target_id, display })
+    }
+}
+
+/// Mints `IMPORTS` edges from each importing file to the imported Module/File
+/// target (issue #444).
+///
+/// Every `File —IMPORTS→ Import` edge the extractors mint says "this file
+/// declares this `use`"; this pass adds the target-side edge
+/// `File —IMPORTS→ Module|File` for each Rust import it can resolve to an
+/// in-repo module, so "which files import module X" is answerable by
+/// traversing inbound `IMPORTS` edges of the module's node — no `jq` over the
+/// raw JSONL.
+///
+/// Resolution is fail-closed: an import mints an edge only when every step is
+/// grounded in facts the graph already carries (inline `Module` nodes,
+/// resolved out-of-line `mod` declarations, crate-root partitioning, owning
+/// package attribution). Documented bounds — no edge rather than a wrong
+/// edge — are listed on [`ImportTargetIndex::resolve_import`]'s semantics
+/// above: Rust only, absolute paths only (`crate::…` or `<crate_name>::…`),
+/// deepest resolvable module wins, external/unresolvable/ambiguous paths
+/// mint nothing, and groups without exactly one entry file resolve nothing.
+///
+/// Output is deterministic: edges are deduplicated by stable edge id
+/// (`edge/IMPORTS/source/target`) and returned sorted by id, so repeated scans
+/// of an unchanged tree are byte-identical.
+#[must_use]
+pub fn cross_file_import_target_edges(
+    repository_id: &str,
+    records: &[GraphRecord],
+    facts_by_file: &BTreeMap<String, FileFacts>,
+    attribution: &CrateAttributionIndex,
+) -> Vec<GraphRecord> {
+    let index = ImportTargetIndex::build(repository_id, records, facts_by_file, attribution);
+    // Edge id → record, deduplicating the repeat-import case (`use
+    // crate::a::X; use crate::a::Y;` in one file mints one edge).
+    let mut edges: BTreeMap<String, GraphRecord> = BTreeMap::new();
+    for record in records {
+        let GraphRecord::Node {
+            kind: NodeKind::Import,
+            name: Some(raw_name),
+            repo_relative_path: Some(importer_path),
+            language,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if language.as_deref() != Some("rust") {
+            continue;
+        }
+        let Some(resolved) = index.resolve_import(importer_path, raw_name, facts_by_file) else {
+            continue;
+        };
+        let source = index.file_node_id(importer_path);
+        let summary = format!(
+            "{importer_path} imports {} (Rust import {raw_name})",
+            resolved.display
+        );
+        let edge = GraphRecord::edge(
+            EdgeLabel::Imports,
+            source,
+            resolved.target_id,
+            Some("1.0".to_owned()),
+            summary,
+        );
+        edges.insert(edge.id().to_owned(), edge);
+    }
+    edges.into_values().collect()
 }
 
 /// Marks panic-risk call sites inside out-of-line `#[cfg(test)]` modules as
@@ -446,11 +1038,202 @@ pub fn apply_out_of_line_test_scope(
     records: &mut [GraphRecord],
     facts_by_file: &BTreeMap<String, FileFacts>,
 ) {
-    // Known repo-relative file paths: fact keys plus every file-backed record
-    // path, so a module file that exported no facts still resolves.
-    let mut known_paths: std::collections::BTreeSet<String> =
-        facts_by_file.keys().cloned().collect();
-    for record in records.iter() {
+    let known_paths = known_file_paths(records, facts_by_file);
+    let test_files = test_only_module_files(facts_by_file, &known_paths);
+    if test_files.is_empty() {
+        return;
+    }
+
+    for record in records.iter_mut() {
+        if let GraphRecord::Node {
+            kind: NodeKind::PanicRiskSite,
+            repo_relative_path: Some(path),
+            call_context,
+            ..
+        } = record
+            && test_files.contains(path.as_str())
+        {
+            *call_context = Some("test".to_owned());
+        }
+    }
+}
+
+/// Stamps the test-vs-production role on `File` AND `Symbol` records for
+/// out-of-line `#[cfg(test)]`-gated modules (issue #238).
+///
+/// The per-file extractor stamps each `File` record's role from its path
+/// alone and each `Symbol` record's role from its lexical signals alone, so a
+/// `#[cfg(test)] mod helpers;` declaration (whose body lives in
+/// `src/helpers.rs`) would leave that file — and every symbol it defines —
+/// `Production` even though the module only compiles under `cfg(test)`.
+/// Issue #238's signal (b) explicitly covers out-of-line modules, so this
+/// deterministic repo-wide pass upgrades those `File` records AND the
+/// `Symbol` records they contain to `Test`, sharing issue #223's test-only
+/// module resolution — including production-precedence for dual-use files,
+/// so a module file also loaded by an ungated declaration (and its symbols)
+/// keeps `Production`. `role` is never an identity input, so record IDs are
+/// unchanged; records already `Test` (via path or lexical signals) are
+/// untouched.
+pub fn apply_out_of_line_test_roles(
+    records: &mut [GraphRecord],
+    facts_by_file: &BTreeMap<String, FileFacts>,
+) {
+    let known_paths = known_file_paths(records, facts_by_file);
+    let test_files = test_only_module_files(facts_by_file, &known_paths);
+    if test_files.is_empty() {
+        return;
+    }
+
+    for record in records.iter_mut() {
+        if let GraphRecord::Node {
+            kind: NodeKind::File | NodeKind::Symbol,
+            repo_relative_path: Some(path),
+            role,
+            ..
+        } = record
+            && test_files.contains(path.as_str())
+        {
+            *role = Some(SymbolRole::Test);
+        }
+    }
+}
+
+/// Propagates conditional-compilation gates across out-of-line module
+/// declarations (issue #190).
+///
+/// A `#[cfg(feature = "x")] mod foo;` declaration gates the whole target
+/// file, which is extracted with no view
+/// of the gating attribute. The repo-wide pass prepends each declaration's
+/// gate chain to every `File` / `Symbol` / `Module` record of the resolved
+/// target file, outermost gate first.
+///
+/// Composition rule (deterministic, documented in `docs/cli/query.md`):
+/// - A target file inherits the *effective* chain of each declaration loading
+///   it: the declaring file's own inherited gates, then the declaration's
+///   extracted chain (declaring file's `#![cfg]` inner attributes, enclosing
+///   gated items outermost-first, the `mod x;` item's own predicates).
+/// - Transitivity falls out of the fixpoint: when `a.rs` declares
+///   `#[cfg(x)] mod b;` and `b.rs` declares `#[cfg(y)] mod c;`, `c`'s records
+///   carry `[x, y]` — `b`'s inherited `[x]` prefixes `b`'s declaration chain
+///   `[y]`.
+/// - Dual-use declarations: if ANY declaration loading the target is
+///   effectively ungated (empty chain), the target inherits nothing — the
+///   file compiles without the gate, mirroring the test-role pass's
+///   production-precedence rule. Otherwise the target inherits the union of
+///   all effective chains, deduplicated, declaring files in sorted order and
+///   declarations in fact order.
+/// - A record's own gates are never dropped or reordered: inherited gates are
+///   prepended, then exact-duplicate predicates collapse (first occurrence
+///   wins), so re-running the pass over already-stamped records is a no-op.
+///
+/// Recomputed over the whole assembled graph every scan — never cached — so a
+/// gating change in a parent file re-gates an unchanged module file's cached
+/// records correctly. The stamping is idempotent, so incremental reassembly
+/// cannot double-apply it.
+pub fn apply_out_of_line_cfg_gates(
+    records: &mut [GraphRecord],
+    facts_by_file: &BTreeMap<String, FileFacts>,
+) {
+    let known_paths = known_file_paths(records, facts_by_file);
+    // Resolve every out-of-line declaration once into (target, declaring
+    // file, extracted chain) triples.
+    let mut declarations: Vec<(String, String, Vec<String>)> = Vec::new();
+    for (file, facts) in facts_by_file {
+        for fact in &facts.out_of_line_mods {
+            if let Some(target) = resolve_out_of_line_target(file, fact, &known_paths) {
+                declarations.push((target, file.clone(), fact.cfg_gates.clone()));
+            }
+        }
+    }
+    if declarations.is_empty() {
+        return;
+    }
+
+    // Fixpoint over declaring files' inherited gates: a declaring file's own
+    // inherited gates prefix every chain it contributes. Monotone growth over
+    // a finite predicate universe — terminates. `BTreeMap` iteration keeps
+    // the union order deterministic.
+    let mut inherited: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    loop {
+        let mut changed = false;
+        // Per-target effective chains under the current `inherited` map.
+        let mut target_chains: BTreeMap<String, Vec<Vec<String>>> = BTreeMap::new();
+        for (target, declaring_file, chain) in &declarations {
+            let mut effective = inherited.get(declaring_file).cloned().unwrap_or_default();
+            effective.extend(chain.iter().cloned());
+            target_chains
+                .entry(target.clone())
+                .or_default()
+                .push(effective);
+        }
+        for (target, chains) in &target_chains {
+            // Ungated wins: any effectively-ungated declaration means the
+            // target compiles without a gate.
+            if chains.iter().any(Vec::is_empty) {
+                if inherited.remove(target).is_some() {
+                    changed = true;
+                }
+                continue;
+            }
+            let mut union: Vec<String> = Vec::new();
+            for chain in chains {
+                for gate in chain {
+                    if !union.contains(gate) {
+                        union.push(gate.clone());
+                    }
+                }
+            }
+            if inherited.get(target) != Some(&union) {
+                inherited.insert(target.clone(), union);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    if inherited.is_empty() {
+        return;
+    }
+
+    for record in records.iter_mut() {
+        let GraphRecord::Node {
+            kind: NodeKind::File | NodeKind::Symbol | NodeKind::Module,
+            repo_relative_path: Some(path),
+            ..
+        } = record
+        else {
+            continue;
+        };
+        let Some(prefix) = inherited.get(path.as_str()) else {
+            continue;
+        };
+        if prefix.is_empty() {
+            continue;
+        }
+        let existing = record.cfg().cloned().unwrap_or_default();
+        let mut merged = prefix.clone();
+        for gate in existing {
+            if !merged.contains(&gate) {
+                merged.push(gate);
+            }
+        }
+        // `with_cfg` consumes the record; clone, stamp, and write back.
+        // Every record reaching this point has a non-empty merged chain.
+        let stamped = record.clone().with_cfg(merged);
+        *record = stamped;
+    }
+}
+
+/// Every repo-relative file path the repo-wide out-of-line passes can resolve
+/// a module declaration against: fact keys plus every file-backed record
+/// path, so a module file that exported no facts still resolves.
+fn known_file_paths(
+    records: &[GraphRecord],
+    facts_by_file: &BTreeMap<String, FileFacts>,
+) -> BTreeSet<String> {
+    let mut known_paths: BTreeSet<String> = facts_by_file.keys().cloned().collect();
+    for record in records {
         if let GraphRecord::Node {
             repo_relative_path: Some(path),
             ..
@@ -459,32 +1242,43 @@ pub fn apply_out_of_line_test_scope(
             known_paths.insert(path.clone());
         }
     }
+    known_paths
+}
 
+/// Resolves out-of-line module declarations to the set of files reachable
+/// ONLY through test-gated declarations (issue #223's rule, shared with the
+/// issue #238 `File`-role pass).
+///
+/// Production takes precedence for dual-use files: a module file that a
+/// non-test declaration also loads still compiles into the production build,
+/// so it is excluded from the returned set. The production-reachable set is
+/// seeded by declaring files that are never themselves loaded as out-of-line
+/// modules (e.g. crate roots) plus conventional crate roots (which always
+/// compile into a production build), then propagated through ungated
+/// declarations to a fixpoint; the test set seeds from every test-gated
+/// declaration's target and expands through all declarations of test-only
+/// files — never rewriting or expanding through anything
+/// production-reachable. Deterministic: `BTreeSet` iteration throughout.
+fn test_only_module_files(
+    facts_by_file: &BTreeMap<String, FileFacts>,
+    known_paths: &BTreeSet<String>,
+) -> BTreeSet<String> {
     // Resolve every out-of-line declaration once into (from, to, gated)
     // module-load edges.
     let mut edges: Vec<(String, String, bool)> = Vec::new();
     for (file, facts) in facts_by_file {
         for fact in &facts.out_of_line_mods {
-            if let Some(target) = resolve_out_of_line_target(file, fact, &known_paths) {
+            if let Some(target) = resolve_out_of_line_target(file, fact, known_paths) {
                 edges.push((file.clone(), target, fact.test_gated));
             }
         }
     }
     if edges.is_empty() {
-        return;
+        return BTreeSet::new();
     }
 
-    // Production takes precedence for dual-use files: a module file that a
-    // non-test declaration also loads still compiles into the production
-    // build, and hiding its panic-risk sites behind a `test` label would
-    // hide production risk. Compute the production-reachable set first —
-    // declaring files that are never themselves loaded as out-of-line
-    // modules (e.g. crate roots) seed it, and it propagates through ungated
-    // declarations to a fixpoint — then never rewrite (or expand through)
-    // anything production-reachable.
-    let targets: std::collections::BTreeSet<&str> =
-        edges.iter().map(|(_, to, _)| to.as_str()).collect();
-    let mut production: std::collections::BTreeSet<String> = edges
+    let targets: BTreeSet<&str> = edges.iter().map(|(_, to, _)| to.as_str()).collect();
+    let mut production: BTreeSet<String> = edges
         .iter()
         .filter(|(from, _, _)| !targets.contains(from.as_str()))
         .map(|(from, _, _)| from.clone())
@@ -516,7 +1310,7 @@ pub fn apply_out_of_line_test_scope(
     // target, expand through all declarations of test-only files — but a
     // production-reachable file is never rewritten and never expanded
     // through (its children compile in the production instantiation too).
-    let mut test_files: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut test_files: BTreeSet<String> = BTreeSet::new();
     let mut worklist: Vec<String> = edges
         .iter()
         .filter(|(_, _, gated)| *gated)
@@ -532,22 +1326,7 @@ pub fn apply_out_of_line_test_scope(
             }
         }
     }
-    if test_files.is_empty() {
-        return;
-    }
-
-    for record in records.iter_mut() {
-        if let GraphRecord::Node {
-            kind: NodeKind::PanicRiskSite,
-            repo_relative_path: Some(path),
-            call_context,
-            ..
-        } = record
-            && test_files.contains(path.as_str())
-        {
-            *call_context = Some("test".to_owned());
-        }
-    }
+    test_files
 }
 
 /// Resolves one out-of-line module declaration to a scanned repo-relative
@@ -797,42 +1576,19 @@ fn resolve_aux_helper_mod(
         .then_some(dir_candidate)
 }
 
-/// Computes a crate-root REASSIGNMENT map for auxiliary-target (test / example /
-/// bench) HELPER module files, closing the recall gap where a shared helper like
-/// `tests/common/mod.rs` — path-classified into its OWN synthetic crate root
-/// `test:common` by [`crate_root_id`] — actually belongs to the entry crate that
-/// `mod`-includes it (`test:it` for `tests/it.rs`). Issue #394 restricts a
-/// pending impl's candidate traits to its own crate root, so without this remap
-/// an `impl crate::T for Foo` in the helper cannot resolve a trait `T` defined in
-/// the entry file — a MISSING `IMPLEMENTS` edge (Codex round-2/3, PR #399: "test
-/// / example helper modules are stamped their own root").
+/// Walks each aux ENTRY crate root's ([`aux_entry_crate_root`]) transitive plain
+/// `mod <name>;` declarations ([`resolve_aux_helper_mod`], nested helpers
+/// included) and returns, for every reached helper file, the SORTED list of
+/// distinct entry crate roots that include it.
 ///
-/// Path alone cannot decide the owning crate; the `mod` inclusion graph must be
-/// consulted. Each aux ENTRY crate root ([`aux_entry_crate_root`]) seeds a walk
-/// down its transitive plain `mod <name>;` declarations (nested helpers
-/// included). A helper reachable from EXACTLY ONE entry crate is remapped to that
-/// entry's crate root; a helper reachable from ZERO or from 2+ distinct entry
-/// crates keeps its path-based crate root (conservative — a shared or standalone
-/// helper stays unresolved rather than binding one interpretation, preserving the
-/// no-wrong-edge invariant). A helper that is ITSELF an aux entry crate root
-/// (`tests/common.rs`, which cargo also compiles as its own test target) counts
-/// as belonging to its own crate and is never remapped.
-///
-/// Only test/example/bench helper files are reassigned; `lib`/`bin`/`build`
-/// assignment is untouched. The returned map is helper repo-relative path ->
-/// reassigned crate root, applied by [`cross_file_implements_records`] as an
-/// in-pass fact remap — no serialized fact shape changes, so
-/// `CACHE_SCHEMA_VERSION` is unaffected.
-///
-/// Documented residual bound: only the `crate_root` partition key is remapped,
-/// not a helper symbol's crate-root-relative `qualified_name`. A DEEPLY nested
-/// helper that defines a root-level symbol colliding by simple name with the
-/// entry crate's own root symbol can therefore become same-name-ambiguous and
-/// stay unresolved (a conservative MISSING edge), never a wrong edge. The
-/// direct, canonical single-`mod` helper case (the reported gap) resolves.
-fn reassign_aux_helper_crate_roots(
+/// The seed of each walk is the entry crate root itself (owns its CONTAINING
+/// directory); every reached helper is an ordinary module file. `visited` is
+/// per-entry, so inclusion cycles terminate. A `BTreeSet` accumulates the
+/// includer roots, so each helper's list is sorted and duplicate-free —
+/// deterministic and byte-identical across runs.
+fn aux_helper_includer_roots(
     facts_by_file: &BTreeMap<String, FileFacts>,
-) -> BTreeMap<String, String> {
+) -> BTreeMap<String, Vec<String>> {
     let known_paths: std::collections::BTreeSet<String> = facts_by_file.keys().cloned().collect();
     // helper repo-relative path -> the distinct entry crate roots that
     // transitively include it via plain `mod` declarations.
@@ -865,31 +1621,148 @@ fn reassign_aux_helper_crate_roots(
             }
         }
     }
+    reached
+        .into_iter()
+        .map(|(helper, roots)| (helper, roots.into_iter().collect()))
+        .collect()
+}
+
+/// Computes a crate-root REASSIGNMENT map for auxiliary-target (test / example /
+/// bench) HELPER module files, closing the recall gap where a shared helper like
+/// `tests/common/mod.rs` — path-classified into its OWN synthetic crate root
+/// `test:common` by [`crate_root_id`] — actually belongs to the entry crate that
+/// `mod`-includes it (`test:it` for `tests/it.rs`). Issue #394 restricts a
+/// pending impl's candidate traits to its own crate root, so without this remap
+/// an `impl crate::T for Foo` in the helper cannot resolve a trait `T` defined in
+/// the entry file — a MISSING `IMPLEMENTS` edge (Codex round-2/3, PR #399: "test
+/// / example helper modules are stamped their own root").
+///
+/// Path alone cannot decide the owning crate; the `mod` inclusion graph
+/// ([`aux_helper_includer_roots`]) is consulted. A helper reachable from EXACTLY
+/// ONE entry crate is remapped to that entry's crate root; a helper reachable
+/// from ZERO entry crates keeps its path-based crate root (conservative — a
+/// standalone helper stays unresolved rather than binding one interpretation,
+/// preserving the no-wrong-edge invariant). A helper shared by 2+ distinct entry
+/// crates is NOT remapped here either (no single owner to pick); issue #401
+/// recovers its recall instead via [`multi_includer_aux_helper_roots`] +
+/// [`duplicate_multi_includer_helpers`]. A helper that is ITSELF an aux entry
+/// crate root (`tests/common.rs`, which cargo also compiles as its own test
+/// target) counts as belonging to its own crate and is never remapped.
+///
+/// Only test/example/bench helper files are reassigned; `lib`/`bin`/`build`
+/// assignment is untouched. The returned map is helper repo-relative path ->
+/// reassigned crate root, applied by [`cross_file_implements_records`] as an
+/// in-pass fact remap — no serialized fact shape changes, so
+/// `CACHE_SCHEMA_VERSION` is unaffected.
+///
+/// Documented residual bound: only the `crate_root` partition key is remapped,
+/// not a helper symbol's crate-root-relative `qualified_name`. A DEEPLY nested
+/// helper that defines a root-level symbol colliding by simple name with the
+/// entry crate's own root symbol can therefore become same-name-ambiguous and
+/// stay unresolved (a conservative MISSING edge), never a wrong edge. The
+/// direct, canonical single-`mod` helper case (the reported gap) resolves.
+fn reassign_aux_helper_crate_roots(
+    facts_by_file: &BTreeMap<String, FileFacts>,
+) -> BTreeMap<String, String> {
     let mut remap: BTreeMap<String, String> = BTreeMap::new();
-    for (helper, roots) in reached {
+    for (helper, roots) in aux_helper_includer_roots(facts_by_file) {
         // Conservative multi/zero-includer bound: only a single-includer helper
-        // is remapped.
-        if roots.len() != 1 {
+        // is remapped. A helper shared by 2+ entry crates is duplicated per
+        // includer root instead (issue #401); it never lands in this map.
+        let [new_root] = roots.as_slice() else {
             continue;
-        }
+        };
         // A file cargo compiles as its OWN aux target belongs to its own crate;
         // never steal it into the including entry (it lives in 2+ crates).
         if aux_entry_crate_root(&helper).is_some() {
             continue;
         }
-        let new_root = roots.into_iter().next().expect("exactly one includer");
-        if crate_root_id(&helper) != new_root {
-            remap.insert(helper, new_root);
+        if crate_root_id(&helper) != *new_root {
+            remap.insert(helper, new_root.clone());
         }
     }
     remap
 }
 
+/// Computes the multi-includer helper map for auxiliary-target (test / example /
+/// bench) HELPER module files (issue #401): every helper file transitively
+/// `mod`-included by 2+ DISTINCT entry crate roots, mapped to the SORTED list of
+/// those entry roots.
+///
+/// Cargo compiles each integration-test / example / bench target as its own
+/// crate, so a helper shared by `tests/a.rs` and `tests/b.rs` is REALLY compiled
+/// once per including target — but path-based [`crate_root_id`] stamps it one
+/// synthetic root (`test:common`), and [`reassign_aux_helper_crate_roots`]
+/// conservatively leaves multi-includer helpers un-remapped (no single owner to
+/// pick). [`cross_file_implements_records`] therefore DUPLICATES such a helper's
+/// facts once per including crate root
+/// ([`duplicate_multi_includer_helpers`]): each duplicate resolves strictly
+/// within its own crate root (#394 isolation), so the duplication recovers the
+/// lost `IMPLEMENTS` recall with no wrong-edge risk — one edge per real
+/// compilation.
+///
+/// A helper that is ITSELF an aux entry crate root (`tests/common.rs`, which
+/// cargo also compiles as its own test target) belongs to its own crate and is
+/// never duplicated into its includers.
+#[must_use]
+fn multi_includer_aux_helper_roots(
+    facts_by_file: &BTreeMap<String, FileFacts>,
+) -> BTreeMap<String, Vec<String>> {
+    aux_helper_includer_roots(facts_by_file)
+        .into_iter()
+        .filter(|(helper, roots)| roots.len() >= 2 && aux_entry_crate_root(helper).is_none())
+        .collect()
+}
+
+/// Duplicates a multi-includer aux helper's facts once per including entry
+/// crate root (issue #401). For each helper in `multi`, one copy of its
+/// [`FileFacts::impl_targets`] / [`FileFacts::pending_impls`] is appended per
+/// includer root with `crate_root` rewritten to that root — mirroring the real
+/// compilations cargo performs (the helper is compiled once per including test
+/// / example / bench target). The helper's original path-stamped copies are
+/// kept, so the phantom partition resolves exactly as before (status quo, never
+/// worse). Only the `crate_root` partition key changes; qualified names, module
+/// paths, and imports are untouched — a pure re-partition, deterministic and
+/// byte-identical across runs.
+#[must_use]
+fn duplicate_multi_includer_helpers(
+    facts_by_file: &BTreeMap<String, FileFacts>,
+    multi: &BTreeMap<String, Vec<String>>,
+) -> BTreeMap<String, FileFacts> {
+    let mut out = facts_by_file.clone();
+    for (path, roots) in multi {
+        let Some(facts) = out.get_mut(path) else {
+            continue;
+        };
+        // Build the per-root copies from the ORIGINAL vectors first: appending
+        // while iterating the same vector would trip the borrow checker (and
+        // duplicating the duplicates would be wrong).
+        let mut extra_targets: Vec<ImplTargetFact> = Vec::new();
+        let mut extra_pending: Vec<PendingImplFact> = Vec::new();
+        for root in roots {
+            for target in &facts.impl_targets {
+                let mut duplicate = target.clone();
+                duplicate.crate_root.clone_from(root);
+                extra_targets.push(duplicate);
+            }
+            for pending in &facts.pending_impls {
+                let mut duplicate = pending.clone();
+                duplicate.crate_root.clone_from(root);
+                extra_pending.push(duplicate);
+            }
+        }
+        facts.impl_targets.extend(extra_targets);
+        facts.pending_impls.extend(extra_pending);
+    }
+    out
+}
+
 /// Applies a [`reassign_aux_helper_crate_roots`] remap to a CLONE of the facts,
-/// rewriting the `crate_root` on every `ImplTargetFact` and `PendingImplFact` of
-/// each remapped helper file. Only the `crate_root` partition key changes;
-/// qualified names, module paths, and imports are untouched, so this is a pure
-/// re-partition, deterministic and byte-identical across runs.
+/// rewriting the `crate_root` on every `ImplTargetFact`, `PendingImplFact`, and
+/// `ImplTraitRelationFact` of each remapped helper file. Only the `crate_root`
+/// partition key changes; qualified names, module paths, and imports are
+/// untouched, so this is a pure re-partition, deterministic and byte-identical
+/// across runs.
 fn apply_crate_root_remap(
     facts_by_file: &BTreeMap<String, FileFacts>,
     remap: &BTreeMap<String, String>,
@@ -902,6 +1775,13 @@ fn apply_crate_root_remap(
             }
             for pending in &mut facts.pending_impls {
                 pending.crate_root.clone_from(new_root);
+            }
+            // The IMPLEMENTS-gated self-dispatch join (issue #414) keys
+            // `impl_trait_relations` by `crate_root`, so a helper's relations
+            // move with the rest of its facts: otherwise the CALLS pass would
+            // look them up under the entry root and miss (issue #475).
+            for relation in &mut facts.impl_trait_relations {
+                relation.crate_root.clone_from(new_root);
             }
         }
     }
@@ -957,72 +1837,66 @@ fn join_segments(dir: &[String], suffix: &str) -> Option<String> {
     Some(segments.join("/"))
 }
 
-/// Computes the cross-file call records for one scanned tree.
-///
-/// Returned records are `Diagnostic` nodes for unresolved calls followed by
-/// `CALLS` edges, in deterministic order. It also appends the `CONSTRUCTS`
-/// struct-literal edges (issue #443) via [`cross_file_construct_records`], so
-/// every driver that emits cross-file CALLS gets CONSTRUCTS with no extra wiring.
-#[must_use]
-pub fn cross_file_call_records(
-    repository_id: &str,
-    facts_by_file: &BTreeMap<String, FileFacts>,
-) -> Vec<GraphRecord> {
-    let index = DefinitionIndex::build(facts_by_file);
-
-    // (source, target) -> strongest resolution + summary, deduplicating
-    // repeated call sites between the same pair.
-    let mut edges: BTreeMap<(String, String), (CallResolution, String)> = BTreeMap::new();
-    // (file, callee display) -> first-seen span, for diagnostic nodes.
-    let mut diagnostics: BTreeMap<(String, String), SourceSpan> = BTreeMap::new();
-    // (file, callee display, caller ID) -> caller name, for unresolved edges.
-    let mut diagnostic_edges: BTreeMap<(String, String, String), String> = BTreeMap::new();
-
-    for (path, facts) in facts_by_file {
-        let caller_crate_root = crate_root_id(path);
-        for call in &facts.call_sites {
-            let Some(simple_name) = call.callee_segments.last() else {
-                continue;
-            };
-            let candidates = index.candidates(call, simple_name, &caller_crate_root);
-            match candidates.len() {
-                0 => {
-                    record_unresolved(
-                        path,
-                        call,
-                        simple_name,
-                        &mut diagnostics,
-                        &mut diagnostic_edges,
-                    );
-                }
-                1 => {
-                    record_candidate_edge(
-                        path,
-                        call,
-                        candidates[0],
-                        CallResolution::Resolved,
-                        1,
-                        &mut edges,
-                    );
-                }
-                n => {
-                    for candidate in &candidates {
-                        record_candidate_edge(
-                            path,
-                            call,
-                            candidate,
-                            CallResolution::Ambiguous,
-                            n,
-                            &mut edges,
-                        );
-                    }
-                }
-            }
+/// Per-body set of simple callee names with a trait-dispatch call site
+/// (issue #267). The per-file textual pass suppresses its own CALLS edge for
+/// these names (the repo-wide pass owns dispatch pairs now, same-file
+/// included), so the cross-file pass must emit the same-file pairs it would
+/// otherwise skip — for the dispatch sites AND for any static site in the same
+/// body that the textual pass no longer covers. Rebuilt from facts alone so
+/// history replay and the incremental cache agree with the extractor's
+/// suppression.
+fn dispatch_suppressed_names(facts: &FileFacts) -> BTreeMap<&str, BTreeSet<&str>> {
+    let mut suppressed: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for call in &facts.call_sites {
+        if call.dispatch_trait.is_some()
+            && let Some(simple_name) = call.callee_segments.last()
+        {
+            suppressed
+                .entry(call.caller_id.as_str())
+                .or_default()
+                .insert(simple_name.as_str());
         }
     }
+    suppressed
+}
 
-    let mut records = Vec::new();
-    for ((path, display), span) in &diagnostics {
+/// Emits the deduplicated cross-file `CALLS` edge records, attaching
+/// resolved call-site spans only to provably single-target pairs
+/// (issue #462; the #233 fabrication-guard discipline).
+fn emit_call_edge_records(
+    records: &mut Vec<GraphRecord>,
+    edges: BTreeMap<(String, String), (CallResolution, String, Vec<SourceSpan>)>,
+) {
+    for ((source, target), (resolution, summary, spans)) in edges {
+        let confidence = match resolution {
+            CallResolution::Resolved => Some("1.0".to_owned()),
+            CallResolution::Ambiguous
+            | CallResolution::Unresolved
+            | CallResolution::UnresolvedDispatch => None,
+        };
+        let mut record = GraphRecord::edge(EdgeLabel::Calls, source, target, confidence, summary)
+            .with_resolution(resolution);
+        // Only a provably single-target pair keeps its call-site spans; an
+        // ambiguous pair drops them even when a resolved site contributed
+        // (issue #462, the #233 fabrication-guard discipline).
+        if resolution == CallResolution::Resolved && !spans.is_empty() {
+            record = record.with_call_site_spans(spans);
+        }
+        records.push(record);
+    }
+}
+
+/// Emits the unresolved-call and unresolved-dispatch `Diagnostic` marker nodes
+/// plus their caller edges (issues #233, #267).
+fn emit_unresolved_records(
+    repository_id: &str,
+    records: &mut Vec<GraphRecord>,
+    diagnostics: &BTreeMap<(String, String), SourceSpan>,
+    dispatch_diagnostics: &BTreeMap<(String, String, String), SourceSpan>,
+    diagnostic_edges: BTreeMap<(String, String, String), String>,
+    dispatch_diagnostic_edges: BTreeMap<(String, String, String, String), String>,
+) {
+    for ((path, display), span) in diagnostics {
         records.push(unresolved_call_diagnostic(
             repository_id,
             path,
@@ -1030,15 +1904,14 @@ pub fn cross_file_call_records(
             *span,
         ));
     }
-    for ((source, target), (resolution, summary)) in edges {
-        let confidence = match resolution {
-            CallResolution::Resolved => Some("1.0".to_owned()),
-            CallResolution::Ambiguous | CallResolution::Unresolved => None,
-        };
-        records.push(
-            GraphRecord::edge(EdgeLabel::Calls, source, target, confidence, summary)
-                .with_resolution(resolution),
-        );
+    for ((path, trait_path, method), span) in dispatch_diagnostics {
+        records.push(unresolved_dispatch_diagnostic(
+            repository_id,
+            path,
+            trait_path,
+            method,
+            *span,
+        ));
     }
     for ((path, display, caller_id), caller_name) in diagnostic_edges {
         let target = unresolved_call_diagnostic_id(repository_id, &path, &display);
@@ -1053,8 +1926,276 @@ pub fn cross_file_call_records(
             .with_resolution(CallResolution::Unresolved),
         );
     }
+    for ((path, trait_path, method, caller_id), caller_name) in dispatch_diagnostic_edges {
+        let target = unresolved_dispatch_diagnostic_id(repository_id, &path, &trait_path, &method);
+        let display = format!("{trait_path}::{method}");
+        records.push(
+            GraphRecord::edge(
+                EdgeLabel::Calls,
+                caller_id,
+                target,
+                None,
+                format!("{caller_name} calls {display} (cross-file, unresolved_dispatch)"),
+            )
+            .with_resolution(CallResolution::UnresolvedDispatch),
+        );
+    }
+}
+
+/// Computes the cross-file call records for one scanned tree.
+///
+/// Returned records are `Diagnostic` nodes for unresolved calls followed by
+/// `CALLS` edges, in deterministic order. It also appends the `CONSTRUCTS`
+/// struct-literal edges (issue #443) via [`cross_file_construct_records`], so
+/// every driver that emits cross-file CALLS gets CONSTRUCTS with no extra wiring.
+///
+/// Auxiliary-target helper modules (`tests/common/mod.rs`) are reassigned to
+/// the entry crate that `mod`-includes them (issue #475) before resolution, on
+/// both the index side and the caller side, exactly as the IMPLEMENTS and
+/// CONSTRUCTS passes do.
+#[must_use]
+pub fn cross_file_call_records(
+    repository_id: &str,
+    facts_by_file: &BTreeMap<String, FileFacts>,
+) -> Vec<GraphRecord> {
+    // Reassign auxiliary-target helper modules (`tests/common/mod.rs`) to the
+    // entry crate that `mod`-includes them, exactly as
+    // [`cross_file_construct_records`] does (issue #475): a `crate::…` call in
+    // such a helper resolves against the including ENTRY crate in Rust, but
+    // path-based [`crate_root_id`] stamps the helper its OWN synthetic root
+    // (`test:common`), which confines the call to the wrong partition and drops
+    // its CALLS edge. The remap rewrites both the index side (helper
+    // definitions partition under the entry root via the remap-aware
+    // [`DefinitionIndex`]) and the caller side (each call site's
+    // `caller_crate_root`, looked up below). When nothing needs remapping the
+    // borrowed facts are used directly, keeping output byte-identical.
+    let remap = reassign_aux_helper_crate_roots(facts_by_file);
+    let remapped;
+    let facts_by_file: &BTreeMap<String, FileFacts> = if remap.is_empty() {
+        facts_by_file
+    } else {
+        remapped = apply_crate_root_remap(facts_by_file, &remap);
+        &remapped
+    };
+    let index = DefinitionIndex::build(facts_by_file, remap.clone());
+
+    // (source, target) -> (strongest resolution, summary, resolved call-site
+    // spans), deduplicating repeated call sites between the same pair. Spans
+    // are retained only from `Resolved` call sites and attached only when the
+    // pair's final resolution is `Resolved` (issue #462; the #233
+    // fabrication-guard discipline).
+    let mut edges: BTreeMap<(String, String), (CallResolution, String, Vec<SourceSpan>)> =
+        BTreeMap::new();
+    // (file, callee display) -> first-seen span, for diagnostic nodes.
+    let mut diagnostics: BTreeMap<(String, String), SourceSpan> = BTreeMap::new();
+    // (file, callee display, caller ID) -> caller name, for unresolved edges.
+    let mut diagnostic_edges: BTreeMap<(String, String, String), String> = BTreeMap::new();
+    // (file, dispatch trait path, method) -> first-seen span, for the typed
+    // issue #267 dispatch markers.
+    let mut dispatch_diagnostics: BTreeMap<(String, String, String), SourceSpan> = BTreeMap::new();
+    // (file, dispatch trait path, method, caller ID) -> caller name, for the
+    // typed dispatch-marker edges.
+    let mut dispatch_diagnostic_edges: BTreeMap<(String, String, String, String), String> =
+        BTreeMap::new();
+
+    for (path, facts) in facts_by_file {
+        let caller_crate_root = remap
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| crate_root_id(path));
+        let dispatch_suppressed = dispatch_suppressed_names(facts);
+        for call in &facts.call_sites {
+            let Some(simple_name) = call.callee_segments.last() else {
+                continue;
+            };
+            // Lexically-scoped block-local recall (issue #422): an in-scope
+            // block-local def shadows the flat pool for this call — a bare
+            // call in the enclosing body binds the block-local, never a
+            // same-named module-level def, and a call from any other scope
+            // never sees the block-local at all (the #413 guard, enforced by
+            // `block_local_candidates`' scope gate).
+            let block_locals = index.block_local_candidates(call, simple_name);
+            if record_block_local_call(call, &block_locals, &mut edges) {
+                continue;
+            }
+            let candidates = index.candidates(call, simple_name, &caller_crate_root);
+            let is_dispatch = call.dispatch_trait.is_some();
+            // Same-file pairs are emitted by the per-file textual pass for
+            // ordinary names; for dispatch-suppressed names that pass stays
+            // silent, so this pass emits them — dispatch sites always, and
+            // static sites in a dispatch-suppressed body too.
+            let emit_same_file = is_dispatch
+                || dispatch_suppressed
+                    .get(call.caller_id.as_str())
+                    .is_some_and(|names| names.contains(simple_name.as_str()));
+            match candidates.len() {
+                0 => {
+                    if let Some(trait_path) = &call.dispatch_trait {
+                        record_unresolved_dispatch(
+                            path,
+                            call,
+                            trait_path,
+                            &mut dispatch_diagnostics,
+                            &mut dispatch_diagnostic_edges,
+                        );
+                    } else {
+                        record_unresolved(
+                            path,
+                            call,
+                            simple_name,
+                            &mut diagnostics,
+                            &mut diagnostic_edges,
+                        );
+                    }
+                }
+                1 => {
+                    record_candidate_edge(
+                        path,
+                        call,
+                        candidates[0],
+                        CallResolution::Resolved,
+                        1,
+                        emit_same_file,
+                        &mut edges,
+                    );
+                }
+                n => {
+                    for candidate in &candidates {
+                        record_candidate_edge(
+                            path,
+                            call,
+                            candidate,
+                            CallResolution::Ambiguous,
+                            n,
+                            emit_same_file,
+                            &mut edges,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let mut records = Vec::new();
+    emit_call_edge_records(&mut records, edges);
+    emit_unresolved_records(
+        repository_id,
+        &mut records,
+        &diagnostics,
+        &dispatch_diagnostics,
+        diagnostic_edges,
+        dispatch_diagnostic_edges,
+    );
     records.extend(cross_file_construct_records(repository_id, facts_by_file));
     records.extend(cross_file_route_records(repository_id, facts_by_file));
+    records
+}
+
+/// Repo-wide macro-invocation resolution (issue #148).
+///
+/// Every `macro_invocation` site the Rust extractor recorded resolves against
+/// the repo-wide pool of `macro_rules!` definitions, matched on the
+/// invocation's simple name:
+///
+/// - exactly one repo-defined macro → a `CALLS` edge from the invoking scope
+///   to the macro's Symbol node, stamped `resolved`, carrying the invocation
+///   spans — INSTEAD OF an `unsupported macro invocation` Diagnostic;
+/// - zero definitions (external macros such as `println!`, dependency
+///   macros) → the pre-existing Diagnostic, with the same stable ID scheme
+///   the per-file extractor used, so external-macro diagnostics stay
+///   byte-identical;
+/// - two or more definitions → the name is ambiguous and must never silently
+///   bind one definition (the issue #134 direction); the site keeps its
+///   Diagnostic.
+///
+/// Purely syntactic and filesystem-local: simple-name matching over parsed
+/// source only — no macro-body expansion, no network, no embeddings, no
+/// agent-authored observations (the trust-separation boundary).
+///
+/// Deterministic: definitions index in sorted path order, invocation sites
+/// iterate in (path, source) order, and repeated invocations between one
+/// (caller, macro) pair collapse to a single edge.
+#[must_use]
+pub fn cross_file_macro_records(
+    repository_id: &str,
+    facts_by_file: &BTreeMap<String, FileFacts>,
+) -> Vec<GraphRecord> {
+    let mut index: BTreeMap<&str, Vec<&MacroDefinitionFact>> = BTreeMap::new();
+    for facts in facts_by_file.values() {
+        for definition in &facts.macro_definitions {
+            index
+                .entry(definition.simple_name.as_str())
+                .or_default()
+                .push(definition);
+        }
+    }
+    // (caller, macro) -> (caller name, simple name, invocation spans):
+    // repeated invocations between one pair collapse to a single edge, with
+    // every site's span retained (the issue #462 fabrication-guard rule:
+    // only provably single-target pairs keep spans).
+    let mut edges: BTreeMap<(String, String), (String, String, Vec<SourceSpan>)> = BTreeMap::new();
+    let mut diagnostics: Vec<GraphRecord> = Vec::new();
+    for (path, facts) in facts_by_file {
+        for invocation in &facts.macro_invocations {
+            let candidates: &[&MacroDefinitionFact] = index
+                .get(invocation.simple_name.as_str())
+                .map_or(&[], Vec::as_slice);
+            if candidates.len() == 1 {
+                let definition = candidates[0];
+                let entry = edges
+                    .entry((invocation.caller_id.clone(), definition.id.clone()))
+                    .or_insert_with(|| {
+                        (
+                            invocation.caller_name.clone(),
+                            invocation.simple_name.clone(),
+                            Vec::new(),
+                        )
+                    });
+                if !entry.2.contains(&invocation.span) {
+                    entry.2.push(invocation.span);
+                }
+                continue;
+            }
+            // Unresolvable here: either no repo-defined macro carries this
+            // name (external / dependency macro) or several do (ambiguous).
+            // Keep the pre-existing Diagnostic with its legacy stable ID.
+            let id = stable_id(&[
+                "node",
+                "diagnostic",
+                repository_id,
+                path,
+                &invocation.invocation_display,
+                &invocation.diagnostic_disambiguator.to_string(),
+            ]);
+            diagnostics.push(GraphRecord::syntax_node(
+                id,
+                NodeKind::Diagnostic,
+                path.clone(),
+                invocation.span,
+                invocation.invocation_display.clone(),
+                "rust",
+                format!(
+                    "unsupported macro invocation {}",
+                    invocation.invocation_display
+                ),
+            ));
+        }
+    }
+    let mut records: Vec<GraphRecord> = Vec::with_capacity(edges.len() + diagnostics.len());
+    for ((source, target), (caller_name, simple_name, spans)) in edges {
+        records.push(
+            GraphRecord::edge(
+                EdgeLabel::Calls,
+                source,
+                target,
+                Some("1.0".to_owned()),
+                format!("{caller_name} invokes macro {simple_name} (resolved)"),
+            )
+            .with_resolution(CallResolution::Resolved)
+            .with_call_site_spans(spans),
+        );
+    }
+    records.extend(diagnostics);
     records
 }
 
@@ -1082,7 +2223,9 @@ pub fn cross_file_route_records(
     // Reassign auxiliary-target helper modules (`tests/common/mod.rs`) to the
     // entry crate that `mod`-includes them, exactly as
     // [`cross_file_construct_records`] does, so a `crate::…`-scoped registration
-    // in such a helper resolves against the including entry crate.
+    // in such a helper resolves against the including entry crate. The remap
+    // also partitions a helper's own handler definitions under the entry root
+    // on the index side (issue #475), via the remap-aware [`DefinitionIndex`].
     let remap = reassign_aux_helper_crate_roots(facts_by_file);
     let remapped;
     let facts_by_file: &BTreeMap<String, FileFacts> = if remap.is_empty() {
@@ -1091,7 +2234,7 @@ pub fn cross_file_route_records(
         remapped = apply_crate_root_remap(facts_by_file, &remap);
         &remapped
     };
-    let index = DefinitionIndex::build(facts_by_file);
+    let index = DefinitionIndex::build(facts_by_file, remap.clone());
 
     // (owner_id, handler_symbol_id) -> summary, collapsing repeated
     // registrations between the same pair.
@@ -1123,6 +2266,7 @@ pub fn cross_file_route_records(
                 path_root: site.path_root.clone(),
                 receiver_owner: None,
                 receiver_type: None,
+                dispatch_trait: None,
                 span: site.span,
             };
             let candidates = index.candidates(&synthetic, simple_name, &caller_crate_root);
@@ -1338,6 +2482,21 @@ pub fn cross_file_implements_records(
     } else {
         remapped = apply_crate_root_remap(facts_by_file, &remap);
         &remapped
+    };
+    // Issue #401: a helper `mod`-included by 2+ entry crates is compiled once
+    // per including test/example/bench target, so its facts are duplicated per
+    // includer crate root before the index is built. Each duplicate resolves
+    // strictly within its own crate root (#394 isolation), recovering the lost
+    // `IMPLEMENTS` recall with no wrong-edge risk — one edge per real
+    // compilation. When no helper is shared the borrowed facts are used
+    // directly, keeping output byte-identical.
+    let multi = multi_includer_aux_helper_roots(facts_by_file);
+    let duplicated;
+    let facts_by_file: &BTreeMap<String, FileFacts> = if multi.is_empty() {
+        facts_by_file
+    } else {
+        duplicated = duplicate_multi_includer_helpers(facts_by_file, &multi);
+        &duplicated
     };
     let index = ImplTargetIndex::build(facts_by_file);
     // (source impl ID, trait target ID) -> summary, deduplicating so a source
@@ -1828,7 +2987,9 @@ fn normalize_absolute_trait_path(target: &str, module_names: &[String]) -> Optio
 /// repo-wide pass. Per-file `CALLS` edges with no corresponding call site
 /// (e.g. calls inside macro token trees, constructor-style matches) keep no
 /// resolution field — absence means "outside the resolution contract", never
-/// "resolved".
+/// "resolved". A pair labeled `resolved` also keeps the deduplicated spans of
+/// its `Resolved` call sites on the edge (`call_site_spans`, issue #462);
+/// `ambiguous` pairs keep none, per the #233 fabrication-guard discipline.
 ///
 /// The pass is deterministic: pair statuses come from `BTreeMap` iteration
 /// and repeated call sites for one pair keep the strongest status.
@@ -1847,6 +3008,7 @@ pub fn label_same_file_call_resolutions(
             target,
             confidence,
             resolution,
+            call_site_spans,
             ..
         } = record
         else {
@@ -1855,10 +3017,16 @@ pub fn label_same_file_call_resolutions(
         if resolution.is_some() {
             continue;
         }
-        let Some(status) = resolutions.get(&(source.clone(), target.clone())) else {
+        let Some((status, spans)) = resolutions.get(&(source.clone(), target.clone())) else {
             continue;
         };
         *resolution = Some(*status);
+        // A `Resolved` pair keeps its deduplicated call-site spans; an
+        // ambiguous pair drops them (issue #462, the #233 fabrication-guard
+        // discipline).
+        if *status == CallResolution::Resolved && !spans.is_empty() {
+            *call_site_spans = Some(spans.clone());
+        }
         if *status == CallResolution::Ambiguous {
             *confidence = None;
         }
@@ -1872,17 +3040,68 @@ pub fn label_same_file_call_resolutions(
 /// matches definitions in other files is `ambiguous`), but only pairs whose
 /// candidate lives in the caller's file are returned — cross-file pairs are
 /// emitted with their status by [`cross_file_call_records`].
+///
+/// The returned spans are the deduplicated call-site spans of the pair's
+/// `Resolved` call sites only (issue #462); ambiguous sites contribute none,
+/// per the #233 fabrication-guard discipline.
 fn same_file_call_resolutions(
     facts_by_file: &BTreeMap<String, FileFacts>,
-) -> BTreeMap<(String, String), CallResolution> {
-    let index = DefinitionIndex::build(facts_by_file);
+) -> BTreeMap<(String, String), (CallResolution, Vec<SourceSpan>)> {
+    // Same aux-helper crate-root remap as the cross-file CALLS pass
+    // (issue #475): a helper's call sites and definitions partition under the
+    // including entry crate, so the repo-wide candidate count behind each
+    // same-file label is computed under the true crate root.
+    let remap = reassign_aux_helper_crate_roots(facts_by_file);
+    let remapped;
+    let facts_by_file: &BTreeMap<String, FileFacts> = if remap.is_empty() {
+        facts_by_file
+    } else {
+        remapped = apply_crate_root_remap(facts_by_file, &remap);
+        &remapped
+    };
+    let index = DefinitionIndex::build(facts_by_file, remap.clone());
     let mut resolutions = BTreeMap::new();
     for (path, facts) in facts_by_file {
-        let caller_crate_root = crate_root_id(path);
+        let caller_crate_root = remap
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| crate_root_id(path));
         for call in &facts.call_sites {
             let Some(simple_name) = call.callee_segments.last() else {
                 continue;
             };
+            // Block-local defs shadow the flat pool here too (issue #422): a
+            // call the scope gate admits binds the block-local. (The per-file
+            // text pass already suppresses its own edge from the enclosing
+            // body to the shadowed same-named module-level def, so no stale
+            // pair reaches this map.)
+            let block_locals = index.block_local_candidates(call, simple_name);
+            if !block_locals.is_empty() {
+                let status = match block_locals.len() {
+                    1 => CallResolution::Resolved,
+                    _ => CallResolution::Ambiguous,
+                };
+                for definition in block_locals {
+                    if definition.repo_relative_path != *path || definition.id == call.caller_id {
+                        continue;
+                    }
+                    let entry = resolutions
+                        .entry((call.caller_id.clone(), definition.id.clone()))
+                        .or_insert((status, Vec::new()));
+                    // Prefer the strongest status when several call sites hit one pair.
+                    if status < entry.0 {
+                        entry.0 = status;
+                    }
+                    // Only `Resolved` call sites contribute spans; ambiguous
+                    // sites are dropped even when the pair later resolves via
+                    // another site (issue #462, the #233 fabrication-guard
+                    // discipline).
+                    if status == CallResolution::Resolved && !entry.1.contains(&call.span) {
+                        entry.1.push(call.span);
+                    }
+                }
+                continue;
+            }
             let candidates = index.candidates(call, simple_name, &caller_crate_root);
             let status = match candidates.len() {
                 0 => continue,
@@ -1895,15 +3114,94 @@ fn same_file_call_resolutions(
                 }
                 let entry = resolutions
                     .entry((call.caller_id.clone(), candidate.id.clone()))
-                    .or_insert(status);
+                    .or_insert((status, Vec::new()));
                 // Prefer the strongest status when several call sites hit one pair.
-                if status < *entry {
-                    *entry = status;
+                if status < entry.0 {
+                    entry.0 = status;
+                }
+                // Only `Resolved` call sites contribute spans; ambiguous sites
+                // are dropped even when the pair later resolves via another
+                // site (issue #462, the #233 fabrication-guard discipline).
+                if status == CallResolution::Resolved && !entry.1.contains(&call.span) {
+                    entry.1.push(call.span);
                 }
             }
         }
     }
     resolutions
+}
+
+/// Records a lexically-scoped block-local call edge (issue #422), mirroring
+/// [`record_candidate_edge`] without its same-file skip.
+fn record_block_local_edge(
+    call: &CallSiteFact,
+    definition: &BlockLocalDefinitionFact,
+    resolution: CallResolution,
+    candidate_count: usize,
+    edges: &mut BTreeMap<(String, String), (CallResolution, String, Vec<SourceSpan>)>,
+) {
+    // A block-local def lives in the caller's own file by construction (the
+    // scope gate only matches caller ids from the enclosing scope), so the
+    // per-file reference pass can never emit this pair — no same-file skip is
+    // needed to avoid duplicate stable edge IDs. Self-recursion
+    // (`definition.id == call.caller_id`) mints no edge, mirroring
+    // `record_candidate_edge`'s treatment of module-level self-recursion.
+    if definition.id == call.caller_id {
+        return;
+    }
+    let summary = match resolution {
+        CallResolution::Resolved => format!(
+            "{} calls {} (block-local, resolved)",
+            call.caller_name, definition.qualified_name
+        ),
+        CallResolution::Ambiguous => format!(
+            "{} calls {} (block-local, ambiguous: {candidate_count} in-scope candidates)",
+            call.caller_name, definition.qualified_name
+        ),
+        CallResolution::Unresolved => unreachable!("unresolved calls never bind a candidate"),
+        CallResolution::UnresolvedDispatch => {
+            unreachable!("unresolved dispatch never binds a candidate")
+        }
+    };
+    let key = (call.caller_id.clone(), definition.id.clone());
+    let entry = edges
+        .entry(key)
+        .or_insert_with(|| (resolution, summary.clone(), Vec::new()));
+    // Prefer the strongest status when several call sites hit one pair.
+    if resolution < entry.0 {
+        entry.0 = resolution;
+        entry.1 = summary;
+    }
+    // Only `Resolved` call sites contribute spans; ambiguous sites are
+    // dropped even when the pair later resolves via another site (issue #462,
+    // the #233 fabrication-guard discipline).
+    if resolution == CallResolution::Resolved && !entry.2.contains(&call.span) {
+        entry.2.push(call.span);
+    }
+}
+
+/// Records the lexically-scoped block-local edges for one call site (issue
+/// #422), returning `true` when the scope gate admitted at least one
+/// block-local candidate. A handled call binds the block-local INSTEAD of
+/// the flat pool (shadowing), so the caller must skip flat candidate
+/// resolution for it.
+fn record_block_local_call(
+    call: &CallSiteFact,
+    block_locals: &[&BlockLocalDefinitionFact],
+    edges: &mut BTreeMap<(String, String), (CallResolution, String, Vec<SourceSpan>)>,
+) -> bool {
+    if block_locals.is_empty() {
+        return false;
+    }
+    let resolution = if block_locals.len() == 1 {
+        CallResolution::Resolved
+    } else {
+        CallResolution::Ambiguous
+    };
+    for definition in block_locals {
+        record_block_local_edge(call, definition, resolution, block_locals.len(), edges);
+    }
+    true
 }
 
 fn record_candidate_edge(
@@ -1912,11 +3210,22 @@ fn record_candidate_edge(
     candidate: &DefinitionFact,
     resolution: CallResolution,
     candidate_count: usize,
-    edges: &mut BTreeMap<(String, String), (CallResolution, String)>,
+    // Emit same-file (caller, candidate) pairs. `false` for ordinary names:
+    // the per-file textual pass already covers those and re-emitting would
+    // duplicate stable edge IDs. `true` for trait-dispatch call sites (issue
+    // #267 — dispatch pairs are repo-wide owned, same-file included) and for
+    // static sites in a dispatch-suppressed body (whose textual edge the
+    // per-file pass suppressed).
+    allow_same_file: bool,
+    edges: &mut BTreeMap<(String, String), (CallResolution, String, Vec<SourceSpan>)>,
 ) {
     // Same-file targets are already covered by the per-file reference pass;
-    // emitting them again would duplicate stable edge IDs.
-    if candidate.repo_relative_path == caller_path || candidate.id == call.caller_id {
+    // emitting them again would duplicate stable edge IDs. A self-call
+    // (candidate IS the caller) never emits: it is not a call between symbols.
+    if !allow_same_file && candidate.repo_relative_path == caller_path {
+        return;
+    }
+    if candidate.id == call.caller_id {
         return;
     }
     let summary = match resolution {
@@ -1929,14 +3238,24 @@ fn record_candidate_edge(
             call.caller_name, candidate.qualified_name
         ),
         CallResolution::Unresolved => unreachable!("unresolved calls never bind a candidate"),
+        CallResolution::UnresolvedDispatch => {
+            unreachable!("unresolved dispatch never binds a candidate")
+        }
     };
     let key = (call.caller_id.clone(), candidate.id.clone());
     let entry = edges
         .entry(key)
-        .or_insert_with(|| (resolution, summary.clone()));
+        .or_insert_with(|| (resolution, summary.clone(), Vec::new()));
     // Prefer the strongest status when several call sites hit one pair.
     if resolution < entry.0 {
-        *entry = (resolution, summary);
+        entry.0 = resolution;
+        entry.1 = summary;
+    }
+    // Only `Resolved` call sites contribute spans; ambiguous sites are
+    // dropped even when the pair later resolves via another site (issue #462,
+    // the #233 fabrication-guard discipline).
+    if resolution == CallResolution::Resolved && !entry.2.contains(&call.span) {
+        entry.2.push(call.span);
     }
 }
 
@@ -1982,6 +3301,79 @@ fn unresolved_call_diagnostic_id(repository_id: &str, path: &str, display: &str)
     ])
 }
 
+/// Records a trait-dispatch call site (issue #267) whose target set could not
+/// be reduced to a concrete in-crate symbol — the dispatch trait is not a
+/// unique local trait, or no in-crate type implements it. Unlike
+/// [`record_unresolved`], this ALWAYS mints the typed marker: a missing
+/// dispatch target is exactly the boundary the issue must enumerate, never a
+/// dropped miss. The marker is keyed by (file, trait path as written, method)
+/// so repeated sites share one node; each caller's edge cites its own span.
+fn record_unresolved_dispatch(
+    caller_path: &str,
+    call: &CallSiteFact,
+    trait_path: &str,
+    dispatch_diagnostics: &mut BTreeMap<(String, String, String), SourceSpan>,
+    dispatch_diagnostic_edges: &mut BTreeMap<(String, String, String, String), String>,
+) {
+    let method = call.callee_segments.last().cloned().unwrap_or_default();
+    dispatch_diagnostics
+        .entry((
+            caller_path.to_owned(),
+            trait_path.to_owned(),
+            method.clone(),
+        ))
+        .or_insert(call.span);
+    dispatch_diagnostic_edges
+        .entry((
+            caller_path.to_owned(),
+            trait_path.to_owned(),
+            method,
+            call.caller_id.clone(),
+        ))
+        .or_insert_with(|| call.caller_name.clone());
+}
+
+fn unresolved_dispatch_diagnostic_id(
+    repository_id: &str,
+    path: &str,
+    trait_path: &str,
+    method: &str,
+) -> String {
+    stable_id(&[
+        "node",
+        "diagnostic",
+        repository_id,
+        path,
+        "unresolved-dispatch",
+        trait_path,
+        method,
+    ])
+}
+
+/// The typed dispatch-boundary marker (issue #267): a `Diagnostic` node named
+/// `unresolved_dispatch: Trait::method` carrying the call-site span, targeted
+/// by a `resolution: "unresolved_dispatch"` CALLS edge. The trait path is the
+/// as-written form the extractor stamped, so the marker cites exactly what the
+/// source said.
+fn unresolved_dispatch_diagnostic(
+    repository_id: &str,
+    path: &str,
+    trait_path: &str,
+    method: &str,
+    span: SourceSpan,
+) -> GraphRecord {
+    let display = format!("{trait_path}::{method}");
+    GraphRecord::syntax_node(
+        unresolved_dispatch_diagnostic_id(repository_id, path, trait_path, method),
+        NodeKind::Diagnostic,
+        path.to_owned(),
+        span,
+        format!("unresolved_dispatch: {display}"),
+        "rust",
+        format!("unresolved trait-dispatch target {display} (no in-crate implementor method)"),
+    )
+}
+
 fn unresolved_call_diagnostic(
     repository_id: &str,
     path: &str,
@@ -2001,6 +3393,12 @@ fn unresolved_call_diagnostic(
 
 struct DefinitionIndex<'facts> {
     by_simple_name: BTreeMap<&'facts str, Vec<&'facts DefinitionFact>>,
+    /// Simple name -> block-local `fn` definitions (issue #422), sorted by
+    /// (path, qualified name, ID) like [`DefinitionIndex::by_simple_name`].
+    /// Consulted ONLY through [`DefinitionIndex::block_local_candidates`],
+    /// which applies the lexical scope gate — never pooled with the flat
+    /// index.
+    block_locals_by_name: BTreeMap<&'facts str, Vec<&'facts BlockLocalDefinitionFact>>,
     /// `(crate_root, implementing_type) -> {trait qualified name}`: the set of
     /// trait qualified names each type provably implements, for IMPLEMENTS-gated
     /// self-dispatch (issue #414). Built by resolving every
@@ -2021,10 +3419,21 @@ struct DefinitionIndex<'facts> {
     /// that type's method. The `implemented` map above is derived from this
     /// same index; retaining it lets the `Method` arm reuse it directly.
     impl_index: ImplTargetIndex<'facts>,
+    /// Aux-helper crate-root remap (issue #475): helper repo-relative path ->
+    /// the including entry crate's root, from
+    /// [`reassign_aux_helper_crate_roots`]. [`Self::definition_crate_root`]
+    /// consults it so a helper's definitions partition under the entry crate
+    /// they truly belong to instead of their synthetic path-derived root.
+    /// Empty when no helper needed reassignment, in which case partitioning is
+    /// exactly the path-derived [`crate_root_id`] behavior.
+    aux_helper_roots: BTreeMap<String, String>,
 }
 
 impl<'facts> DefinitionIndex<'facts> {
-    fn build(facts_by_file: &'facts BTreeMap<String, FileFacts>) -> Self {
+    fn build(
+        facts_by_file: &'facts BTreeMap<String, FileFacts>,
+        aux_helper_roots: BTreeMap<String, String>,
+    ) -> Self {
         let mut by_simple_name: BTreeMap<&str, Vec<&DefinitionFact>> = BTreeMap::new();
         for facts in facts_by_file.values() {
             for definition in &facts.definitions {
@@ -2045,6 +3454,30 @@ impl<'facts> DefinitionIndex<'facts> {
             candidates.dedup_by(|a, b| a.id == b.id);
         }
 
+        // Lexically-scoped block-local definitions (issue #422): indexed by
+        // simple name but kept OUT of the flat `by_simple_name` pool, so only
+        // the scope-gated `block_local_candidates` can ever surface them.
+        let mut block_locals_by_name: BTreeMap<&str, Vec<&BlockLocalDefinitionFact>> =
+            BTreeMap::new();
+        for facts in facts_by_file.values() {
+            for definition in &facts.block_local_definitions {
+                block_locals_by_name
+                    .entry(definition.simple_name.as_str())
+                    .or_default()
+                    .push(definition);
+            }
+        }
+        for candidates in block_locals_by_name.values_mut() {
+            candidates.sort_by(|a, b| {
+                (&a.repo_relative_path, &a.qualified_name, &a.id).cmp(&(
+                    &b.repo_relative_path,
+                    &b.qualified_name,
+                    &b.id,
+                ))
+            });
+            candidates.dedup_by(|a, b| a.id == b.id);
+        }
+
         // Build the workspace crate-name registry (issue #440): every crate
         // directory the scanned file set reveals contributes its inferred name
         // -> library crate-root binding, so a `dep_crate::…` qualified call can
@@ -2055,11 +3488,14 @@ impl<'facts> DefinitionIndex<'facts> {
 
         // Resolve every recorded `impl Trait for Type` relation to the trait's
         // crate-root-relative qualified name via the repo-wide impl-target
-        // index (issue #414). A plain `build` (no aux-helper crate-root remap)
-        // is used deliberately — this join is conservative and stays within one
-        // crate root, so it never needs the #399 out-of-line remap. An
-        // unresolvable trait path (external/std, ambiguous) contributes nothing,
-        // so the gate degrades to unresolved (a MISS, never a WRONG edge).
+        // index (issue #414). The facts carry the aux-helper crate-root remap
+        // when the caller applied [`reassign_aux_helper_crate_roots`]
+        // (issue #475): a helper's impl relations then join under the including
+        // entry crate they truly belong to, and the remap is conservative
+        // (single-includer helpers only), so the join still never crosses a
+        // true crate boundary. An unresolvable trait path (external/std,
+        // ambiguous) contributes nothing, so the gate degrades to unresolved
+        // (a MISS, never a WRONG edge).
         let impl_index = ImplTargetIndex::build(facts_by_file);
         let mut implemented: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
         for facts in facts_by_file.values() {
@@ -2125,10 +3561,25 @@ impl<'facts> DefinitionIndex<'facts> {
 
         Self {
             by_simple_name,
+            block_locals_by_name,
             implemented,
             crate_name_roots,
             impl_index,
+            aux_helper_roots,
         }
+    }
+
+    /// The crate root a definition partitions under for call-target
+    /// confinement (issue #475): the aux-helper remap when the definition's
+    /// file was reassigned to its including entry crate, else the
+    /// path-derived [`crate_root_id`].
+    fn definition_crate_root(&self, definition: &DefinitionFact) -> Cow<'_, str> {
+        self.aux_helper_roots
+            .get(&definition.repo_relative_path)
+            .map_or_else(
+                || Cow::Owned(crate_root_id(&definition.repo_relative_path)),
+                |root| Cow::Borrowed(root.as_str()),
+            )
     }
 
     /// The set of trait qualified names the type `impl_type` provably implements
@@ -2190,6 +3641,102 @@ impl<'facts> DefinitionIndex<'facts> {
         }
     }
 
+    /// Resolves a provable trait-dispatch path (issue #267) to the
+    /// crate-root-relative qualified name of the UNIQUE LOCAL trait it names
+    /// within `crate_root`, or `None` when it is not such a unique local trait.
+    ///
+    /// The dispatch trait is reduced to its trailing simple segment and matched
+    /// against this crate root's impl-target index by that leaf, mirroring
+    /// [`resolve_receiver_type_owner`](Self::resolve_receiver_type_owner).
+    /// Resolution succeeds ONLY when exactly one distinct impl-target
+    /// qualified name in the root carries that leaf AND it is a trait
+    /// impl-target kind. An external trait, a non-trait type, or a leaf shared
+    /// by two local traits resolves to `None` (the call site mints a typed
+    /// `unresolved_dispatch` marker instead of guessing — prefer a MISSING
+    /// dispatch target over a WRONG one).
+    fn resolve_dispatch_trait(&self, crate_root: &str, trait_path: &str) -> Option<String> {
+        let leaf = trait_path.rsplit("::").next()?.trim();
+        if leaf.is_empty() {
+            return None;
+        }
+        let mut matched: Option<&str> = None;
+        for ((root, qualified), facts) in &self.impl_index.by_qualified {
+            if *root != crate_root {
+                continue;
+            }
+            let def_leaf = qualified.rsplit("::").next().unwrap_or(qualified);
+            if def_leaf != leaf {
+                continue;
+            }
+            if !facts.iter().any(|fact| fact.symbol_kind == "trait") {
+                continue;
+            }
+            if matched.is_some() {
+                // Two distinct local traits share the leaf: ambiguous, refuse.
+                return None;
+            }
+            matched = Some(qualified);
+        }
+        matched.map(str::to_owned)
+    }
+
+    /// Returns the in-crate implementor methods for a trait-dispatch call site
+    /// (issue #267): every callable `method` definition in the caller's crate
+    /// root whose owner segment is a type provably implementing the dispatch
+    /// trait, and whose simple name is `simple_name`.
+    ///
+    /// The implementor set comes from the [`ImplTraitRelationFact`] reverse
+    /// join (`implemented`: `(crate_root, impl_type) -> {trait qualified
+    /// names}`), keyed by the RESOLVED trait qualified name — never by the
+    /// method name alone, so an unrelated trait (or inherent method) that
+    /// merely shares the method name can never enter the set. A trait method
+    /// DECLARATION (kind `"function"` + `is_trait_method`) is not a callable
+    /// implementor and is excluded; only concrete `impl Trait for T` methods
+    /// (kind `"method"`) link.
+    ///
+    /// Modeling note: an inherent method and a trait-impl method of the SAME
+    /// type share the same `match_segments` tail (`[owner, name]`), exactly as
+    /// in the existing [`narrow_methods_to_owner`](Self::narrow_methods_to_owner)
+    /// static-call path — when a type defines both, the dispatch set admits
+    /// both symbols (the multi-target `Ambiguous` labeling records that the
+    /// set, not one edge, is the answer). Distinguishing them would need a new
+    /// serialized fact; the AC's phantom-edge bar is unrelated traits, which
+    /// the implementor join already excludes.
+    fn dispatch_candidates(
+        &self,
+        trait_path: &str,
+        simple_name: &str,
+        caller_crate_root: &str,
+    ) -> Vec<&'facts DefinitionFact> {
+        let Some(pool) = self.by_simple_name.get(simple_name) else {
+            return Vec::new();
+        };
+        let Some(trait_qualified) = self.resolve_dispatch_trait(caller_crate_root, trait_path)
+        else {
+            return Vec::new();
+        };
+        let mut implementors: BTreeSet<&str> = BTreeSet::new();
+        for ((root, impl_type), traits) in &self.implemented {
+            if root == caller_crate_root && traits.contains(&trait_qualified) {
+                implementors.insert(impl_type.as_str());
+            }
+        }
+        if implementors.is_empty() {
+            return Vec::new();
+        }
+        pool.iter()
+            .copied()
+            .filter(|definition| {
+                definition.symbol_kind == "method"
+                    && crate_root_id(&definition.repo_relative_path) == caller_crate_root
+                    && definition.match_segments.len() >= 2
+                    && implementors.contains(
+                        definition.match_segments[definition.match_segments.len() - 2].as_str(),
+                    )
+            })
+            .collect()
+    }
+
     /// Narrows a receiver-call method pool to a proven owner type's own methods
     /// (issue #441 shares this with the #420 `SelfMethod` self-dispatch path so
     /// the two can never desync). Given the owner's simple-leaf name and the
@@ -2233,7 +3780,7 @@ impl<'facts> DefinitionIndex<'facts> {
             .into_iter()
             .filter(|definition| {
                 definition.is_trait_method
-                    && crate_root_id(&definition.repo_relative_path) == caller_crate_root
+                    && self.definition_crate_root(definition) == *caller_crate_root
                     && definition.match_segments.len() >= 2
                     && implemented.contains(
                         &definition.match_segments[..definition.match_segments.len() - 1]
@@ -2249,6 +3796,39 @@ impl<'facts> DefinitionIndex<'facts> {
             return Vec::new();
         }
         gated
+    }
+
+    /// Returns the in-scope block-local `fn` candidates for a call site
+    /// (issue #422), deterministically ordered. A block-local def is a
+    /// candidate ONLY for a bare (`Direct`) call whose caller is the
+    /// lexically-enclosing scope — `call.caller_id` equals the def's
+    /// `enclosing_scope_id` (calls in the enclosing function/method body,
+    /// including closures and nested blocks, which inherit the enclosing
+    /// caller id) — or the def itself (`call.caller_id == def.id`, a recursive
+    /// call inside its own body). Calls from any other scope see nothing: the
+    /// #413 no-wrong-edge guard.
+    ///
+    /// A non-empty result SHADOWS the flat pool: the caller is lexically
+    /// inside the def's scope, so the block-local wins over any same-named
+    /// module-level def (Rust name resolution), and the flat candidates must
+    /// not also claim the call.
+    fn block_local_candidates(
+        &self,
+        call: &CallSiteFact,
+        simple_name: &str,
+    ) -> Vec<&'facts BlockLocalDefinitionFact> {
+        if call.call_kind != CallKind::Direct {
+            return Vec::new();
+        }
+        let Some(pool) = self.block_locals_by_name.get(simple_name) else {
+            return Vec::new();
+        };
+        pool.iter()
+            .copied()
+            .filter(|definition| {
+                call.caller_id == definition.enclosing_scope_id || call.caller_id == definition.id
+            })
+            .collect()
     }
 
     /// Returns the in-repo candidates for a call site, deterministically
@@ -2286,6 +3866,16 @@ impl<'facts> DefinitionIndex<'facts> {
                 .filter(|definition| is_free_function(definition))
                 .collect(),
             CallKind::Method => {
+                // Trait-dispatch resolution (issue #267): a call whose receiver
+                // is syntactically PROVABLE as trait-typed (`&dyn Trait` or a
+                // `T: Trait` bound, stamped by the extractor) dispatches ONLY
+                // to the trait's in-crate implementor methods — never the broad
+                // same-name pool. This arm runs first: a dispatch site's
+                // candidate set is defined by its trait identity, and the
+                // receiver-type narrowing below is for CONCRETE receivers.
+                if let Some(trait_path) = &call.dispatch_trait {
+                    return self.dispatch_candidates(trait_path, simple_name, caller_crate_root);
+                }
                 // A receiver call `x.read()` can dispatch to an inherent impl
                 // method OR a trait method (issue #390). Trait methods keep kind
                 // `"function"`, so widen the pool by the marker.
@@ -2395,9 +3985,9 @@ impl<'facts> DefinitionIndex<'facts> {
                 pool.iter()
                     .copied()
                     .filter(|definition| {
-                        target_root.is_none_or(|root| {
-                            crate_root_id(&definition.repo_relative_path) == root
-                        }) && segments_end_with(&definition.match_segments, segments)
+                        target_root
+                            .is_none_or(|root| self.definition_crate_root(definition) == *root)
+                            && segments_end_with(&definition.match_segments, segments)
                     })
                     .collect()
             }
@@ -2435,6 +4025,8 @@ mod tests {
             end_byte: 1,
             start_line: 1,
             end_line: 1,
+            start_column: None,
+            end_column: None,
         }
     }
 
@@ -2464,12 +4056,29 @@ mod tests {
         }
     }
 
-    fn call(
+    fn span_at(
+        start_byte: usize,
+        end_byte: usize,
+        start_line: usize,
+        end_line: usize,
+    ) -> SourceSpan {
+        SourceSpan {
+            start_byte,
+            end_byte,
+            start_line,
+            end_line,
+            start_column: None,
+            end_column: None,
+        }
+    }
+
+    fn call_at(
         caller_id: &str,
         display: &str,
         segments: &[&str],
         kind: CallKind,
         owner: Option<&str>,
+        span: SourceSpan,
     ) -> CallSiteFact {
         CallSiteFact {
             caller_id: caller_id.to_owned(),
@@ -2482,8 +4091,19 @@ mod tests {
             path_root: CallPathRoot::Unqualified,
             receiver_owner: owner.map(ToOwned::to_owned),
             receiver_type: None,
-            span: span(),
+            dispatch_trait: None,
+            span,
         }
+    }
+
+    fn call(
+        caller_id: &str,
+        display: &str,
+        segments: &[&str],
+        kind: CallKind,
+        owner: Option<&str>,
+    ) -> CallSiteFact {
+        call_at(caller_id, display, segments, kind, owner, span())
     }
 
     fn facts(
@@ -2818,7 +4438,7 @@ mod tests {
             )],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call(
             "caller",
             "Device::read",
@@ -2851,7 +4471,7 @@ mod tests {
             )],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call("caller", "read", &["read"], CallKind::Method, None);
         let ids: Vec<&str> = index
             .candidates(&call, "read", "lib")
@@ -2879,7 +4499,7 @@ mod tests {
             )],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call("caller", "read", &["read"], CallKind::Direct, None);
         assert!(
             index.candidates(&call, "read", "lib").is_empty(),
@@ -2900,7 +4520,7 @@ mod tests {
             )],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call("caller", "read", &["read"], CallKind::Path, None);
         assert!(
             index.candidates(&call, "read", "lib").is_empty(),
@@ -2920,7 +4540,7 @@ mod tests {
             ],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call("caller", "A::read", &["A", "read"], CallKind::Path, None);
         let ids: Vec<&str> = index
             .candidates(&call, "read", "lib")
@@ -2944,7 +4564,7 @@ mod tests {
             )],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call(
             "caller",
             "Device::read",
@@ -3012,7 +4632,7 @@ mod tests {
             ],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call("caller", "read", &["read"], CallKind::SelfMethod, Some("T"));
         let ids: Vec<&str> = index
             .candidates(&call, "read", "lib")
@@ -3044,7 +4664,7 @@ mod tests {
             )],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call("caller", "read", &["read"], CallKind::SelfMethod, Some("T"));
         assert!(
             index.candidates(&call, "read", "lib").is_empty(),
@@ -3066,7 +4686,7 @@ mod tests {
             ],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call("caller", "g", &["g"], CallKind::SelfMethod, Some("S"));
         let ids: Vec<&str> = index
             .candidates(&call, "g", "lib")
@@ -3124,7 +4744,7 @@ mod tests {
         // `read`), binds ONLY `T::read`. The unrelated `U::read` (S does not
         // implement `U`) is excluded even though it shares the simple name.
         let facts = self_dispatch_facts(true);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call("caller", "read", &["read"], CallKind::SelfMethod, Some("S"));
         let ids: Vec<&str> = index
             .candidates(&call, "read", "lib")
@@ -3144,7 +4764,7 @@ mod tests {
         // relation leaves `S`'s implemented-trait set empty, so `self.read()`
         // binds nothing — a MISS, never a WRONG edge to `T::read` or `U::read`.
         let facts = self_dispatch_facts(false);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call("caller", "read", &["read"], CallKind::SelfMethod, Some("S"));
         assert!(
             index.candidates(&call, "read", "lib").is_empty(),
@@ -3159,7 +4779,7 @@ mod tests {
         // finds no proof for `S`, so the trait default is not bound — a
         // cross-crate-root trait degrades to unresolved, never a wrong edge.
         let facts = self_dispatch_facts(true);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call("caller", "read", &["read"], CallKind::SelfMethod, Some("S"));
         assert!(
             index.candidates(&call, "read", "bin:tool").is_empty(),
@@ -3300,6 +4920,206 @@ mod tests {
             "two call sites for one pair must collapse to a single edge"
         );
         assert_eq!(records.len(), 1);
+    }
+
+    // ── Call-site span retention on edges (issue #462) ───────────────────
+
+    #[test]
+    fn resolved_cross_file_edge_retains_deduplicated_call_site_spans() {
+        let helper = definition("helper", "function", "src/a.rs", &["a", "helper"]);
+        let span_a = span_at(10, 16, 2, 2);
+        let span_b = span_at(40, 46, 5, 5);
+        let facts = facts(&[
+            ("src/a.rs", vec![helper], vec![]),
+            (
+                "src/b.rs",
+                vec![],
+                vec![
+                    call_at(
+                        "caller",
+                        "helper",
+                        &["helper"],
+                        CallKind::Direct,
+                        None,
+                        span_a,
+                    ),
+                    call_at(
+                        "caller",
+                        "a::helper",
+                        &["a", "helper"],
+                        CallKind::Path,
+                        None,
+                        span_b,
+                    ),
+                    // A repeated call site at an already-seen span must not
+                    // duplicate the span on the edge.
+                    call_at(
+                        "caller",
+                        "helper",
+                        &["helper"],
+                        CallKind::Direct,
+                        None,
+                        span_a,
+                    ),
+                ],
+            ),
+        ]);
+        let records = cross_file_call_records("repo", &facts);
+        assert_eq!(records.len(), 1, "sites must still collapse to one edge");
+        let edge = &records[0];
+        assert_eq!(edge.resolution(), Some(CallResolution::Resolved));
+        assert_eq!(
+            edge.call_site_spans(),
+            Some([span_a, span_b].as_slice()),
+            "a resolved edge must retain every distinct call-site span, in scan order"
+        );
+    }
+
+    #[test]
+    fn ambiguous_cross_file_edge_carries_no_call_site_spans() {
+        let facts = facts(&[
+            (
+                "src/a.rs",
+                vec![definition("a-dupe", "function", "src/a.rs", &["a", "dupe"])],
+                vec![],
+            ),
+            (
+                "src/b.rs",
+                vec![definition("b-dupe", "function", "src/b.rs", &["b", "dupe"])],
+                vec![],
+            ),
+            (
+                "src/c.rs",
+                vec![],
+                vec![call_at(
+                    "caller",
+                    "dupe",
+                    &["dupe"],
+                    CallKind::Direct,
+                    None,
+                    span_at(3, 7, 1, 1),
+                )],
+            ),
+        ]);
+        let records = cross_file_call_records("repo", &facts);
+        let edges: Vec<&GraphRecord> = records
+            .iter()
+            .filter(|record| matches!(record, GraphRecord::Edge { .. }))
+            .collect();
+        assert_eq!(
+            edges.len(),
+            2,
+            "an ambiguous call must fan out to both candidates"
+        );
+        for edge in edges {
+            assert_eq!(edge.resolution(), Some(CallResolution::Ambiguous));
+            assert_eq!(
+                edge.call_site_spans(),
+                None,
+                "an ambiguous edge must not retain call-site spans (fabrication guard)"
+            );
+        }
+    }
+
+    #[test]
+    fn same_file_resolved_edge_retains_call_site_spans() {
+        let span_a = span_at(10, 16, 2, 2);
+        let facts = facts(&[(
+            "src/a.rs",
+            vec![definition(
+                "helper",
+                "function",
+                "src/a.rs",
+                &["a", "helper"],
+            )],
+            vec![call_at(
+                "caller",
+                "helper",
+                &["helper"],
+                CallKind::Direct,
+                None,
+                span_a,
+            )],
+        )]);
+        let mut records = vec![per_file_calls_edge("caller", "helper")];
+        label_same_file_call_resolutions(&mut records, &facts);
+        assert_eq!(records[0].resolution(), Some(CallResolution::Resolved));
+        assert_eq!(
+            records[0].call_site_spans(),
+            Some([span_a].as_slice()),
+            "a resolved same-file edge must retain its call-site span"
+        );
+    }
+
+    #[test]
+    fn same_file_ambiguous_edge_carries_no_call_site_spans() {
+        let facts = facts(&[
+            (
+                "src/a.rs",
+                vec![definition("a-dupe", "function", "src/a.rs", &["a", "dupe"])],
+                vec![call("caller", "dupe", &["dupe"], CallKind::Direct, None)],
+            ),
+            (
+                "src/b.rs",
+                vec![definition("b-dupe", "function", "src/b.rs", &["b", "dupe"])],
+                vec![],
+            ),
+        ]);
+        let mut records = vec![per_file_calls_edge("caller", "a-dupe")];
+        label_same_file_call_resolutions(&mut records, &facts);
+        assert_eq!(records[0].resolution(), Some(CallResolution::Ambiguous));
+        assert_eq!(
+            records[0].call_site_spans(),
+            None,
+            "an ambiguous same-file edge must not retain call-site spans (fabrication guard)"
+        );
+    }
+
+    #[test]
+    fn same_file_mixed_pair_keeps_only_resolved_site_spans() {
+        // One pair, two call sites: a path-qualified site that resolves
+        // uniquely and a bare site that is ambiguous. The pair labels
+        // `resolved` (strongest wins) but only the resolved site's span may
+        // be retained — the ambiguous site's span is dropped, never promoted.
+        let resolved_span = span_at(10, 16, 2, 2);
+        let ambiguous_span = span_at(40, 46, 5, 5);
+        let facts = facts(&[
+            (
+                "src/a.rs",
+                vec![definition("a-dupe", "function", "src/a.rs", &["a", "dupe"])],
+                vec![
+                    call_at(
+                        "caller",
+                        "a::dupe",
+                        &["a", "dupe"],
+                        CallKind::Path,
+                        None,
+                        resolved_span,
+                    ),
+                    call_at(
+                        "caller",
+                        "dupe",
+                        &["dupe"],
+                        CallKind::Direct,
+                        None,
+                        ambiguous_span,
+                    ),
+                ],
+            ),
+            (
+                "src/b.rs",
+                vec![definition("b-dupe", "function", "src/b.rs", &["b", "dupe"])],
+                vec![],
+            ),
+        ]);
+        let mut records = vec![per_file_calls_edge("caller", "a-dupe")];
+        label_same_file_call_resolutions(&mut records, &facts);
+        assert_eq!(records[0].resolution(), Some(CallResolution::Resolved));
+        assert_eq!(
+            records[0].call_site_spans(),
+            Some([resolved_span].as_slice()),
+            "only resolved call sites may contribute spans to a resolved edge"
+        );
     }
 
     // --- Cross-file IMPLEMENTS resolution (issue #344) ---------------------
@@ -3658,6 +5478,7 @@ mod tests {
                     test_gated: false,
                     path_override: None,
                     under_inline_path_override: false,
+                    cfg_gates: Vec::new(),
                 })
                 .collect(),
             ..FileFacts::default()
@@ -3686,6 +5507,13 @@ mod tests {
                         &[],
                         "test:common",
                     )],
+                    impl_trait_relations: vec![ImplTraitRelationFact {
+                        impl_type: "Foo".to_owned(),
+                        impl_type_path: "Foo".to_owned(),
+                        trait_path: "crate::T".to_owned(),
+                        crate_root: "test:common".to_owned(),
+                        module_names: Vec::new(),
+                    }],
                     ..FileFacts::default()
                 },
             ),
@@ -3698,11 +5526,53 @@ mod tests {
             Some("test:it"),
             "a single-includer helper is reassigned to the including entry crate"
         );
-        // The remap rewrites crate_root on both fact kinds.
+        // The remap rewrites crate_root on all three fact kinds.
         let remapped = apply_crate_root_remap(&facts, &remap);
         let helper = &remapped["tests/common/mod.rs"];
         assert_eq!(helper.impl_targets[0].crate_root, "test:it");
         assert_eq!(helper.pending_impls[0].crate_root, "test:it");
+        assert_eq!(helper.impl_trait_relations[0].crate_root, "test:it");
+    }
+
+    #[test]
+    fn definition_crate_root_prefers_aux_helper_remap() {
+        // Issue #475: a definition in a remapped helper file partitions under
+        // the including entry crate's root, not its synthetic path-derived
+        // root; every other definition keeps the path-derived root.
+        let facts: BTreeMap<String, FileFacts> = [
+            (
+                "tests/common/mod.rs".to_owned(),
+                FileFacts {
+                    definitions: vec![definition(
+                        "helper-deep",
+                        "function",
+                        "tests/common/mod.rs",
+                        &["inner", "deep"],
+                    )],
+                    ..FileFacts::default()
+                },
+            ),
+            (
+                "src/lib.rs".to_owned(),
+                FileFacts {
+                    definitions: vec![definition(
+                        "lib-root",
+                        "function",
+                        "src/lib.rs",
+                        &["root_fn"],
+                    )],
+                    ..FileFacts::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let remap = BTreeMap::from([("tests/common/mod.rs".to_owned(), "test:it".to_owned())]);
+        let index = DefinitionIndex::build(&facts, remap);
+        let helper_def = &facts["tests/common/mod.rs"].definitions[0];
+        assert_eq!(index.definition_crate_root(helper_def), "test:it");
+        let lib_def = &facts["src/lib.rs"].definitions[0];
+        assert_eq!(index.definition_crate_root(lib_def), "lib");
     }
 
     #[test]
@@ -3732,6 +5602,131 @@ mod tests {
         assert!(
             remap.is_empty(),
             "a helper shared by 2+ entry crates is left unresolved: {remap:?}"
+        );
+    }
+
+    #[test]
+    fn multi_includer_helper_roots_lists_each_including_entry_crate() {
+        // `tests/common/mod.rs` is `mod`-included by both `tests/a.rs` and
+        // `tests/b.rs`: the multi-includer map (issue #401) lists BOTH entry
+        // crate roots, sorted, instead of picking one.
+        let facts: BTreeMap<String, FileFacts> = [
+            ("tests/a.rs".to_owned(), mod_only_facts(&["common"])),
+            ("tests/b.rs".to_owned(), mod_only_facts(&["common"])),
+            (
+                "tests/common/mod.rs".to_owned(),
+                FileFacts {
+                    impl_targets: vec![impl_target_in(
+                        "helper-Foo",
+                        "Foo",
+                        &[],
+                        "struct",
+                        "test:common",
+                    )],
+                    ..FileFacts::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let multi = multi_includer_aux_helper_roots(&facts);
+        assert_eq!(
+            multi.get("tests/common/mod.rs"),
+            Some(&vec!["test:a".to_owned(), "test:b".to_owned()]),
+            "a helper shared by 2+ entry crates lists every includer root: {multi:?}"
+        );
+    }
+
+    #[test]
+    fn own_aux_target_helper_is_excluded_from_multi_includer_map() {
+        // `tests/common.rs` is included by both entries, but cargo ALSO compiles
+        // it as its own test target `test:common` — it belongs to 3 crates, so
+        // it is never duplicated into the including entries (conservative,
+        // matching `helper_that_is_its_own_aux_target_is_not_reassigned`).
+        let facts: BTreeMap<String, FileFacts> = [
+            ("tests/a.rs".to_owned(), mod_only_facts(&["common"])),
+            ("tests/b.rs".to_owned(), mod_only_facts(&["common"])),
+            (
+                "tests/common.rs".to_owned(),
+                FileFacts {
+                    impl_targets: vec![impl_target_in(
+                        "helper-Foo",
+                        "Foo",
+                        &[],
+                        "struct",
+                        "test:common",
+                    )],
+                    ..FileFacts::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let multi = multi_includer_aux_helper_roots(&facts);
+        assert!(
+            multi.is_empty(),
+            "a file cargo compiles as its own aux target is never duplicated: {multi:?}"
+        );
+    }
+
+    #[test]
+    fn shared_helper_included_by_two_entries_mints_implements_edge_per_including_crate() {
+        // `tests/a.rs` and `tests/b.rs` each define a root `trait T` and each
+        // `mod common;` the shared helper. The helper's `impl crate::T for Foo`
+        // cannot pick one crate — but cargo compiles the helper ONCE PER
+        // including test target, so the pass duplicates the helper's facts per
+        // includer root (issue #401) and mints one edge per real compilation.
+        // Each duplicate resolves strictly within its own crate root (#394
+        // isolation), so no wrong edge is possible — only recovered recall.
+        let facts: BTreeMap<String, FileFacts> = [
+            (
+                "tests/a.rs".to_owned(),
+                FileFacts {
+                    impl_targets: vec![impl_target_in("a-T", "T", &[], "trait", "test:a")],
+                    out_of_line_mods: mod_only_facts(&["common"]).out_of_line_mods,
+                    ..FileFacts::default()
+                },
+            ),
+            (
+                "tests/b.rs".to_owned(),
+                FileFacts {
+                    impl_targets: vec![impl_target_in("b-T", "T", &[], "trait", "test:b")],
+                    out_of_line_mods: mod_only_facts(&["common"]).out_of_line_mods,
+                    ..FileFacts::default()
+                },
+            ),
+            (
+                "tests/common/mod.rs".to_owned(),
+                FileFacts {
+                    impl_targets: vec![impl_target_in(
+                        "helper-Foo",
+                        "Foo",
+                        &[],
+                        "struct",
+                        "test:common",
+                    )],
+                    pending_impls: vec![pending_impl_in(
+                        "impl-helper-Foo",
+                        "crate::T",
+                        &[],
+                        "test:common",
+                    )],
+                    ..FileFacts::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let records = cross_file_implements_records("repo", &facts);
+        let mut pairs = implements_pairs(&records);
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("impl-helper-Foo".to_owned(), "a-T".to_owned()),
+                ("impl-helper-Foo".to_owned(), "b-T".to_owned()),
+            ],
+            "the shared helper's impl must edge-back to EACH including crate's T: {records:?}"
         );
     }
 
@@ -4291,5 +6286,1252 @@ mod tests {
             !hits.contains(&("crate_a/src/mod_d.rs".to_owned(), "target".to_owned())),
             "crate::mod_b::target() must NOT bind mod_d's same-named target: {hits:?}"
         );
+    }
+
+    // ── Issue #444: inbound IMPORTS edges ────────────────────────────────
+
+    /// Scans `(repo-relative path, source)` fixtures through the real per-file
+    /// extractor, returning the exact `(records, facts_by_file)` inputs the
+    /// scan pipelines feed `cross_file_import_target_edges`.
+    fn import_edge_fixture(
+        files: &[(&str, &str)],
+    ) -> (Vec<GraphRecord>, BTreeMap<String, FileFacts>) {
+        let mut records = Vec::new();
+        let mut facts_by_file = BTreeMap::new();
+        for (path, source) in files {
+            let source_file = crate::fs::SourceFile {
+                path: std::path::PathBuf::from(path),
+                repo_relative_path: (*path).to_owned(),
+            };
+            let (mut file_records, facts) =
+                crate::scan_source_text_records(&source_file, source, "repo")
+                    .expect("fixture source must extract");
+            records.append(&mut file_records);
+            facts_by_file.insert((*path).to_owned(), facts);
+        }
+        (records, facts_by_file)
+    }
+
+    fn unattributed() -> CrateAttributionIndex {
+        CrateAttributionIndex::from_facts(Vec::new())
+    }
+
+    fn package_attribution(manifest: &str, name: &str) -> CrateAttributionIndex {
+        CrateAttributionIndex::from_facts(vec![crate::crate_attribution::ManifestPackageFact::new(
+            manifest,
+            crate::crate_attribution::ManifestParseOutcome::Package {
+                name: name.to_owned(),
+            },
+        )])
+    }
+
+    /// The issue-#444 target edges minted for `importer_path`'s File node, as
+    /// `(target kind, target id)` pairs. The extractor's containment-shaped
+    /// `File —IMPORTS→ Import` edges are excluded by requiring a Module/File
+    /// target — exactly the dependency-edge shape this pass mints.
+    fn import_targets(
+        importer_path: &str,
+        files: &[(&str, &str)],
+        attribution: &CrateAttributionIndex,
+    ) -> Vec<(NodeKind, String)> {
+        let (records, facts_by_file) = import_edge_fixture(files);
+        let target_of: BTreeMap<&str, NodeKind> = records
+            .iter()
+            .filter_map(|record| match record {
+                GraphRecord::Node { id, kind, .. } => Some((id.as_str(), *kind)),
+                GraphRecord::Edge { .. } | GraphRecord::Tombstone { .. } => None,
+            })
+            .collect();
+        let importer_file_id = stable_id(&["node", "file", "repo", importer_path]);
+        cross_file_import_target_edges("repo", &records, &facts_by_file, attribution)
+            .into_iter()
+            .filter_map(|record| match record {
+                GraphRecord::Edge {
+                    label: EdgeLabel::Imports,
+                    source,
+                    target,
+                    ..
+                } if source == importer_file_id => {
+                    let kind = target_of.get(target.as_str()).copied()?;
+                    (kind == NodeKind::Module || kind == NodeKind::File).then_some((kind, target))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn import_edge_targets_inline_module() {
+        let files = &[
+            ("src/lib.rs", "pub mod helpers {\n    pub fn help() {}\n}\n"),
+            ("src/consumer.rs", "use crate::helpers;\n"),
+        ];
+        let targets = import_targets("src/consumer.rs", files, &unattributed());
+        assert_eq!(
+            targets,
+            vec![(
+                NodeKind::Module,
+                stable_id(&["node", "module", "repo", "src/lib.rs", "helpers"])
+            )],
+            "crate::helpers must edge to the inline Module node"
+        );
+    }
+
+    #[test]
+    fn import_declared_inside_inline_module_edges_from_file() {
+        // A `use` inside an inline `mod` block still belongs to the file:
+        // the target-side IMPORTS edge sources from the File node, not the
+        // enclosing Module node (issue #444: "importing files carry an
+        // inbound IMPORTS edge").
+        let files = &[
+            (
+                "src/lib.rs",
+                "pub mod inner {\n    use crate::other;\n}\npub mod other;\n",
+            ),
+            ("src/other.rs", "pub fn f() {}\n"),
+        ];
+        let targets = import_targets("src/lib.rs", files, &unattributed());
+        assert_eq!(
+            targets,
+            vec![(
+                NodeKind::File,
+                stable_id(&["node", "file", "repo", "src/other.rs"])
+            )],
+            "use inside inline mod must edge from the File node to the target"
+        );
+    }
+
+    #[test]
+    fn import_edge_targets_out_of_line_file() {
+        let files = &[
+            ("src/lib.rs", "pub mod b;\n"),
+            ("src/b.rs", "pub fn f() {}\n"),
+            ("src/consumer.rs", "use crate::b;\n"),
+        ];
+        let targets = import_targets("src/consumer.rs", files, &unattributed());
+        assert_eq!(
+            targets,
+            vec![(
+                NodeKind::File,
+                stable_id(&["node", "file", "repo", "src/b.rs"])
+            )],
+            "crate::b must edge to b.rs's File node"
+        );
+    }
+
+    #[test]
+    fn import_edge_stops_at_deepest_resolvable_module() {
+        let files = &[
+            ("src/lib.rs", "pub mod b;\n"),
+            ("src/b.rs", "pub struct Widget;\n"),
+            ("src/consumer.rs", "use crate::b::Widget;\n"),
+        ];
+        let targets = import_targets("src/consumer.rs", files, &unattributed());
+        // `Widget` is a symbol, not a module: the edge stops at the deepest
+        // resolvable module — b.rs's File node.
+        assert_eq!(
+            targets,
+            vec![(
+                NodeKind::File,
+                stable_id(&["node", "file", "repo", "src/b.rs"])
+            )],
+            "a trailing symbol leaf must not move the edge past its module"
+        );
+    }
+
+    #[test]
+    fn external_and_unresolvable_imports_mint_no_edge() {
+        let files = &[
+            ("src/lib.rs", "pub fn f() {}\n"),
+            (
+                "src/consumer.rs",
+                "use serde::Serialize;\nuse std::fmt::Debug;\nuse nowhere::missing;\n",
+            ),
+        ];
+        let targets = import_targets("src/consumer.rs", files, &unattributed());
+        assert!(
+            targets.is_empty(),
+            "external/unresolvable imports must mint no edge, got {targets:?}"
+        );
+    }
+
+    #[test]
+    fn relative_imports_mint_no_edge() {
+        let files = &[
+            ("src/lib.rs", "pub mod b;\n"),
+            ("src/b.rs", "pub fn f() {}\n"),
+            ("src/consumer.rs", "use self::b;\nuse super::b;\n"),
+        ];
+        let targets = import_targets("src/consumer.rs", files, &unattributed());
+        assert!(
+            targets.is_empty(),
+            "self::/super:: imports carry no module anchor at scan time: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_absolute_import_resolves_via_manifest_attribution() {
+        let files = &[
+            ("crates/foo/src/lib.rs", "pub mod inner;\n"),
+            ("crates/foo/src/inner.rs", "pub fn f() {}\n"),
+            ("crates/foo/src/bin/tool.rs", "use foo::inner;\n"),
+        ];
+        let attribution = package_attribution("crates/foo/Cargo.toml", "foo");
+        let targets = import_targets("crates/foo/src/bin/tool.rs", files, &attribution);
+        assert_eq!(
+            targets,
+            vec![(
+                NodeKind::File,
+                stable_id(&["node", "file", "repo", "crates/foo/src/inner.rs"])
+            )],
+            "use foo::inner must resolve through the manifest-stamped package name"
+        );
+    }
+
+    #[test]
+    fn ambiguous_crate_name_mints_no_edge() {
+        // Two workspace members declaring the SAME package name: the name is
+        // dropped as ambiguous and absolute imports through it resolve nothing.
+        let files = &[
+            ("crates/a/src/lib.rs", "pub mod inner;\n"),
+            ("crates/a/src/inner.rs", "pub fn f() {}\n"),
+            ("crates/b/src/lib.rs", "pub fn g() {}\n"),
+            ("crates/b/src/consumer.rs", "use foo::inner;\n"),
+        ];
+        let mut facts = vec![crate::crate_attribution::ManifestPackageFact::new(
+            "crates/a/Cargo.toml",
+            crate::crate_attribution::ManifestParseOutcome::Package {
+                name: "foo".to_owned(),
+            },
+        )];
+        facts.push(crate::crate_attribution::ManifestPackageFact::new(
+            "crates/b/Cargo.toml",
+            crate::crate_attribution::ManifestParseOutcome::Package {
+                name: "foo".to_owned(),
+            },
+        ));
+        let attribution = CrateAttributionIndex::from_facts(facts);
+        let targets = import_targets("crates/b/src/consumer.rs", files, &attribution);
+        assert!(
+            targets.is_empty(),
+            "an ambiguous crate name must resolve nothing: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn pooled_entry_group_mints_no_edge() {
+        // `src/lib.rs` + `src/main.rs` pool into one group with two entry
+        // files: no single module tree anchors `crate::` imports, so nothing
+        // resolves.
+        let files = &[
+            ("src/lib.rs", "pub mod a;\n"),
+            ("src/a.rs", "pub fn f() {}\n"),
+            ("src/main.rs", "fn main() {}\n"),
+            ("src/consumer.rs", "use crate::a;\n"),
+        ];
+        let targets = import_targets("src/consumer.rs", files, &unattributed());
+        assert!(
+            targets.is_empty(),
+            "a group with two entry files must resolve nothing: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_imports_deduplicate_to_one_edge() {
+        let files = &[
+            (
+                "src/lib.rs",
+                "pub mod helpers {\n    pub struct Widget;\n}\n",
+            ),
+            (
+                "src/consumer.rs",
+                "use crate::helpers;\nuse crate::helpers::Widget;\n",
+            ),
+        ];
+        let targets = import_targets("src/consumer.rs", files, &unattributed());
+        assert_eq!(
+            targets,
+            vec![(
+                NodeKind::Module,
+                stable_id(&["node", "module", "repo", "src/lib.rs", "helpers"])
+            )],
+            "two imports of the same module must mint exactly one edge"
+        );
+    }
+
+    #[test]
+    fn import_edges_are_deterministic() {
+        let files = &[
+            (
+                "src/lib.rs",
+                "pub mod b;\npub mod helpers {\n    pub fn help() {}\n}\n",
+            ),
+            ("src/b.rs", "pub mod deep;\n"),
+            // Rust 2018 module resolution: `mod deep;` inside `src/b.rs`
+            // (module `b`) lives at `src/b/deep.rs`.
+            ("src/b/deep.rs", "pub fn f() {}\n"),
+            (
+                "src/consumer.rs",
+                "use crate::b::deep;\nuse crate::helpers;\n",
+            ),
+        ];
+        let attribution = unattributed();
+        let (records, facts_by_file) = import_edge_fixture(files);
+        let first = cross_file_import_target_edges("repo", &records, &facts_by_file, &attribution);
+        let second = cross_file_import_target_edges("repo", &records, &facts_by_file, &attribution);
+        assert_eq!(first, second, "the pass must be deterministic");
+        // And sorted by edge id.
+        let ids: Vec<&str> = first.iter().map(GraphRecord::id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted, "edges must come out sorted by id");
+        assert_eq!(first.len(), 2, "expected two edges, got {first:?}");
+    }
+
+    #[test]
+    fn import_edge_summaries_are_human_readable() {
+        let files = &[
+            ("src/lib.rs", "pub mod b;\n"),
+            ("src/b.rs", "pub fn f() {}\n"),
+            ("src/consumer.rs", "use crate::b;\n"),
+        ];
+        let (records, facts_by_file) = import_edge_fixture(files);
+        let edges =
+            cross_file_import_target_edges("repo", &records, &facts_by_file, &unattributed());
+        assert_eq!(edges.len(), 1);
+        let GraphRecord::Edge { summary, .. } = &edges[0] else {
+            panic!("expected an edge record");
+        };
+        assert!(
+            summary.contains("src/consumer.rs") && summary.contains("src/b.rs"),
+            "summary must name importer and target, got {summary:?}"
+        );
+    }
+
+    // ── Trait-dispatch resolution (issue #267) ────────────────────────────
+
+    /// Fixture for trait-dispatch resolution (issue #267): trait `Renderable`
+    /// implemented by `Circle` and `Square`, an unrelated inherent method that
+    /// merely shares the method name (`Speaker::render`), a trait with no
+    /// in-crate implementors (`Orphan`), and four dispatch shapes plus a static
+    /// control call.
+    fn dispatch_fixture() -> BTreeMap<String, FileFacts> {
+        workspace_facts(&[
+            ("crate_a/src/lib.rs", "pub mod shapes;\npub mod draw;\n"),
+            (
+                "crate_a/src/shapes.rs",
+                "pub trait Renderable { fn render(&self); }\n                 pub struct Circle;\n                 impl Renderable for Circle { fn render(&self) {} }\n                 pub struct Square;\n                 impl Renderable for Square { fn render(&self) {} }\n                 pub struct Speaker;\n                 impl Speaker { pub fn render(&self) {} }\n                 pub trait Orphan { fn orphan_render(&self); }\n",
+            ),
+            (
+                "crate_a/src/draw.rs",
+                "use crate::shapes::{Circle, Orphan, Renderable, Speaker};\n                 pub fn draw_static(c: &Circle) { c.render(); }\n                 pub fn draw_dyn(item: &dyn Renderable) { item.render(); }\n                 pub fn draw_generic<T: Renderable>(t: &T) { t.render(); }\n                 pub fn draw_where<T>(t: T) where T: Renderable { t.render(); }\n                 pub fn draw_orphan(o: &dyn Orphan) { o.orphan_render(); }\n                 pub fn draw_speaker(s: &Speaker) { s.render(); }\n",
+            ),
+        ])
+    }
+
+    /// Repo-relative paths of definitions reached by `ambiguous` CALLS edges,
+    /// alongside their resolution — mirrors `resolved_definition_hits`.
+    fn ambiguous_definition_hits(
+        records: &[GraphRecord],
+        facts: &BTreeMap<String, FileFacts>,
+    ) -> Vec<(String, String)> {
+        let by_id: BTreeMap<&str, &DefinitionFact> = facts
+            .values()
+            .flat_map(|f| f.definitions.iter())
+            .map(|d| (d.id.as_str(), d))
+            .collect();
+        let mut hits: Vec<(String, String)> = records
+            .iter()
+            .filter(|r| r.resolution() == Some(CallResolution::Ambiguous))
+            .filter_map(|r| match r {
+                GraphRecord::Edge { target, .. } => by_id
+                    .get(target.as_str())
+                    .map(|d| (d.repo_relative_path.clone(), d.simple_name.clone())),
+                _ => None,
+            })
+            .collect();
+        hits.sort();
+        hits.dedup();
+        hits
+    }
+
+    fn unresolved_dispatch_markers(records: &[GraphRecord]) -> Vec<String> {
+        records
+            .iter()
+            .filter_map(|r| match r {
+                GraphRecord::Node {
+                    kind: crate::ir::NodeKind::Diagnostic,
+                    name: Some(name),
+                    ..
+                } if name.starts_with("unresolved_dispatch:") => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dyn_dispatch_links_every_in_crate_implementor() {
+        let facts = dispatch_fixture();
+        let records = cross_file_call_records("repo", &facts);
+        let hits = ambiguous_definition_hits(&records, &facts);
+        assert!(
+            hits.contains(&("crate_a/src/shapes.rs".to_owned(), "render".to_owned())),
+            "dyn dispatch must reach an implementor's render: {hits:?}"
+        );
+        // Both implementors must be reachable from the dispatch call site —
+        // find the dispatch caller's outgoing ambiguous edges precisely.
+        let by_id: BTreeMap<&str, &DefinitionFact> = facts
+            .values()
+            .flat_map(|f| f.definitions.iter())
+            .map(|d| (d.id.as_str(), d))
+            .collect();
+        let draw_dyn_id = facts["crate_a/src/draw.rs"]
+            .definitions
+            .iter()
+            .find(|d| d.simple_name == "draw_dyn")
+            .expect("draw_dyn defined")
+            .id
+            .clone();
+        let targets: Vec<String> = records
+            .iter()
+            .filter_map(|r| match r {
+                GraphRecord::Edge {
+                    source,
+                    target,
+                    label: crate::ir::EdgeLabel::Calls,
+                    ..
+                } if source == &draw_dyn_id
+                    && r.resolution() == Some(CallResolution::Ambiguous) =>
+                {
+                    by_id
+                        .get(target.as_str())
+                        .map(|d| format!("{}::{}", d.repo_relative_path, d.simple_name))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            targets.len(),
+            2,
+            "draw_dyn must link exactly the two implementor methods: {targets:?}"
+        );
+        assert!(
+            targets.iter().all(|t| t == "crate_a/src/shapes.rs::render"),
+            "dispatch targets must be the implementor renders: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn generic_bound_dispatch_links_every_in_crate_implementor() {
+        let facts = dispatch_fixture();
+        let records = cross_file_call_records("repo", &facts);
+        let by_id: BTreeMap<&str, &DefinitionFact> = facts
+            .values()
+            .flat_map(|f| f.definitions.iter())
+            .map(|d| (d.id.as_str(), d))
+            .collect();
+        for caller in ["draw_generic", "draw_where"] {
+            let caller_id = facts["crate_a/src/draw.rs"]
+                .definitions
+                .iter()
+                .find(|d| d.simple_name == caller)
+                .unwrap_or_else(|| panic!("{caller} defined"))
+                .id
+                .clone();
+            let targets: Vec<&DefinitionFact> = records
+                .iter()
+                .filter_map(|r| match r {
+                    GraphRecord::Edge { source, target, .. }
+                        if source == &caller_id
+                            && r.resolution() == Some(CallResolution::Ambiguous) =>
+                    {
+                        by_id.get(target.as_str()).copied()
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                targets.len(),
+                2,
+                "{caller} must link exactly the two implementor methods"
+            );
+            assert!(
+                targets
+                    .iter()
+                    .all(|d| d.repo_relative_path == "crate_a/src/shapes.rs"
+                        && d.simple_name == "render"),
+                "{caller} targets must be the implementor renders"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_never_links_unrelated_same_named_methods() {
+        let facts = dispatch_fixture();
+        let records = cross_file_call_records("repo", &facts);
+        let by_id: BTreeMap<&str, &DefinitionFact> = facts
+            .values()
+            .flat_map(|f| f.definitions.iter())
+            .map(|d| (d.id.as_str(), d))
+            .collect();
+        // Speaker::render is an inherent method that merely shares the name;
+        // no dispatch edge may target it.
+        let speaker_render = facts["crate_a/src/shapes.rs"]
+            .definitions
+            .iter()
+            .find(|d| d.simple_name == "render" && d.qualified_name.contains("Speaker"))
+            .map(|d| d.id.clone());
+        if let Some(speaker_id) = speaker_render {
+            let phantom = records.iter().any(|r| match r {
+                GraphRecord::Edge { target, .. } => {
+                    target == &speaker_id && r.resolution() == Some(CallResolution::Ambiguous)
+                }
+                _ => false,
+            });
+            assert!(
+                !phantom,
+                "dispatch must never link the unrelated same-named Speaker::render"
+            );
+        }
+        let _ = by_id;
+    }
+
+    #[test]
+    fn static_call_is_unchanged_by_dispatch() {
+        let facts = dispatch_fixture();
+        let records = cross_file_call_records("repo", &facts);
+        let hits = resolved_definition_hits(&records, &facts);
+        assert!(
+            hits.contains(&("crate_a/src/shapes.rs".to_owned(), "render".to_owned())),
+            "static call must still resolve: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn unimplementable_dispatch_mints_a_typed_marker() {
+        let facts = dispatch_fixture();
+        let records = cross_file_call_records("repo", &facts);
+        let markers = unresolved_dispatch_markers(&records);
+        assert_eq!(
+            markers.len(),
+            1,
+            "exactly one unresolved_dispatch marker is expected: {markers:?}"
+        );
+        assert!(
+            markers[0].contains("Orphan") && markers[0].contains("orphan_render"),
+            "marker must carry the trait+method handle: {:?}",
+            markers[0]
+        );
+        // The dispatch edge must carry the TYPED resolution, not `unresolved`.
+        let typed = records.iter().any(|r| {
+            r.resolution() == Some(CallResolution::UnresolvedDispatch)
+                && matches!(r, GraphRecord::Edge { .. })
+        });
+        assert!(typed, "dispatch edge must be unresolved_dispatch-typed");
+    }
+
+    // ── Out-of-line test-role propagation (issue #238, RED) ───────────────
+
+    /// One out-of-line `mod <name>;` fact with an explicit gate flag.
+    fn gated_mod_fact(name: &str, test_gated: bool) -> OutOfLineModFact {
+        OutOfLineModFact {
+            name: name.to_owned(),
+            inline_module_path: Vec::new(),
+            test_gated,
+            path_override: None,
+            under_inline_path_override: false,
+            cfg_gates: Vec::new(),
+        }
+    }
+
+    /// A `File` node record for `path` with a path-derived initial role,
+    /// mirroring `scan_source_text_records`.
+    fn file_record(path: &str) -> GraphRecord {
+        GraphRecord::node(
+            format!("file:{path}"),
+            NodeKind::File,
+            Some(path.to_owned()),
+            None,
+            Some(path.to_owned()),
+            format!("summary for {path}"),
+        )
+        .with_role(crate::ir::SymbolRole::Production)
+    }
+
+    /// A `Symbol` node record for `name` in `path` with a lexical initial
+    /// role, mirroring the per-file extractor.
+    fn symbol_record(name: &str, path: &str, role: crate::ir::SymbolRole) -> GraphRecord {
+        GraphRecord::node(
+            format!("symbol:{path}#{name}"),
+            NodeKind::Symbol,
+            Some(path.to_owned()),
+            None,
+            Some(name.to_owned()),
+            format!("summary for {name}"),
+        )
+        .with_role(role)
+    }
+
+    fn record_role(records: &[GraphRecord], id: &str) -> Option<crate::ir::SymbolRole> {
+        records
+            .iter()
+            .find(|r| r.id() == id)
+            .unwrap_or_else(|| panic!("record `{id}` should exist"))
+            .role()
+            .copied()
+    }
+
+    fn file_role(records: &[GraphRecord], path: &str) -> Option<crate::ir::SymbolRole> {
+        record_role(records, &format!("file:{path}"))
+    }
+
+    #[test]
+    fn out_of_line_test_gated_module_file_is_test() {
+        // `#[cfg(test)] mod helpers;` in src/lib.rs → src/helpers.rs is a
+        // test-only module file (issue #238 signal b, out-of-line form).
+        let facts: BTreeMap<String, FileFacts> = [
+            (
+                "src/lib.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![gated_mod_fact("helpers", true)],
+                    ..FileFacts::default()
+                },
+            ),
+            ("src/helpers.rs".to_owned(), FileFacts::default()),
+        ]
+        .into_iter()
+        .collect();
+        let mut records = vec![
+            file_record("src/lib.rs"),
+            file_record("src/helpers.rs"),
+            // Symbols carry only their lexical role before the repo-wide
+            // pass: `helper` has no in-file test signal, so it extracts as
+            // production even though its module only compiles under cfg(test).
+            symbol_record(
+                "helper",
+                "src/helpers.rs",
+                crate::ir::SymbolRole::Production,
+            ),
+            symbol_record(
+                "already_test",
+                "src/helpers.rs",
+                crate::ir::SymbolRole::Test,
+            ),
+        ];
+        apply_out_of_line_test_roles(&mut records, &facts);
+        assert_eq!(
+            file_role(&records, "src/helpers.rs"),
+            Some(crate::ir::SymbolRole::Test),
+            "test-gated out-of-line module file must be test"
+        );
+        assert_eq!(
+            file_role(&records, "src/lib.rs"),
+            Some(crate::ir::SymbolRole::Production),
+            "the declaring crate root stays production"
+        );
+        assert_eq!(
+            record_role(&records, "symbol:src/helpers.rs#helper"),
+            Some(crate::ir::SymbolRole::Test),
+            "issue #238 signal (b) covers out-of-line modules: a symbol in a \
+             test-only module file is test even with no lexical signal"
+        );
+        assert_eq!(
+            record_role(&records, "symbol:src/helpers.rs#already_test"),
+            Some(crate::ir::SymbolRole::Test),
+            "an already-test symbol stays test"
+        );
+    }
+
+    #[test]
+    fn out_of_line_dual_use_module_file_stays_production() {
+        // Production takes precedence (issue #223's rule, reused for #238):
+        // a module file loaded by BOTH a test-gated and an ungated
+        // declaration still compiles into the production build.
+        let facts: BTreeMap<String, FileFacts> = [
+            (
+                "src/lib.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![gated_mod_fact("shared", false)],
+                    ..FileFacts::default()
+                },
+            ),
+            (
+                "src/other.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![gated_mod_fact("shared", true)],
+                    ..FileFacts::default()
+                },
+            ),
+            ("src/shared.rs".to_owned(), FileFacts::default()),
+        ]
+        .into_iter()
+        .collect();
+        let mut records = vec![
+            file_record("src/lib.rs"),
+            file_record("src/other.rs"),
+            file_record("src/shared.rs"),
+            symbol_record(
+                "shared_fn",
+                "src/shared.rs",
+                crate::ir::SymbolRole::Production,
+            ),
+        ];
+        apply_out_of_line_test_roles(&mut records, &facts);
+        assert_eq!(
+            file_role(&records, "src/shared.rs"),
+            Some(crate::ir::SymbolRole::Production),
+            "dual-use module file must stay production"
+        );
+        assert_eq!(
+            record_role(&records, "symbol:src/shared.rs#shared_fn"),
+            Some(crate::ir::SymbolRole::Production),
+            "production precedence extends to the dual-use file's symbols"
+        );
+    }
+
+    #[test]
+    fn out_of_line_test_scope_is_transitive_through_test_files() {
+        // A test-gated module's own out-of-line submodules are test too,
+        // even when their declarations carry no gate of their own.
+        let facts: BTreeMap<String, FileFacts> = [
+            (
+                "src/lib.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![gated_mod_fact("helpers", true)],
+                    ..FileFacts::default()
+                },
+            ),
+            (
+                "src/helpers.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![gated_mod_fact("inner", false)],
+                    ..FileFacts::default()
+                },
+            ),
+            ("src/helpers/inner.rs".to_owned(), FileFacts::default()),
+        ]
+        .into_iter()
+        .collect();
+        let mut records = vec![
+            file_record("src/lib.rs"),
+            file_record("src/helpers.rs"),
+            file_record("src/helpers/inner.rs"),
+        ];
+        apply_out_of_line_test_roles(&mut records, &facts);
+        assert_eq!(
+            file_role(&records, "src/helpers/inner.rs"),
+            Some(crate::ir::SymbolRole::Test),
+            "transitive submodule of a test-only module must be test"
+        );
+    }
+
+    // ── Out-of-line cfg-gate propagation (issue #190) ─────────────────────
+
+    /// One out-of-line `mod <name>;` fact with an explicit cfg gate chain.
+    fn cfg_gated_mod_fact(name: &str, gates: &[&str]) -> OutOfLineModFact {
+        OutOfLineModFact {
+            name: name.to_owned(),
+            inline_module_path: Vec::new(),
+            test_gated: false,
+            path_override: None,
+            under_inline_path_override: false,
+            cfg_gates: gates.iter().map(|gate| (*gate).to_owned()).collect(),
+        }
+    }
+
+    fn record_cfg(records: &[GraphRecord], id: &str) -> Option<Vec<String>> {
+        records
+            .iter()
+            .find(|record| record.id() == id)
+            .unwrap_or_else(|| panic!("record `{id}` should exist"))
+            .cfg()
+            .cloned()
+    }
+
+    fn file_cfg(records: &[GraphRecord], path: &str) -> Option<Vec<String>> {
+        record_cfg(records, &format!("file:{path}"))
+    }
+
+    #[test]
+    fn out_of_line_cfg_gated_module_file_inherits_gates() {
+        // `#[cfg(feature = "x")] mod helpers;` in src/lib.rs → the whole
+        // target file's records carry the declaration's gate chain.
+        let facts: BTreeMap<String, FileFacts> = [
+            (
+                "src/lib.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![cfg_gated_mod_fact("helpers", &[r#"feature = "x""#])],
+                    ..FileFacts::default()
+                },
+            ),
+            ("src/helpers.rs".to_owned(), FileFacts::default()),
+        ]
+        .into_iter()
+        .collect();
+        let mut records = vec![
+            file_record("src/lib.rs"),
+            file_record("src/helpers.rs"),
+            symbol_record(
+                "helper",
+                "src/helpers.rs",
+                crate::ir::SymbolRole::Production,
+            ),
+        ];
+        apply_out_of_line_cfg_gates(&mut records, &facts);
+        assert_eq!(
+            file_cfg(&records, "src/helpers.rs"),
+            Some(vec![r#"feature = "x""#.to_owned()]),
+            "gated out-of-line module file inherits the declaration gate"
+        );
+        assert_eq!(
+            record_cfg(&records, "symbol:src/helpers.rs#helper"),
+            Some(vec![r#"feature = "x""#.to_owned()]),
+            "the module file's symbols inherit the declaration gate"
+        );
+        assert_eq!(
+            file_cfg(&records, "src/lib.rs"),
+            None,
+            "the declaring file is never re-gated by its own declaration"
+        );
+    }
+
+    #[test]
+    fn out_of_line_cfg_gates_are_transitive() {
+        // `#[cfg(x)] mod b;` in lib.rs and `#[cfg(y)] mod c;` in b.rs →
+        // b/c.rs carries [x, y]: the declaring file's inherited gates prefix
+        // the declaration's own chain. Paths follow real Rust module
+        // resolution: `mod b;` in the crate root is src/b.rs, and `mod c;`
+        // in src/b.rs is src/b/c.rs.
+        let facts: BTreeMap<String, FileFacts> = [
+            (
+                "src/lib.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![cfg_gated_mod_fact("b", &[r#"feature = "x""#])],
+                    ..FileFacts::default()
+                },
+            ),
+            (
+                "src/b.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![cfg_gated_mod_fact("c", &[r#"feature = "y""#])],
+                    ..FileFacts::default()
+                },
+            ),
+            ("src/b/c.rs".to_owned(), FileFacts::default()),
+        ]
+        .into_iter()
+        .collect();
+        let mut records = vec![
+            file_record("src/lib.rs"),
+            file_record("src/b.rs"),
+            file_record("src/b/c.rs"),
+        ];
+        apply_out_of_line_cfg_gates(&mut records, &facts);
+        assert_eq!(
+            file_cfg(&records, "src/b.rs"),
+            Some(vec![r#"feature = "x""#.to_owned()]),
+            "direct target inherits the declaration gate"
+        );
+        assert_eq!(
+            file_cfg(&records, "src/b/c.rs"),
+            Some(vec![
+                r#"feature = "x""#.to_owned(),
+                r#"feature = "y""#.to_owned()
+            ]),
+            "transitive target accumulates gates outermost-first"
+        );
+    }
+
+    #[test]
+    fn out_of_line_cfg_ungated_declaration_wins() {
+        // Dual-use module file: loaded ungated by src/lib.rs and gated by
+        // src/other.rs. It compiles without the gate, so it inherits nothing
+        // — mirroring the test-role pass's production precedence.
+        let facts: BTreeMap<String, FileFacts> = [
+            (
+                "src/lib.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![cfg_gated_mod_fact("shared", &[])],
+                    ..FileFacts::default()
+                },
+            ),
+            (
+                "src/other.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![cfg_gated_mod_fact("shared", &[r#"feature = "x""#])],
+                    ..FileFacts::default()
+                },
+            ),
+            ("src/shared.rs".to_owned(), FileFacts::default()),
+        ]
+        .into_iter()
+        .collect();
+        let mut records = vec![
+            file_record("src/lib.rs"),
+            file_record("src/other.rs"),
+            file_record("src/shared.rs"),
+            symbol_record(
+                "shared_fn",
+                "src/shared.rs",
+                crate::ir::SymbolRole::Production,
+            ),
+        ];
+        apply_out_of_line_cfg_gates(&mut records, &facts);
+        assert_eq!(
+            file_cfg(&records, "src/shared.rs"),
+            None,
+            "a file also loaded ungated inherits no gates"
+        );
+        assert_eq!(
+            record_cfg(&records, "symbol:src/shared.rs#shared_fn"),
+            None,
+            "ungated precedence extends to the dual-use file's symbols"
+        );
+    }
+
+    #[test]
+    fn out_of_line_cfg_unions_gated_declarations() {
+        // Two gated declarations load one file: the target inherits the
+        // union, declaring files in sorted order. Both declarations come
+        // from crate roots (lib.rs and main.rs) so that `mod shared;`
+        // resolves to the same src/shared.rs under real Rust module
+        // resolution.
+        let facts: BTreeMap<String, FileFacts> = [
+            (
+                "src/lib.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![cfg_gated_mod_fact("shared", &[r#"feature = "x""#])],
+                    ..FileFacts::default()
+                },
+            ),
+            (
+                "src/main.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![cfg_gated_mod_fact("shared", &[r#"feature = "y""#])],
+                    ..FileFacts::default()
+                },
+            ),
+            ("src/shared.rs".to_owned(), FileFacts::default()),
+        ]
+        .into_iter()
+        .collect();
+        let mut records = vec![
+            file_record("src/lib.rs"),
+            file_record("src/main.rs"),
+            file_record("src/shared.rs"),
+        ];
+        apply_out_of_line_cfg_gates(&mut records, &facts);
+        assert_eq!(
+            file_cfg(&records, "src/shared.rs"),
+            Some(vec![
+                r#"feature = "x""#.to_owned(),
+                r#"feature = "y""#.to_owned()
+            ]),
+            "all-gated dual use inherits the union in declaring-file order"
+        );
+    }
+
+    #[test]
+    fn out_of_line_cfg_prepends_before_existing_gates() {
+        // A target file with its own `#![cfg]` inner attributes keeps them;
+        // inherited gates prefix the chain, outermost first.
+        let facts: BTreeMap<String, FileFacts> = [
+            (
+                "src/lib.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![cfg_gated_mod_fact("helpers", &[r#"feature = "x""#])],
+                    ..FileFacts::default()
+                },
+            ),
+            ("src/helpers.rs".to_owned(), FileFacts::default()),
+        ]
+        .into_iter()
+        .collect();
+        let mut records = vec![
+            file_record("src/lib.rs"),
+            file_record("src/helpers.rs").with_cfg(vec![r#"feature = "file""#.to_owned()]),
+        ];
+        apply_out_of_line_cfg_gates(&mut records, &facts);
+        assert_eq!(
+            file_cfg(&records, "src/helpers.rs"),
+            Some(vec![
+                r#"feature = "x""#.to_owned(),
+                r#"feature = "file""#.to_owned()
+            ]),
+            "inherited gates prepend before the file's own gates"
+        );
+    }
+
+    #[test]
+    fn out_of_line_cfg_pass_is_idempotent() {
+        // Re-running the pass over already-stamped records is a no-op, so
+        // incremental reassembly cannot double-apply gates.
+        let facts: BTreeMap<String, FileFacts> = [
+            (
+                "src/lib.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![cfg_gated_mod_fact("helpers", &[r#"feature = "x""#])],
+                    ..FileFacts::default()
+                },
+            ),
+            ("src/helpers.rs".to_owned(), FileFacts::default()),
+        ]
+        .into_iter()
+        .collect();
+        let mut records = vec![
+            file_record("src/lib.rs"),
+            file_record("src/helpers.rs"),
+            symbol_record(
+                "helper",
+                "src/helpers.rs",
+                crate::ir::SymbolRole::Production,
+            ),
+        ];
+        apply_out_of_line_cfg_gates(&mut records, &facts);
+        let once = records.clone();
+        apply_out_of_line_cfg_gates(&mut records, &facts);
+        assert_eq!(
+            records, once,
+            "a second pass run must not change already-stamped records"
+        );
+    }
+
+    // ── Issue #148: macro invocation resolution ──────────────────────────
+
+    fn macro_definition_fact(id: &str, name: &str, path: &str) -> MacroDefinitionFact {
+        MacroDefinitionFact {
+            id: id.to_owned(),
+            simple_name: name.to_owned(),
+            qualified_name: name.to_owned(),
+            repo_relative_path: path.to_owned(),
+        }
+    }
+
+    fn macro_invocation_fact(
+        caller_id: &str,
+        display: &str,
+        simple_name: &str,
+        path: &str,
+        disambiguator: u64,
+    ) -> MacroInvocationFact {
+        MacroInvocationFact {
+            caller_id: caller_id.to_owned(),
+            caller_name: caller_id.to_owned(),
+            invocation_display: display.to_owned(),
+            simple_name: simple_name.to_owned(),
+            span: span(),
+            diagnostic_disambiguator: disambiguator,
+            repo_relative_path: path.to_owned(),
+        }
+    }
+
+    fn macro_facts(
+        path: &str,
+        definitions: Vec<MacroDefinitionFact>,
+        invocations: Vec<MacroInvocationFact>,
+    ) -> (String, FileFacts) {
+        (
+            path.to_owned(),
+            FileFacts {
+                macro_definitions: definitions,
+                macro_invocations: invocations,
+                ..FileFacts::default()
+            },
+        )
+    }
+
+    fn calls_edges(records: &[GraphRecord]) -> Vec<&GraphRecord> {
+        records
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    GraphRecord::Edge {
+                        label: EdgeLabel::Calls,
+                        ..
+                    }
+                )
+            })
+            .collect()
+    }
+
+    fn diagnostic_nodes(records: &[GraphRecord]) -> Vec<&GraphRecord> {
+        records
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    GraphRecord::Node {
+                        kind: NodeKind::Diagnostic,
+                        ..
+                    }
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn macro_unique_resolution_emits_resolved_calls_edge() {
+        let facts: BTreeMap<String, FileFacts> = [
+            macro_facts(
+                "src/lib.rs",
+                vec![macro_definition_fact("macro-id", "greet", "src/lib.rs")],
+                vec![macro_invocation_fact(
+                    "caller-id",
+                    "greet!",
+                    "greet",
+                    "src/lib.rs",
+                    0,
+                )],
+            ),
+            macro_facts(
+                "src/main.rs",
+                vec![],
+                vec![macro_invocation_fact(
+                    "other-caller",
+                    "greet!",
+                    "greet",
+                    "src/main.rs",
+                    0,
+                )],
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let records = cross_file_macro_records("repo-id", &facts);
+        let edges = calls_edges(&records);
+        assert_eq!(edges.len(), 2, "one CALLS edge per invoking scope");
+        for edge in &edges {
+            let GraphRecord::Edge {
+                source,
+                target,
+                resolution,
+                ..
+            } = edge
+            else {
+                panic!("expected an edge record");
+            };
+            assert_eq!(target, "macro-id");
+            assert!(
+                source == "caller-id" || source == "other-caller",
+                "unexpected edge source {source}"
+            );
+            assert_eq!(
+                *resolution,
+                Some(CallResolution::Resolved),
+                "a unique repo-defined macro resolves"
+            );
+        }
+        assert!(
+            diagnostic_nodes(&records).is_empty(),
+            "a resolved invocation must not mint a diagnostic"
+        );
+    }
+
+    #[test]
+    fn macro_external_invocation_keeps_legacy_diagnostic() {
+        let facts: BTreeMap<String, FileFacts> = BTreeMap::from([macro_facts(
+            "src/main.rs",
+            vec![],
+            vec![macro_invocation_fact(
+                "caller-id",
+                "println!",
+                "println",
+                "src/main.rs",
+                0,
+            )],
+        )]);
+        let records = cross_file_macro_records("repo-id", &facts);
+        assert!(
+            calls_edges(&records).is_empty(),
+            "no edge may bind an external macro name"
+        );
+        let diagnostics = diagnostic_nodes(&records);
+        assert_eq!(diagnostics.len(), 1);
+        let GraphRecord::Node {
+            id, name, summary, ..
+        } = diagnostics[0]
+        else {
+            panic!("expected a diagnostic node");
+        };
+        // The pass preserves the pre-#148 per-file diagnostic ID scheme, so
+        // external-macro diagnostics stay byte-identical.
+        let expected = stable_id(&[
+            "node",
+            "diagnostic",
+            "repo-id",
+            "src/main.rs",
+            "println!",
+            "0",
+        ]);
+        assert_eq!(id, &expected, "diagnostic ID scheme must not change");
+        assert_eq!(name.as_deref(), Some("println!"));
+        assert_eq!(summary.as_str(), "unsupported macro invocation println!");
+    }
+
+    #[test]
+    fn macro_ambiguous_name_keeps_diagnostic_and_no_edge() {
+        let facts: BTreeMap<String, FileFacts> = [
+            macro_facts(
+                "src/a.rs",
+                vec![macro_definition_fact("macro-a", "greet", "src/a.rs")],
+                vec![],
+            ),
+            macro_facts(
+                "src/b.rs",
+                vec![macro_definition_fact("macro-b", "greet", "src/b.rs")],
+                vec![macro_invocation_fact(
+                    "caller-id",
+                    "greet!",
+                    "greet",
+                    "src/b.rs",
+                    0,
+                )],
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let records = cross_file_macro_records("repo-id", &facts);
+        assert!(
+            calls_edges(&records).is_empty(),
+            "an ambiguous macro name must never silently bind one definition"
+        );
+        assert_eq!(
+            diagnostic_nodes(&records).len(),
+            1,
+            "an ambiguous invocation stays a diagnostic"
+        );
+    }
+
+    #[test]
+    fn macro_resolution_is_deterministic_across_runs() {
+        let facts: BTreeMap<String, FileFacts> = [
+            macro_facts(
+                "src/lib.rs",
+                vec![macro_definition_fact("macro-id", "greet", "src/lib.rs")],
+                vec![
+                    macro_invocation_fact("caller-id", "greet!", "greet", "src/lib.rs", 0),
+                    macro_invocation_fact("caller-id", "println!", "println", "src/lib.rs", 0),
+                ],
+            ),
+            macro_facts(
+                "src/main.rs",
+                vec![],
+                vec![macro_invocation_fact(
+                    "other-caller",
+                    "greet!",
+                    "greet",
+                    "src/main.rs",
+                    0,
+                )],
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let first = cross_file_macro_records("repo-id", &facts);
+        for _ in 0..5 {
+            let again = cross_file_macro_records("repo-id", &facts);
+            assert_eq!(first, again, "the macro pass must be deterministic");
+        }
     }
 }

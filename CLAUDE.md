@@ -346,7 +346,7 @@ nodes, and URL matching. Bumps codegraph `SCHEMA_VERSION` 7→8 and
 
 Every code fact now records WHICH CARGO PACKAGE OWNS IT (issue #117). Every
 path-bearing code-graph node (`File`, `Module`, `Symbol`, `Import`, `Diagnostic`,
-`PanicRiskSite`, `DebtMarker`, `UnsafeSite`, `DependencyDeclaration`, `Change`) carries an
+`PanicRiskSite`, `DebtMarker`, `UnsafeSite`, `DependencyDeclaration`, `LintSuppression`, `Change`) carries an
 additive optional `crate_attribution`: the owning package NAME plus the
 repo-relative path of the owning `Cargo.toml`, or a closed-set reason no package
 owns it. Before this the graph was a flat pool of files — every fact had a

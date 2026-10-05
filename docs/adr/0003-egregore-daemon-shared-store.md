@@ -4,6 +4,13 @@
 
 Accepted
 
+> **Update (2026-09-15, issue #260):** the MCP server this ADR calls "future"
+> below has shipped — `eg mcp` is a read-only stdio server (issue #53,
+> `src/mcp.rs`, documented in [docs/cli/mcp.md](../cli/mcp.md)) exposing
+> `inspect_store`, `symbol_context`, and `task_evidence` against the running
+> daemon via the same `DaemonClient::from_data_dir` contract. The decision
+> itself is unchanged; only the "future" framing is stale.
+
 ## Wire Contract
 
 The HTTP/JSON wire contract for `egregored` is frozen in

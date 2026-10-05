@@ -80,9 +80,9 @@ The error envelope is printed to stderr as the last non-empty line:
 
 `temporal_snapshots_retained` is present in **both** dry-run and `--confirm`
 output. It enumerates (count + representative IDs) the evicted CODE records that
-carry commit/temporal metadata — the records eviction tombstones but that a
-`scan-history` store's shared read path still surfaces on current-state code
-lanes (see [Temporal-store residual](#temporal-store-residual-scan-history)). It
+carry commit/temporal metadata — retained in the store for `--at <commit>`
+history views while suppressed from current-state code lanes (see
+[Temporal-store snapshots](#temporal-store-snapshots-scan-history)). It
 is empty on a non-temporal (`eg scan`) store.
 
 `--confirm` sets `"action":"evicted"` and adds
@@ -145,8 +145,8 @@ later re-scan/re-ingest — the re-run **repairs** by re-issuing tombstones for 
 currently-live records **without writing a second eviction event** (the original
 is preserved verbatim). `--confirm` reports `action: repaired`; a dry-run over the
 same state reports `action: repair_needed`. A commit-anchored temporal
-(`scan-history`) code snapshot — the documented residual a base-ID tombstone can
-never suppress — is excluded from the repair trigger, so a re-run over a
+(`scan-history`) code snapshot — suppressed from current-state lanes but retained
+for history — is excluded from the repair trigger, so a re-run over a
 `scan-history` store settles to `already_evicted` instead of looping.
 
 ## The eviction event
@@ -173,35 +173,35 @@ cites an evicted handle over an evidence edge is KEPT; the now-dangling link is
 reported under `cross_repo_citations`, never silently dropped or cascade-evicted
 (consistent with `eg forget`'s stale-evidence discipline).
 
-## Temporal-store residual (scan-history)
+## Temporal-store snapshots (scan-history)
 
 On a **non-temporal** (`eg scan`) store, eviction is clean and complete: a base-ID
 tombstone excludes each evicted node (and its edges) from every current-state
 read.
 
-On a **`scan-history`** store, code nodes are commit-anchored (temporal), and
-here eviction has a **documented residual**: the shared `read_all_records` path
-re-emits every per-commit code snapshot with **no tombstone check**, so a base-ID
-tombstone does NOT suppress an evicted repository's temporal code snapshots from
-the current-state (HEAD-anchored) code serving lanes.
+On a **`scan-history`** store, code nodes are commit-anchored (temporal). The
+shared `read_all_records` path re-emits every per-commit code snapshot with **no
+tombstone check** — the same read path that deliberately serves issue #231 `eg
+forget`'s `--at`-after-deletion **bi-temporal honesty**. Eviction tombstones are
+nevertheless distinguishable from ordinary `forget` tombstones without a schema
+change: a tombstone is an eviction tombstone iff its own ID equals the
+`eviction_tombstone_id` recomputed from its target (self-verifying, see
+`src/repo_evict.rs`). Current-state serving paths suppress the targets of
+**active** eviction tombstones — including their temporal snapshots — from every
+current-state lane (`query symbol`/`symbols`/`context`/`deps`/`transitive-callers`,
+the `inspect` serving view). Ordinary `forget` tombstones keep the issue #231
+temporal exemption.
 
-**Why the residual exists.** That same shared read path deliberately serves issue
-#231 `eg forget`'s `--at`-after-deletion **bi-temporal honesty** (a historical
-`--at <commit>` view must still see a record deleted later). An eviction tombstone
-cannot be distinguished from a `forget` tombstone at the read layer without a new
-schema field or a repository-ownership recompute in the hot path — both out of
-scope for this slice — and there is no distinct per-commit version ID to tombstone
-anyway. A physical purge would require an `aletheiadb` capability that does not
-exist. Bi-temporal honesty in fact WANTS the historical `--at <commit>` snapshots
-preserved; the open question is only the HEAD-anchored current-state read.
+**History is preserved.** The bytes stay in the store: an explicit historical
+`query symbol --at <commit>` (or `--as-of`) still resolves the evicted
+repository's snapshots. Eviction suppresses current-state lanes; it does not
+erase history. A re-ingest of the evicted repository revives its records under
+latest-write-wins (the eviction tombstone is superseded).
 
-**The residual is disclosed, never silent.** Every plan and report — dry-run and
-`--confirm` alike — carries a `temporal_snapshots_retained` section enumerating
-(count + representative record IDs) exactly the commit-anchored code records that
-remain visible. On a non-temporal store the section is empty. The
-non-temporal records and the `Repository` identity node are fully evicted; only
-commit-anchored code snapshots persist in current-state code lanes. A follow-up
-issue (#472) tracks the full fix (a read-layer distinction or physical purge).
+**The retained snapshots are disclosed, never silent.** Every plan and report —
+dry-run and `--confirm` alike — carries a `temporal_snapshots_retained` section
+enumerating (count + representative record IDs) exactly the commit-anchored code
+records retained for history views. On a non-temporal store the section is empty.
 
 Read-only in dry-run, redaction-safe (record IDs, domains, kinds, handles,
 counts, and the redacted reason/actor only), deterministic and byte-identical

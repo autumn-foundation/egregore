@@ -1,0 +1,9 @@
+# Fixture config for the issue #252 five-domain context join acceptance gate.
+#
+# Pins the scan transaction time so `eg scan` output is byte-stable across the
+# gate's repeated runs (the gate asserts byte-identical sections over 5 runs).
+# No include/exclude scoping: those pins are version-controlled warnings only
+# (issue #99) and this fixture wants the whole crate scanned.
+
+[scan]
+transaction_time = "2026-09-16T05:30:00Z"

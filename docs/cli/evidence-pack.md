@@ -577,19 +577,24 @@ Re-verifies an assembled pack offline and read-only:
   `ReviewCoverageMeasurement`**, since `merged_pr_count`, `coverage`, `passed`,
   and `unapproved_pr_ids` carry no hashed row of their own and could otherwise be
   edited to show a passing result without disturbing any hashed row: (4) **when the
-  `review_coverage` verdict is `applicable` (gating)**, `unapproved_pr_ids` must
+  recomputed review-coverage applicability holds** (see below),
+  `unapproved_pr_ids` must
   **exactly equal** the set of PR ids the pack's own
   `merged_pr_without_approving_review` gap rows cite (both derive from the same
   merged-but-unapproved set, so they can never legitimately diverge). This binding
-  is **gated on the verdict's `applicable` flag** because `assemble` always fills
+  is **gated on the applicability recomputed from the pack's own bound section
+  requirements** — never the artifact's self-declared
+  `verdicts.review_coverage.applicable` flag, which a hand-edited pack could flip
+  to `false` while stripping the gap rows to make the required gap evidence
+  vanish with Integrity still passing (issue #355) — because `assemble` always fills
   `unapproved_pr_ids` (merged minus approved) but emits the
   `merged_pr_without_approving_review` gaps **only** for a control that requires
-  PR/review evidence — the same condition under which the verdict is
-  applicable/gating. A control that maps `review_coverage` merely **optional** (or
+  PR/review evidence — the same condition the recomputed applicability mirrors.
+  A control that maps `review_coverage` merely **optional** (or
   not at all) therefore emits no such gap even with unapproved in-window merged PRs;
   binding to the empty gap set would wrongly fail its own freshly-assembled pack, so
-  this check is **skipped** when the verdict is `not_applicable` (a safe relaxation —
-  whenever the verdict is applicable the equality holds and is enforced). The
+  this check is **skipped** when the recomputed applicability is false (a safe relaxation —
+  whenever it holds, the equality holds and is enforced). The
   arithmetic/coverage/`passed` rechecks (5)–(7) below run in **every** case; (5)
   `merged_pr_count` must equal `approved_pr_count + unapproved_pr_ids.len()`
   (every merged-in-window PR is either approved or unapproved); (6) `coverage` is
@@ -663,6 +668,38 @@ Re-verifies an assembled pack offline and read-only:
   diagnostics — `assemble` pushes exactly one `missing_valid_time` diagnostic per
   record it excludes for an unresolvable valid time, in lockstep with the counter —
   so understating the manifest's stored exclusion count fails Integrity.
+  Fourth (issue #355 GAP D), the **section-requirements binding hash and the
+  recomputed review-coverage applicability**: the manifest's
+  `section_requirements_binding_hash` is a BLAKE3 hash over the pack's own
+  `(class, requirement)` section pairs, recomputed and compared by Integrity, so a
+  hand-edited section `requirement` with a stale hash fails. With the section
+  requirements bound, Integrity **recomputes** review-coverage applicability from
+  them — `required` `reviews` or `review_coverage` section — and never trusts the
+  artifact's self-declared `verdicts.review_coverage.applicable` flag. The gap-set
+  binding (check (4) above) is gated on the recomputed value, and the verdict
+  itself is bound: `applicable` must equal the recomputed value, `status` must be
+  exactly `gating` / `not_applicable`, `not_applicable_reason` exactly
+  `control_does_not_require_review` iff not applicable, `passed` must equal the
+  bound measurement's `passed` when applicable (vacuously `true` otherwise), and
+  `detail` must be the recomputed canonical text. Flipping `applicable` to
+  `false` while stripping the `merged_pr_without_approving_review` gap rows, or
+  flipping `passed` over a failing measurement, therefore fails Integrity even
+  though every row hash is still valid.
+  Fifth (issue #355 follow-up, "derive on read"), the **control/catalog binding
+  hash**: `manifest.control_catalog_binding_hash` is a BLAKE3 hash over the
+  pack's own carried data — the catalog pin's identity fields (`catalog_id`,
+  schema version, `catalog_hash`), `manifest.control_id`, and the bound
+  `(class, requirement)` section pairs — recomputed and compared by Integrity
+  *after* the section-requirements bind, so a selectively relabeled pack (a
+  hand-edited `control_id` or `catalog_pin` naming a different control or
+  catalog, with a stale hash) fails. An offline verify never needs the external
+  catalog: the expected bind is *derived on read* from the artifact itself.
+  Honest limit: the pin's `catalog_hash` stays an opaque echo — without the
+  catalog, verify cannot recompute the catalog's own hash, so a total-rewrite
+  attacker who consistently recomputes the pin and the bind achieves a
+  self-consistent (relabeled) pack. The bind guarantees no *selective* relabel:
+  `control_id`/`catalog_pin` cannot drift from the sections the verdicts were
+  recomputed over.
 - **Coverage** — recompute the #65 citation thresholds (>=95% code rows cited;
   100% non-code rows cited).
 - **Safety** — scans the **entire serialized pack artifact** for raw sensitive

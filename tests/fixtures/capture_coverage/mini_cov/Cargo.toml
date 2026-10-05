@@ -1,0 +1,8 @@
+[package]
+name = "mini_cov"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone workspace root: this fixture is built by integration tests that
+# run cargo inside it, and it must not be absorbed into the egregore workspace.
+[workspace]

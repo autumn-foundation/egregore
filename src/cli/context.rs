@@ -1,10 +1,13 @@
 use super::*;
 
+use super::record_budget::RecordBudget;
+
 /// Renders a resolved [`query::SymbolContext`] into the serializable section
 /// views, reusing the existing per-record builders (`context_source_fact`,
 /// `context_observation`, `context_linked_item`). `.copied()` collapses the
 /// `&&GraphRecord` from `iter()` so each view borrows the record slice directly.
 pub(crate) fn build_context_sections<'a>(
+    records: &'a [GraphRecord],
     ctx: &'a query::SymbolContext<'a>,
     trust: &query::TrustIndex<'_>,
 ) -> ContextSections<'a> {
@@ -51,6 +54,14 @@ pub(crate) fn build_context_sections<'a>(
             .copied()
             .filter_map(|r| context_observation(r, trust))
             .collect(),
+        // Section contract (issue #191): decisions surface in their own
+        // section and never in `observations`.
+        decisions: ctx
+            .decisions
+            .iter()
+            .copied()
+            .filter_map(|r| context_decision(r, records, trust))
+            .collect(),
         project_state: ctx
             .project_state
             .iter()
@@ -80,22 +91,85 @@ pub(crate) fn build_context_sections<'a>(
                 verification_status: "unresolved",
             })
             .collect(),
+        // Issue #169: fold active approved policy into the context answer.
+        // Always present (possibly empty) — a context with no applicable
+        // policy carries an explicit empty `policy` section.
+        policy: ctx
+            .policy
+            .iter()
+            .map(|p| ContextPolicyRow {
+                record_id: p.record_id(),
+                kind: p.kind.as_str(),
+                body: p.body,
+                approval_decision_id: p.approval_decision_id,
+                active_from: p.active_from,
+                status: p.status.as_str(),
+                trust: trust.classify(p.record),
+                scope_repo: p.scope.repo.as_deref(),
+                scope_path_glob: p.scope.path_glob.as_deref(),
+                scope_language: p.scope.language.as_deref(),
+                scope_lifecycle_phase: p.scope.lifecycle_phase.as_deref(),
+            })
+            .collect(),
     }
 }
 
-pub(crate) fn apply_supersession<'a>(
-    observations: Vec<query::ContextObservation<'a>>,
+/// A context row that can carry temporal-supersession flags (issue #191:
+/// decisions need the same supersession handling as observations).
+pub(crate) trait SupersessionRow<'a> {
+    fn record_id(&self) -> &'a str;
+    fn trust(&self) -> crate::query::TrustClass;
+    fn set_temporal_status(&mut self, status: String);
+    fn set_superseded_by(&mut self, ids: Option<Vec<crate::temporal_status::TemporalReference>>);
+    fn set_contradicted_by(&mut self, ids: Option<Vec<crate::temporal_status::TemporalReference>>);
+}
+
+impl<'a> SupersessionRow<'a> for query::ContextObservation<'a> {
+    fn record_id(&self) -> &'a str {
+        self.record_id
+    }
+    fn trust(&self) -> crate::query::TrustClass {
+        self.trust
+    }
+    fn set_temporal_status(&mut self, status: String) {
+        self.temporal_status = Some(status);
+    }
+    fn set_superseded_by(&mut self, ids: Option<Vec<crate::temporal_status::TemporalReference>>) {
+        self.superseded_by = ids;
+    }
+    fn set_contradicted_by(&mut self, ids: Option<Vec<crate::temporal_status::TemporalReference>>) {
+        self.contradicted_by = ids;
+    }
+}
+
+impl<'a> SupersessionRow<'a> for query::ContextDecision<'a> {
+    fn record_id(&self) -> &'a str {
+        self.record_id
+    }
+    fn trust(&self) -> crate::query::TrustClass {
+        self.trust
+    }
+    fn set_temporal_status(&mut self, status: String) {
+        self.temporal_status = Some(status);
+    }
+    fn set_superseded_by(&mut self, ids: Option<Vec<crate::temporal_status::TemporalReference>>) {
+        self.superseded_by = ids;
+    }
+    fn set_contradicted_by(&mut self, ids: Option<Vec<crate::temporal_status::TemporalReference>>) {
+        self.contradicted_by = ids;
+    }
+}
+
+pub(crate) fn apply_supersession<'a, R: SupersessionRow<'a>>(
+    rows: Vec<R>,
     resolver: &crate::temporal_status::TemporalResolver<'a>,
     mode: crate::temporal_status::SupersessionMode,
-) -> (
-    Vec<query::ContextObservation<'a>>,
-    Vec<ExcludedDiagnostic<'a>>,
-) {
+) -> (Vec<R>, Vec<ExcludedDiagnostic<'a>>) {
     let mut filtered = Vec::new();
     let mut excluded = Vec::new();
 
-    for mut obs in observations {
-        let (status, superseded_by, contradicted_by) = resolver.resolve_status(obs.record_id);
+    for mut row in rows {
+        let (status, superseded_by, contradicted_by) = resolver.resolve_status(row.record_id());
 
         let is_superseded = status == "superseded" || status == "cycle";
         let is_contradicted = status == "contradicted";
@@ -109,8 +183,8 @@ pub(crate) fn apply_supersession<'a>(
             match mode {
                 crate::temporal_status::SupersessionMode::Exclude => {
                     excluded.push(ExcludedDiagnostic {
-                        record_id: obs.record_id,
-                        trust: obs.trust,
+                        record_id: row.record_id(),
+                        trust: row.trust(),
                         reason,
                         superseded_by: if superseded_by.is_empty() {
                             None
@@ -125,28 +199,28 @@ pub(crate) fn apply_supersession<'a>(
                     });
                 }
                 crate::temporal_status::SupersessionMode::IncludeButFlag => {
-                    obs.temporal_status = Some(status.to_string());
-                    obs.superseded_by = if superseded_by.is_empty() {
+                    row.set_temporal_status(status.to_string());
+                    row.set_superseded_by(if superseded_by.is_empty() {
                         None
                     } else {
                         Some(superseded_by)
-                    };
-                    obs.contradicted_by = if contradicted_by.is_empty() {
+                    });
+                    row.set_contradicted_by(if contradicted_by.is_empty() {
                         None
                     } else {
                         Some(contradicted_by)
-                    };
-                    filtered.push(obs);
+                    });
+                    filtered.push(row);
                 }
             }
         } else {
             match mode {
                 crate::temporal_status::SupersessionMode::IncludeButFlag => {
-                    obs.temporal_status = Some(status.to_string());
-                    filtered.push(obs);
+                    row.set_temporal_status(status.to_string());
+                    filtered.push(row);
                 }
                 crate::temporal_status::SupersessionMode::Exclude => {
-                    filtered.push(obs);
+                    filtered.push(row);
                 }
             }
         }
@@ -155,24 +229,73 @@ pub(crate) fn apply_supersession<'a>(
     (filtered, excluded)
 }
 
-pub(crate) fn query_context_cmd(
-    records: &[GraphRecord],
-    symbol_name: &str,
-    freshness: Option<(String, &'static str)>,
-    supersession: crate::temporal_status::SupersessionMode,
-    at_head: bool,
-    all_history: bool,
-) -> Result<()> {
-    // Corpus-mode selection (issue #456): head-anchor by default over a
-    // scan-history store; `--all-history` opts into the union. Pre-filter drops
-    // off-HEAD records BEFORE building the cross-domain context bundle.
-    let index = query::RepositoryIndex::build(records);
-    let (corpus_mode, corpus_mode_source, filtered) =
-        resolve_current_state_corpus(records, &index, false, at_head, all_history)?;
-    let records: &[GraphRecord] = filtered.as_deref().unwrap_or(records);
-
+/// Issue #192: resolve the symbol context for a name, reporting ambiguity
+/// instead of merging when the name matches distinct symbols. When
+/// `candidate` is `Some`, re-query for exactly that identity (a stable
+/// record ID or a `file:span` handle); otherwise look the name up directly.
+/// Exits the process with a JSON error envelope when the recall is
+/// ambiguous or matches nothing.
+fn resolve_symbol_or_candidate<'a>(
+    records: &'a [GraphRecord],
+    symbol_name: &'a str,
+    candidate: Option<&'a str>,
+) -> Result<(query::SymbolContext<'a>, &'a str)> {
+    if let Some(selector) = candidate {
+        let anchor = records
+            .iter()
+            .find(|r| {
+                r.id() == selector
+                    && matches!(
+                        r,
+                        GraphRecord::Node {
+                            kind: NodeKind::Symbol,
+                            ..
+                        }
+                    )
+            })
+            .or_else(|| query::resolve_symbol_file_span_handle(records, selector));
+        let Some(anchor) = anchor else {
+            emit_no_match_candidate(selector)?;
+            std::process::exit(2);
+        };
+        let ctx = query::record_context(records, anchor.id());
+        if ctx.is_no_match() {
+            emit_no_match_candidate(selector)?;
+            std::process::exit(2);
+        }
+        let name = match anchor {
+            GraphRecord::Node { name: Some(n), .. } => n.as_str(),
+            _ => selector,
+        };
+        return Ok((ctx, name));
+    }
     let ctx = query::symbol_context(records, symbol_name);
-
+    if ctx.is_ambiguous() {
+        let candidates: Vec<serde_json::Value> = ctx
+            .candidates
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "record_id": c.record_id,
+                    "symbol_name": c.symbol_name,
+                    "repo_relative_path": c.repo_relative_path,
+                    "span": c.span,
+                    "file_span_handle": c.file_span_handle(),
+                })
+            })
+            .collect();
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "ambiguous_symbol",
+                "symbol_name": symbol_name,
+                "message": "the name matches more than one distinct symbol; re-run with --candidate <record_id|file:span handle>",
+                "candidates": candidates,
+            }
+        });
+        println!("{}", serde_json::to_string(&envelope)?);
+        std::process::exit(1);
+    }
     if ctx.is_no_match() {
         let envelope = serde_json::json!({
             "ok": false,
@@ -184,9 +307,65 @@ pub(crate) fn query_context_cmd(
         println!("{}", serde_json::to_string(&envelope)?);
         std::process::exit(2);
     }
+    Ok((ctx, symbol_name))
+}
+
+/// Emit the `no_match` envelope for an unresolvable `--candidate` selector.
+fn emit_no_match_candidate(selector: &str) -> Result<()> {
+    let envelope = serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": "no_match",
+            "candidate": selector,
+        }
+    });
+    println!("{}", serde_json::to_string(&envelope)?);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn query_context_cmd(
+    records: &[GraphRecord],
+    symbol_name: &str,
+    freshness: Option<(String, &'static str)>,
+    supersession: crate::temporal_status::SupersessionMode,
+    at_head: bool,
+    all_history: bool,
+    max_records: Option<usize>,
+    store_coverage: query::StoreCoverage,
+    candidate: Option<&str>,
+    // Size budget (issue #131): `Some` renders a token/byte-bounded pack via
+    // `context_pack::emit_context_pack` instead of the full answer; `None`
+    // preserves the existing un-budgeted behavior exactly.
+    pack_budget: Option<context_pack::PackBudget>,
+) -> Result<()> {
+    // Corpus-mode selection (issue #456): head-anchor by default over a
+    // scan-history store; `--all-history` opts into the union. Pre-filter drops
+    // off-HEAD records BEFORE building the cross-domain context bundle.
+    let index = query::RepositoryIndex::build(records);
+    let (corpus_mode, corpus_mode_source, filtered) =
+        resolve_current_state_corpus(records, &index, false, at_head, all_history)?;
+    let records: &[GraphRecord] = filtered.as_deref().unwrap_or(records);
+
+    // Issue #192: a name shared by distinct symbols is reported, never merged;
+    // `--candidate` re-queries for exactly one of them.
+    let (ctx, display_name) = resolve_symbol_or_candidate(records, symbol_name, candidate)?;
 
     let trust = query::TrustIndex::build(records);
-    let sections = build_context_sections(&ctx, &trust);
+    let sections = build_context_sections(records, &ctx, &trust);
+    // Destructure so the supersession passes below can move the observation
+    // and decision rows out without partially moving `sections`.
+    let ContextSections {
+        source_facts,
+        topology_edges,
+        observations: pre_observations,
+        decisions: pre_decisions,
+        project_state,
+        artifacts,
+        verification_evidence,
+        unresolved,
+        policy,
+    } = sections;
 
     // Attach the freshness verdict only when every source fact belongs to the
     // repository the verdict was computed for (PR #186): `query context` has no
@@ -206,8 +385,14 @@ pub(crate) fn query_context_cmd(
     // Reuse the resolver the trust index already built over this exact slice
     // (one O(n) build per answer) so `trust` and `temporal_status` can never be
     // computed from different corpora.
-    let (observations, excluded) =
-        apply_supersession(sections.observations, trust.resolver(), supersession);
+    let (observations, mut excluded) =
+        apply_supersession(pre_observations, trust.resolver(), supersession);
+
+    // Decisions get their own supersession pass (issue #191): same
+    // temporal-status semantics, surfaced in the decisions section.
+    let (decisions, decision_excluded) =
+        apply_supersession(pre_decisions, trust.resolver(), supersession);
+    excluded.extend(decision_excluded);
 
     let resolved_drift_targets = query::resolve_drift_targets(records, &ctx.drift_history);
     let drift_history: Vec<ContextDrift<'_>> = ctx
@@ -220,22 +405,58 @@ pub(crate) fn query_context_cmd(
 
     let corpus_disclaimer = corpus_mode.disclaimer().to_owned();
 
+    // Budgeted pack (issue #131): the same resolved sections, rendered
+    // under a token/byte ceiling instead of the full answer.
+    if let Some(pack_budget) = pack_budget {
+        let sections = ContextSections {
+            source_facts,
+            topology_edges,
+            observations,
+            decisions,
+            project_state,
+            artifacts,
+            verification_evidence,
+            unresolved,
+            policy,
+        };
+        return context_pack::emit_context_pack(
+            display_name,
+            freshness_code,
+            sections,
+            drift_history,
+            excluded,
+            corpus_mode,
+            corpus_mode_source,
+            corpus_disclaimer,
+            store_coverage,
+            pack_budget,
+        );
+    }
+
+    // Record budget (issue #211): sections fill sequentially in envelope
+    // order; each keeps its top-ranked prefix and the remainder flows on.
+    let mut budget = RecordBudget::new(max_records);
     let response = ContextResponse {
         ok: true,
-        symbol_name,
+        symbol_name: display_name,
         freshness: freshness_code,
-        source_facts: sections.source_facts,
-        topology_edges: sections.topology_edges,
-        observations,
-        project_state: sections.project_state,
-        artifacts: sections.artifacts,
-        verification_evidence: sections.verification_evidence,
-        drift_history,
-        unresolved: sections.unresolved,
+        source_facts: budget.section(source_facts),
+        topology_edges: budget.section(topology_edges),
+        observations: budget.section(observations),
+        decisions: budget.section(decisions),
+        project_state: budget.section(project_state),
+        artifacts: budget.section(artifacts),
+        verification_evidence: budget.section(verification_evidence),
+        drift_history: budget.section(drift_history),
+        unresolved: budget.section(unresolved),
+        // Issue #169: policy folds into the single-symbol context answer,
+        // budgeted like every other section; always present (possibly empty).
+        policy: budget.section(policy),
         excluded,
         corpus_mode: corpus_mode.as_str(),
         corpus_mode_source: corpus_mode_source.as_str(),
         corpus_disclaimer,
+        store_coverage,
     };
 
     let output = serde_json::to_string_pretty(&response).context("failed to serialize context")?;

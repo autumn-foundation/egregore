@@ -1,9 +1,12 @@
-use std::cmp::Ordering;
-
 use super::{drift_score, semantic_drift};
 use crate::ir::{EdgeLabel, GraphRecord, SemanticDriftMetadata};
 
 /// Returns semantic drift nodes ranked by score descending.
+///
+/// The ranking is a total order (issue #199): score descending via
+/// [`f64::total_cmp`] — so NaN takes a deterministic position instead of
+/// collapsing to `Equal` — then record ID ascending. No two distinct drift
+/// rows can ever swap positions across runs.
 #[must_use]
 pub fn largest_semantic_drifts(records: &[GraphRecord], limit: usize) -> Vec<&GraphRecord> {
     let mut drifts = records
@@ -12,8 +15,7 @@ pub fn largest_semantic_drifts(records: &[GraphRecord], limit: usize) -> Vec<&Gr
         .collect::<Vec<_>>();
     drifts.sort_by(|(left_record, left_score), (right_record, right_score)| {
         right_score
-            .partial_cmp(left_score)
-            .unwrap_or(Ordering::Equal)
+            .total_cmp(left_score)
             .then_with(|| left_record.id().cmp(right_record.id()))
     });
     drifts
@@ -223,3 +225,102 @@ pub fn resolve_drift_targets<'a>(
 }
 
 // ── Repository scope (issue #67) ──────────────────────────────────────────────
+
+#[cfg(test)]
+mod ordering_tests {
+    //! Ordering-contract regression tests (issue #199): drift ranking is a
+    //! total order — score descending, then record ID ascending — so tied
+    //! rows can never swap positions across runs.
+    use super::*;
+    use crate::ir::{EmbeddingModel, MetricKind, NodeKind, SelectionBasis, SemanticDriftMetadata};
+
+    fn drift_node(id: &str, score: f64) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::SemanticDrift,
+            Some("src/lib.rs".to_owned()),
+            None,
+            Some("drifted_fn".to_owned()),
+            format!("drift {id}"),
+        )
+        .with_semantic_drift(SemanticDriftMetadata {
+            embedding_model: EmbeddingModel {
+                provider: "test".to_owned(),
+                name: "test-model-v1".to_owned(),
+                version: "v1".to_owned(),
+                dim: 2,
+                content_hash: "fixture".to_owned(),
+            },
+            target_record_id: "target".to_owned(),
+            prior_record_id: "target".to_owned(),
+            before_git_commit: "aaaaaaaa".to_owned(),
+            after_git_commit: "bbbbbbbb".to_owned(),
+            before_valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            after_valid_time: "2026-01-02T00:00:00Z".to_owned(),
+            metric_kind: MetricKind::CosineDistance,
+            score,
+            selection_threshold: 0.2,
+            selection_basis: SelectionBasis::ThresholdOnly,
+        })
+    }
+
+    fn ranked_ids(records: &[GraphRecord]) -> Vec<String> {
+        largest_semantic_drifts(records, 10)
+            .iter()
+            .map(|r| r.id().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn tied_drift_scores_break_by_record_id_ascending() {
+        // Insertion order is deliberately NOT record-ID order.
+        let records = vec![
+            drift_node("drift/zeta", 0.5),
+            drift_node("drift/alpha", 0.5),
+            drift_node("drift/mike", 0.9),
+        ];
+        assert_eq!(
+            ranked_ids(&records),
+            vec!["drift/mike", "drift/alpha", "drift/zeta"],
+            "tied drift scores must break by record ID ascending"
+        );
+    }
+
+    #[test]
+    fn nan_drift_score_sorts_to_a_deterministic_position() {
+        // `partial_cmp` collapses NaN comparisons to `Equal`, which would pin
+        // the NaN row to its input position — input-order-dependent, not a
+        // total order. `total_cmp` ranks NaN deterministically instead.
+        let records = vec![drift_node("drift/a", 0.5), drift_node("drift/n", f64::NAN)];
+        assert_eq!(
+            ranked_ids(&records),
+            vec!["drift/n", "drift/a"],
+            "a NaN drift score must sort to a deterministic position"
+        );
+        // And the reverse insertion order must converge to the same ranking.
+        let reversed = vec![drift_node("drift/n", f64::NAN), drift_node("drift/a", 0.5)];
+        assert_eq!(
+            ranked_ids(&reversed),
+            vec!["drift/n", "drift/a"],
+            "NaN positioning must not depend on input order"
+        );
+    }
+
+    #[test]
+    fn drift_ranking_is_stable_across_repeated_runs() {
+        let records = vec![
+            drift_node("drift/zeta", 0.5),
+            drift_node("drift/alpha", 0.5),
+            drift_node("drift/mike", 0.9),
+            drift_node("drift/beta", 0.1),
+        ];
+        let reference = ranked_ids(&records);
+        for _ in 0..20 {
+            assert_eq!(
+                ranked_ids(&records),
+                reference,
+                "drift ranking must be byte-identical across runs"
+            );
+        }
+    }
+}

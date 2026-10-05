@@ -49,7 +49,11 @@ eg query semantic-memory "what breaks when the input file is empty?" \
 
 ```text
 eg query semantic-memory <QUERY> --data-dir <DIR> [--repo <SELECTOR>] \
-    [--limit <N>] [--verified-only] [--supersession <exclude|include-but-flag>] [--format json|text]
+    [--limit <N>] [--verified-only] [--agent <AGENT_ID>] [--not-agent <AGENT_ID>] \
+    [--supersession <exclude|include-but-flag>] [--format json|text]
+eg query semantic-memory <QUERY> --data-dir <DIR> --collapse \
+    [--collapse-mode <auto|embedding-cosine|normalized-text>] \
+    [--similarity-threshold <F>] [--limit <N>] [--format json|text]
 ```
 
 Reads directly from an embedded AletheiaDB store (`--data-dir`). The query string
@@ -63,8 +67,13 @@ contacted.
 | `--repo <SELECTOR>` | Restrict results to one repository (issue #67). |
 | `--limit <N>` | Maximum memory hits to return (default 10). |
 | `--verified-only` | Exclude unverified observations (see below). |
+| `--agent <AGENT_ID>` | Restrict recall to observations authored by this agent identity (see "Author scoping"). |
+| `--not-agent <AGENT_ID>` | Exclude observations authored by this agent identity (see "Author scoping"). |
 | `--supersession <mode>` | `exclude` (default) or `include-but-flag` (see [recall-supersession.md](recall-supersession.md)). |
 | `--format` | `json` (default) or `text`. |
+| `--collapse` | Collapse near-duplicate observations: one representative row per cluster, preceded by an envelope naming the requested/actual mode, threshold, and source/representative counts (issue #163; see below). |
+| `--collapse-mode <mode>` | `auto` (default), `embedding-cosine`, or `normalized-text`. |
+| `--similarity-threshold <F>` | Cosine-similarity threshold in `[0.0, 1.0]` (default `0.85`, echoed in the envelope); ignored by normalized-text equality clustering. |
 
 | Condition | Exit |
 |-----------|------|
@@ -115,6 +124,78 @@ silently promoted to a fact.
 ### `--supersession`
 
 Controls how superseded or contradicted observations are filtered or annotated. By default (`exclude`), they are excluded from the `observations` list and added to `excluded` diagnostics. With `include-but-flag`, they are returned alongside their temporal status and forward references. See [recall-supersession.md](recall-supersession.md) for full details.
+
+### `--include-retired` (issue #156)
+
+Records retired from recall ([`eg retire`](retire.md)) are excluded from
+default recall with an exclusion diagnostic — on the vector path, the
+`--collapse` path, and the normalized-text degraded collapse path.
+`--include-retired` keeps them and labels every returned row with its
+`retirement_state`:
+
+```sh
+eg query semantic-memory "what breaks when the input file is empty?" --include-retired
+```
+
+```json
+"retirement_state": { "state": "retired", "reason": "superseded", "retired_by": "op-1", "retired_at": "2026-09-28T12:00:00Z" }
+```
+
+Active records label as `{ "state": "active" }` when the flag is passed. The
+label is omitted entirely in default recall, where retired records never
+reach the row stage. Retirement is the recall-state switch; it is distinct
+from [`eg forget`](forget.md) (logical retraction from every read surface)
+and from supersession (a provenance relationship that recall also filters
+on).
+
+### Author scoping (issue #195)
+
+In multi-agent deployments many agents write observations into one shared
+store. The author selector scopes recall by the authoring agent identity:
+
+```sh
+# Only what agent_1 concluded about the parser:
+eg query semantic-memory "what breaks when the input file is empty?" \
+  --data-dir .egregore --agent agent_1
+
+# Everything except agent_1's observations:
+eg query semantic-memory "what breaks when the input file is empty?" \
+  --data-dir .egregore --not-agent agent_1
+```
+
+- The selector is spelled `--agent <AGENT_ID>` (include) and
+  `--not-agent <AGENT_ID>` (exclude). Both may be given: a recalled
+  observation must satisfy both, so when both name the same agent the
+  exclusion wins.
+- Every recalled observation already carries its author as first-class
+  answer fields: **`agent_id`** and **`session_id`** on each row (never
+  buried inside raw provenance).
+- Matching is exact, case-sensitive equality on the `agent_id` handle.
+- Composes with `--repo`, `--verified-only`, and `--supersession`; with no
+  selector recall is unscoped (default behavior unchanged).
+- Deterministic code-graph facts carry no `agent_id` and are never returned
+  by an author-scoped recall.
+- When the selector matches no observations the answer is an explicit empty
+  result — exit `0`, not an error and not a silent fallback to unscoped
+  recall:
+
+```json
+{
+  "ok": true,
+  "query": "what breaks when the input file is empty?",
+  "results": [],
+  "author_scope": {
+    "agent": "agent_9",
+    "not_agent": null,
+    "author_field": "agent_id",
+    "observations_matched": 0
+  },
+  "message": "no observations matched the author selector"
+}
+```
+
+`author_scope.author_field` names the row field carrying the author
+(`agent_id`); `agent` / `not_agent` echo the selectors that were applied.
 
 ### Example
 
@@ -179,6 +260,53 @@ equivalent ordered results and identical aggregate metrics.
 `rg` + `jq` over transcripts are honest substitutes for literal recall, but they
 cannot retrieve by meaning, separate trust classes, or attach citable record and
 transcript handles.
+
+## Collapsing near-duplicate observations (issue #163)
+
+When several sessions re-learn the same lesson, plain recall returns every
+restatement. `--collapse` groups near-duplicates into clusters and returns one
+representative row per cluster:
+
+```sh
+eg query semantic-memory "what did past sessions learn?" \
+  --data-dir .egregore --collapse
+```
+
+The answer is an envelope line followed by one JSON row per representative
+(`--limit` bounds representatives, not source rows):
+
+```jsonc
+{"ok": true, "query": "...", "collapse": {"enabled": true, "mode": "embedding-cosine",
+  "mode_requested": "auto", "similarity_threshold": 0.85,
+  "threshold_monotonicity": "raising the threshold monotonically refines the partition …",
+  "source_records": 25, "representatives": 5, "collapsed_away": 20}}
+{"record_id": "…", "kind": "Observation", "trust_class": "agent_authored",
+  "representative_trust_class": "agent_verified", "cluster_size": 5,
+  "member_ids": ["…", "…"], "cluster_observed_at_min": "…",
+  "cluster_observed_at_max": "…", "trust_spread": {"agent_verified": 2, "agent_unverified": 3},
+  "primary_cited_target": {"record_id": "…", "relation": "OBSERVES"}, "memory_text": "…"}
+```
+
+- **Eligibility**: agent-authored observation-class records sharing the same
+  primary cited code target (`OBSERVES` / `MENTIONS_SYMBOL`, inline links and
+  standalone edges; `as_of_commit` is part of the identity). Target-less
+  records stay singletons; observations never merge with deterministic code
+  facts.
+- **Modes**: `embedding-cosine` reuses stored vectors (missing vectors fail
+  closed to singletons); `normalized-text` clusters on normalized stored-text
+  equality without loading a model. `auto` picks `embedding-cosine` when the
+  store has a vector index and degrades to `normalized-text` on a store that
+  was never embedded; a damaged index is refused, not degraded over.
+- **Representative**: highest confidence, then earliest `observed_at`, then
+  smallest record ID — a real stored record, provenance intact.
+- **Read-only**: collapse never writes; the store is untouched. This is
+  presentation, not persistence. It differs from the adjacent recall
+  surfaces on purpose: #94 (composition-health measurement) measures and
+  explicitly never collapses; #131 (budget-fit packing) fits an answer to a
+  token budget but collapses nothing; #92 (supersession flagging) flags
+  superseded/contradicted records while `--collapse` groups the recalled
+  ones. A cluster may mix trust classes and reports that mix in
+  `trust_spread`.
 
 ## Scope
 

@@ -121,6 +121,10 @@ fn make_agent_memory_node(
         note: None,
         content_signature: None,
         route: None,
+        deprecated: None,
+        entry_point: None,
+        role: None,
+        complexity: None,
         crate_attribution: None,
         temporal: None,
         semantic_drift: None,
@@ -128,6 +132,9 @@ fn make_agent_memory_node(
         repository_identity: None,
         source_snapshot: None,
         text,
+        // Issue #191: decision-only fields; None for non-Decision records.
+        decision_text: None,
+        rationale_summary: None,
         superseded_by: None,
         agent_id: Some("test-agent".to_string()),
         agent_kind: Some("test".to_string()),
@@ -215,9 +222,15 @@ fn make_agent_memory_node(
         dependency: None,
         log: None,
         scan_coverage: None,
+        history_replay_window: None,
+        history_replay_tip: None,
         embedding_model: None,
         user_context: aletheia_egregore::UserContextFields::empty(),
         producer: None,
+        lint_suppression: None,
+        // Conditional-compilation gates (issue #190): test fixtures build
+        // plain nodes; ungated, so no `cfg` chain.
+        cfg: None,
     }
 }
 

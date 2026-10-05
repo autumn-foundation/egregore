@@ -20,6 +20,26 @@ const fn span(start_line: usize, end_line: usize) -> SourceSpan {
         end_byte: 1,
         start_line,
         end_line,
+        // No columns recorded: legacy provenance exercises the whole-line
+        // fallback (issue #463).
+        start_column: None,
+        end_column: None,
+    }
+}
+
+const fn span_columns(
+    start_line: usize,
+    start_column: usize,
+    end_line: usize,
+    end_column: usize,
+) -> SourceSpan {
+    SourceSpan {
+        start_byte: 0,
+        end_byte: 1,
+        start_line,
+        end_line,
+        start_column: Some(start_column),
+        end_column: Some(end_column),
     }
 }
 
@@ -123,6 +143,67 @@ fn export_scip_from_graph_writes_parseable_index() {
     assert_eq!(doc.occurrences.len(), 2);
     let meta = index.metadata.as_ref().expect("metadata");
     assert_eq!(meta.tool_info.name, "egregore");
+}
+
+/// Column-carrying spans (issue #463) export as precise half-open ranges, and
+/// the document declares the UTF-8 position encoding the exporter uses.
+#[test]
+fn export_scip_emits_column_precise_ranges() {
+    use aletheia_egregore::scip::build_index;
+
+    let records = vec![
+        GraphRecord::node(
+            "file-1".to_string(),
+            NodeKind::File,
+            Some("src/lib.rs".to_string()),
+            None,
+            Some("src/lib.rs".to_string()),
+            "File src/lib.rs".to_string(),
+        ),
+        GraphRecord::syntax_symbol(
+            "s-indented".to_string(),
+            "function",
+            "src/lib.rs".to_string(),
+            span_columns(3, 4, 3, 15),
+            "indented".to_string(),
+            "rust",
+            0,
+            "Rust function indented".to_string(),
+        ),
+        // Legacy span with no columns degrades to the whole-line range.
+        GraphRecord::syntax_symbol(
+            "s-legacy".to_string(),
+            "function",
+            "src/lib.rs".to_string(),
+            span(5, 6),
+            "legacy".to_string(),
+            "rust",
+            0,
+            "Rust function legacy".to_string(),
+        ),
+    ];
+    let export = build_index(&records, "widget", "0.0.0");
+    let doc = &export.index.documents[0];
+    assert_eq!(
+        doc.position_encoding.enum_value_or_default(),
+        scip::types::PositionEncoding::UTF8CodeUnitOffsetFromLineStart
+    );
+    let range_of = |display: &str| {
+        doc.occurrences
+            .iter()
+            .find(|occ| {
+                doc.symbols
+                    .iter()
+                    .any(|s| s.symbol == occ.symbol && s.display_name == display)
+            })
+            .expect("occurrence")
+            .range
+            .clone()
+    };
+    // Line 3 (1-based), columns 4..15 → 0-based half-open [2, 4, 2, 15].
+    assert_eq!(range_of("indented"), vec![2, 4, 2, 15]);
+    // No columns → whole-line fallback [4, 0, 6, 0].
+    assert_eq!(range_of("legacy"), vec![4, 0, 6, 0]);
 }
 
 #[test]

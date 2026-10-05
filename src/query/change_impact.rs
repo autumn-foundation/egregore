@@ -5,7 +5,7 @@ use super::{
     FailureTargetKind, MemoryAuditDiagnostic, RepositoryIndex, ResolvedFailureTarget,
     containing_file_or_module, imported_symbol_names, last_path_segment, record_node_kind,
 };
-use crate::ir::{EdgeLabel, GraphRecord, NodeKind};
+use crate::ir::{CallResolution, EdgeLabel, GraphRecord, NodeKind};
 
 /// Direction of traversal for one impact lead.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -237,7 +237,12 @@ pub fn change_impact_context<'a>(
 
     let target_kind = match target.kind {
         FailureTargetKind::File => "file",
-        FailureTargetKind::Task | FailureTargetKind::Source | FailureTargetKind::Symbol => "symbol",
+        // `WorkingSet` is unreachable here (`resolve_failure_target` never
+        // produces it); grouped with the code kinds as the safe default.
+        FailureTargetKind::Task
+        | FailureTargetKind::Source
+        | FailureTargetKind::Symbol
+        | FailureTargetKind::WorkingSet => "symbol",
     };
     let target_ids: Vec<String> = target.anchor_ids.iter().cloned().collect();
 
@@ -623,6 +628,38 @@ pub fn change_impact_context<'a>(
                                         anchor_id,
                                         hop,
                                     });
+                                // Issue #267: traversing a trait-dispatch
+                                // boundary (an `unresolved_dispatch` edge to
+                                // the typed marker) is a typed diagnostic in
+                                // the existing diagnostics lane — the callee
+                                // set beyond the boundary is unknowable, and
+                                // the marker lead alone does not say so. The
+                                // target handle is the marker's
+                                // `unresolved_dispatch: Trait::method` name:
+                                // for a dispatch boundary the trait+method
+                                // handle IS the identity of what could not be
+                                // resolved (a bare record ID would not say
+                                // which dispatch failed); the edge record ID
+                                // keeps the machine link.
+                                if let GraphRecord::Edge {
+                                    resolution: Some(CallResolution::UnresolvedDispatch),
+                                    ..
+                                } = edge_record
+                                {
+                                    let target_handle = match node {
+                                        GraphRecord::Node {
+                                            name: Some(name), ..
+                                        } => name.clone(),
+                                        _ => target_id.to_owned(),
+                                    };
+                                    diagnostics.push(MemoryAuditDiagnostic {
+                                        code: "unresolved_dispatch".to_owned(),
+                                        source_record_id: edge_id.to_owned(),
+                                        target_handle,
+                                        relation: "CALLS".to_owned(),
+                                        target_domain: "codegraph".to_owned(),
+                                    });
+                                }
                                 // Expand callees at next hop (only symbols)
                                 if hop < depth
                                     && matches!(
@@ -926,6 +963,8 @@ mod liveness_parity_tests {
                 end_byte: 10,
                 start_line: 1,
                 end_line: 2,
+                start_column: None,
+                end_column: None,
             }),
             Some(name.to_owned()),
             format!("symbol {name}"),
@@ -997,6 +1036,109 @@ mod liveness_parity_tests {
         assert!(
             ctx.direct_callers.is_empty(),
             "a tombstone with no later re-ingest still deletes the anchor, so it has no leads"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dispatch_boundary_tests {
+    //! Issue #267: an outbound `resolution: "unresolved_dispatch"` CALLS edge
+    //! traversed by the blast-radius lane must enumerate the dispatch boundary
+    //! as a typed diagnostic — the lane's existing incompleteness channel —
+    //! rather than ending silently at the marker lead.
+    use super::*;
+    use crate::ir::SourceSpan;
+
+    fn sym(id: &str, name: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            Some(SourceSpan {
+                start_byte: 0,
+                end_byte: 10,
+                start_line: 1,
+                end_line: 2,
+                start_column: None,
+                end_column: None,
+            }),
+            Some(name.to_owned()),
+            format!("symbol {name}"),
+        )
+    }
+
+    fn dispatch_marker(id: &str, name: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Diagnostic,
+            Some("src/draw.rs".to_owned()),
+            Some(SourceSpan {
+                start_byte: 40,
+                end_byte: 60,
+                start_line: 4,
+                end_line: 4,
+                start_column: None,
+                end_column: None,
+            }),
+            Some(name.to_owned()),
+            format!("unresolved trait-dispatch target {name}"),
+        )
+    }
+
+    fn calls(source: &str, target: &str, resolution: CallResolution) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::Calls,
+            source.to_owned(),
+            target.to_owned(),
+            Some("1.0".to_owned()),
+            "calls".to_owned(),
+        )
+        .with_resolution(resolution)
+    }
+
+    fn target(anchor: &str) -> ResolvedFailureTarget {
+        let mut anchor_ids = BTreeSet::new();
+        anchor_ids.insert(anchor.to_owned());
+        ResolvedFailureTarget {
+            handle: anchor.to_owned(),
+            kind: FailureTargetKind::Symbol,
+            anchor_ids,
+            seed_failures: BTreeSet::new(),
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn traversed_dispatch_boundary_is_a_typed_diagnostic() {
+        let records = vec![
+            sym("codegraph:v5:draw", "draw"),
+            dispatch_marker(
+                "codegraph:v5:marker",
+                "unresolved_dispatch: Orphan::orphan_render",
+            ),
+            calls(
+                "codegraph:v5:draw",
+                "codegraph:v5:marker",
+                CallResolution::UnresolvedDispatch,
+            ),
+        ];
+        let repo_index = RepositoryIndex::build(&records);
+        let ctx =
+            change_impact_context(&records, &target("codegraph:v5:draw"), 1, &repo_index, None);
+        assert!(
+            ctx.direct_callees
+                .iter()
+                .any(|l| l.record.id() == "codegraph:v5:marker"),
+            "the dispatch marker still surfaces as a callee lead"
+        );
+        assert!(
+            ctx.diagnostics
+                .iter()
+                .any(|d| d.code == "unresolved_dispatch"
+                    && d.target_handle
+                        .contains("unresolved_dispatch: Orphan::orphan_render")),
+            "the traversed dispatch boundary must be enumerated as a typed diagnostic: {:?}",
+            ctx.diagnostics
         );
     }
 }

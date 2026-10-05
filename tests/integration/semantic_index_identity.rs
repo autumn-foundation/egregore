@@ -42,6 +42,8 @@ fn build_store(data_dir: &Path, dim: usize, identities: &[aletheia_egregore::Emb
                 end_byte: 10 + i,
                 start_line: i + 1,
                 end_line: i + 1,
+                start_column: None,
+                end_column: None,
             },
             format!("sym{i:02}"),
             format!("fixture symbol number {i}"),

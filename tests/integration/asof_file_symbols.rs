@@ -883,6 +883,8 @@ fn query_file_at_data_dir_collapses_reingested_snapshots() {
             end_byte: 100,
             start_line,
             end_line,
+            start_column: None,
+            end_column: None,
         }
     }
     fn spanned_symbol(

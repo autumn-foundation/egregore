@@ -9,6 +9,8 @@ fn mk_span(start_line: usize, end_line: usize) -> SourceSpan {
         end_byte: 10,
         start_line,
         end_line,
+        start_column: None,
+        end_column: None,
     }
 }
 
@@ -745,6 +747,7 @@ fn frame_resolves_to(signature_id: &str, target: &str) -> GraphRecord {
         frame_resolution: Some(crate::ir::FrameResolution::Resolved),
         frame_index: Some(0),
         basis: None,
+        call_site_spans: None,
         is_exhaustive: None,
         temporal: None,
         summary: format!("frame 0 resolves to {target}"),
@@ -880,6 +883,8 @@ fn frame_target_reingested_after_tombstone_is_cited() {
                 end_byte: 10,
                 start_line: 10,
                 end_line: 20,
+                start_column: None,
+                end_column: None,
             }),
             None,
             "summary".to_owned(),
@@ -2152,5 +2157,113 @@ fn context_drift_history_keeps_distinct_temporal_versions_as_separate_rows() {
         2,
         "each version must keep its OWN resolved target handle, not borrow the \
          other version's: {drift_rows:?}"
+    );
+}
+
+// ── Latest-write-wins liveness (issue #421) ──────────────────────────────────
+// `tombstoned_ids` fed the audit's drive sets (`file_paths`, `memory_claim_ids`)
+// and `LogProvenanceIndex` on raw tombstone membership: a record re-ingested
+// AFTER its own tombstone stayed excluded over `--graph` while `--data-dir`
+// (coalesced current state) drove it. The shared `Liveness` gate keeps a
+// tombstone active only while it is the id's most recent write.
+
+fn tomb(deleted_id: &str) -> GraphRecord {
+    GraphRecord::Tombstone {
+        id: format!("codegraph:v5:tomb_{deleted_id}"),
+        schema_version: 5,
+        deleted_id: deleted_id.to_owned(),
+        summary: "removed".to_owned(),
+        producer: None,
+    }
+}
+
+fn file_node(id: &str, path: &str) -> GraphRecord {
+    let mut rec = node(id, NodeKind::File);
+    if let GraphRecord::Node {
+        repo_relative_path, ..
+    } = &mut rec
+    {
+        *repo_relative_path = Some(path.to_owned());
+    }
+    rec
+}
+
+#[test]
+fn file_paths_includes_file_revived_after_tombstone() {
+    let records = vec![
+        file_node("codegraph:v5:revived", "src/revived.rs"),
+        tomb("codegraph:v5:revived"),
+        file_node("codegraph:v5:revived", "src/revived.rs"),
+    ];
+    assert!(
+        file_paths(&records).contains("src/revived.rs"),
+        "a file re-ingested after its tombstone must stay in the audit drive set"
+    );
+}
+
+#[test]
+fn file_paths_excludes_file_tombstoned_without_reingest() {
+    let records = vec![
+        file_node("codegraph:v5:gone", "src/gone.rs"),
+        tomb("codegraph:v5:gone"),
+    ];
+    assert!(
+        !file_paths(&records).contains("src/gone.rs"),
+        "a tombstone with no later re-ingest still deletes the file"
+    );
+}
+
+#[test]
+fn memory_claim_ids_includes_observation_revived_after_tombstone() {
+    let records = vec![
+        node("agent_memory:v1:obs1", NodeKind::Observation),
+        tomb("agent_memory:v1:obs1"),
+        node("agent_memory:v1:obs1", NodeKind::Observation),
+    ];
+    assert!(
+        memory_claim_ids(&records).contains("agent_memory:v1:obs1"),
+        "an observation re-ingested after its tombstone must stay in the audit drive set"
+    );
+}
+
+#[test]
+fn memory_claim_ids_excludes_observation_tombstoned_without_reingest() {
+    let records = vec![
+        node("agent_memory:v1:obs1", NodeKind::Observation),
+        tomb("agent_memory:v1:obs1"),
+    ];
+    assert!(
+        !memory_claim_ids(&records).contains("agent_memory:v1:obs1"),
+        "a tombstone with no later re-ingest still deletes the observation"
+    );
+}
+
+#[test]
+fn revived_captured_from_edge_is_reachable_provenance() {
+    // Mirror of `tombstoned_captured_from_edge_is_not_provenance` with the
+    // CAPTURED_FROM edge re-ingested AFTER its tombstone: latest write wins,
+    // so the edge resolves provenance again.
+    let src_id = crate::ir::log_stable_id(&["log_source", "repo", "app.log", "h"]);
+    let sig_id = crate::ir::log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+    let edge_id = captured_from(&sig_id, &src_id).id().to_owned();
+    let records = vec![
+        log_source_node(&src_id, "app.log", "abc123"),
+        error_signature_node(&sig_id),
+        captured_from(&sig_id, &src_id),
+        GraphRecord::Tombstone {
+            id: "log:v1:tomb_edge".to_owned(),
+            schema_version: crate::ir::LOG_SCHEMA_VERSION,
+            deleted_id: edge_id,
+            summary: "edge removed".to_owned(),
+            producer: None,
+        },
+        captured_from(&sig_id, &src_id),
+    ];
+    let index = LogProvenanceIndex::build(&records);
+    let result = classify_log_handle(&index, &records[1]);
+    assert_eq!(
+        result.row.status,
+        CitationStatus::Cited,
+        "a CAPTURED_FROM edge revived after its tombstone is reachable provenance again"
     );
 }

@@ -31,6 +31,8 @@ const fn span(start_line: usize, end_line: usize) -> aletheia_egregore::SourceSp
         end_byte: 100,
         start_line,
         end_line,
+        start_column: None,
+        end_column: None,
     }
 }
 
@@ -1162,4 +1164,261 @@ fn query_subsystem_tombstoned_frame_edge_excluded_from_log_signatures() {
         }),
         "tombstoned frame-edge binding must not surface in unresolved: {unresolved:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Author scoping (issue #195)
+//
+// RED: these tests drive `--agent` / `--not-agent`, which do not exist yet —
+// the CLI rejects the unknown flags until the implementation lands.
+// ---------------------------------------------------------------------------
+
+/// Builds an agent-authored `Observation` citing `target_symbol_id` through a
+/// `MENTIONS_SYMBOL` evidence link, authored by `agent_id` in `session_id`.
+fn authored_observation(
+    seed: &str,
+    agent_id: &str,
+    session_id: &str,
+    target_symbol_id: &str,
+) -> GraphRecord {
+    let obs_id = agent_memory_stable_id(&["obs", seed]);
+    let mut obs = GraphRecord::node(
+        obs_id,
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        format!("Observation {seed} by {agent_id}"),
+    );
+    if let GraphRecord::Node {
+        evidence_links: ref mut el,
+        schema_version: ref mut sv,
+        agent_id: ref mut aid,
+        agent_kind: ref mut ak,
+        session_id: ref mut sid,
+        observed_at: ref mut oa,
+        ingested_at: ref mut ia,
+        source_handle: ref mut sh,
+        ..
+    } = obs
+    {
+        *sv = AGENT_MEMORY_SCHEMA_VERSION;
+        *aid = Some(agent_id.to_owned());
+        *ak = Some("claude-code".to_owned());
+        *sid = Some(session_id.to_owned());
+        *oa = Some("2026-06-03T12:00:00Z".to_owned());
+        *ia = Some("2026-06-03T12:00:01Z".to_owned());
+        *sh = Some(format!("trajectories/{session_id}.traj"));
+        *el = Some(vec![EvidenceLink {
+            target_record_id: Some(target_symbol_id.to_owned()),
+            target_domain: "codegraph".to_owned(),
+            relation: "MENTIONS_SYMBOL".to_owned(),
+            confidence: "0.9".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+    obs
+}
+
+/// JSONL fixture with two agent-authored observations under `src/alpha/` — one
+/// by `agent_1`, one by `agent_2` — both citing the same in-prefix symbol.
+/// Returns (`TempDir`, `graph_path`). Caller must keep `TempDir` alive.
+fn fixture_subsystem_multi_agent() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("subsystem-authors.jsonl");
+
+    let alpha_file = GraphRecord::node(
+        "file:sub:authors_alpha_a".to_owned(),
+        NodeKind::File,
+        Some("src/alpha/a.rs".to_owned()),
+        None,
+        Some("src/alpha/a.rs".to_owned()),
+        "file src/alpha/a.rs".to_owned(),
+    );
+    let alpha_sym_id = "codegraph:v4:intsub_authors_alpha_sym001".to_owned();
+    let alpha_sym = GraphRecord::symbol(
+        alpha_sym_id.clone(),
+        "fn",
+        "src/alpha/a.rs".to_owned(),
+        span(1, 10),
+        "alpha_fn1".to_owned(),
+        "fn alpha_fn1 in src/alpha/a.rs".to_owned(),
+    );
+
+    let obs_a = authored_observation("authors_obs_a", "agent_1", "sess_1", &alpha_sym_id);
+    let obs_b = authored_observation("authors_obs_b", "agent_2", "sess_2", &alpha_sym_id);
+
+    let mut graph = Graph::new();
+    for r in [alpha_file, alpha_sym, obs_a, obs_b] {
+        graph.push(r);
+    }
+    let jsonl = graph.to_jsonl().expect("serialize graph");
+    fs::write(&path, jsonl).expect("write fixture");
+    (temp, path)
+}
+
+/// Runs `eg query subsystem` with extra CLI args; asserts exit 0 and parses
+/// stdout as JSON.
+fn run_subsystem_args(prefix: &str, graph: &PathBuf, extra: &[&str]) -> serde_json::Value {
+    let output = egregore()
+        .args(["query", "subsystem", prefix, "--graph"])
+        .arg(graph)
+        .args(extra)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("utf8");
+    serde_json::from_str(stdout.trim()).expect("valid JSON")
+}
+
+/// `(agent_id, session_id)` of every observation row — both are first-class
+/// answer fields (issue #195 AC1), never buried in provenance.
+fn observation_authors(answer: &serde_json::Value) -> Vec<(String, String)> {
+    answer["observations"]
+        .as_array()
+        .expect("observations array")
+        .iter()
+        .map(|o| {
+            (
+                o["agent_id"]
+                    .as_str()
+                    .expect("observation must carry first-class agent_id")
+                    .to_owned(),
+                o["session_id"]
+                    .as_str()
+                    .expect("observation must carry first-class session_id")
+                    .to_owned(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn subsystem_default_recall_is_unscoped_and_omits_author_scope() {
+    let (_temp, graph) = fixture_subsystem_multi_agent();
+    let answer = run_subsystem_args("src/alpha", &graph, &[]);
+    assert_eq!(answer["ok"], true);
+    let mut authors = observation_authors(&answer);
+    authors.sort();
+    assert_eq!(
+        authors,
+        vec![
+            ("agent_1".to_owned(), "sess_1".to_owned()),
+            ("agent_2".to_owned(), "sess_2".to_owned()),
+        ],
+        "unscoped recall must return every agent's observations"
+    );
+    assert!(
+        answer.get("author_scope").is_none(),
+        "an unscoped answer must not carry an author_scope section"
+    );
+}
+
+#[test]
+fn subsystem_agent_flag_scopes_observations_to_named_agent() {
+    let (_temp, graph) = fixture_subsystem_multi_agent();
+    let answer = run_subsystem_args("src/alpha", &graph, &["--agent", "agent_1"]);
+    assert_eq!(answer["ok"], true);
+    assert_eq!(
+        observation_authors(&answer),
+        vec![("agent_1".to_owned(), "sess_1".to_owned())],
+        "--agent agent_1 must return exactly agent_1's observations"
+    );
+    let scope = &answer["author_scope"];
+    assert_eq!(scope["agent"], "agent_1");
+    assert!(
+        scope.get("not_agent").is_none(),
+        "unset selector must be omitted, got {scope}"
+    );
+    assert_eq!(
+        scope["author_field"], "agent_id",
+        "the answer must document which field carries the author"
+    );
+    assert_eq!(scope["observations_matched"], 1);
+    assert_eq!(scope["observations_total"], 2);
+}
+
+#[test]
+fn subsystem_not_agent_flag_excludes_named_agent() {
+    let (_temp, graph) = fixture_subsystem_multi_agent();
+    let answer = run_subsystem_args("src/alpha", &graph, &["--not-agent", "agent_1"]);
+    assert_eq!(answer["ok"], true);
+    assert_eq!(
+        observation_authors(&answer),
+        vec![("agent_2".to_owned(), "sess_2".to_owned())],
+        "--not-agent agent_1 must return every other agent's observations"
+    );
+    let scope = &answer["author_scope"];
+    assert_eq!(scope["not_agent"], "agent_1");
+    assert!(scope.get("agent").is_none());
+    assert_eq!(scope["observations_matched"], 1);
+    assert_eq!(scope["observations_total"], 2);
+}
+
+#[test]
+fn subsystem_agent_and_not_agent_compose_with_veto_winning() {
+    let (_temp, graph) = fixture_subsystem_multi_agent();
+    // --agent agent_1 --not-agent agent_2 leaves only agent_1.
+    let answer = run_subsystem_args(
+        "src/alpha",
+        &graph,
+        &["--agent", "agent_1", "--not-agent", "agent_2"],
+    );
+    assert_eq!(
+        observation_authors(&answer),
+        vec![("agent_1".to_owned(), "sess_1".to_owned())]
+    );
+
+    // Both selectors naming the same agent: the veto wins — an explicit
+    // empty observation list, not an error.
+    let answer = run_subsystem_args(
+        "src/alpha",
+        &graph,
+        &["--agent", "agent_1", "--not-agent", "agent_1"],
+    );
+    assert_eq!(answer["ok"], true);
+    assert!(
+        answer["observations"].as_array().expect("array").is_empty(),
+        "conflicting selectors must yield an explicit empty observation list"
+    );
+    assert_eq!(answer["author_scope"]["observations_matched"], 0);
+}
+
+#[test]
+fn subsystem_unknown_agent_is_explicit_empty_not_error() {
+    let (_temp, graph) = fixture_subsystem_multi_agent();
+    let answer = run_subsystem_args("src/alpha", &graph, &["--agent", "nobody"]);
+    // Exit 0 and ok:true are asserted inside `run_subsystem_args`: an author
+    // selector matching nothing is a successful empty answer — not an error
+    // and not a silent fallback to unscoped recall.
+    assert_eq!(answer["ok"], true);
+    assert!(
+        answer["observations"].as_array().expect("array").is_empty(),
+        "no observation may fall back to unscoped recall"
+    );
+    let scope = &answer["author_scope"];
+    assert_eq!(scope["agent"], "nobody");
+    assert_eq!(scope["observations_matched"], 0);
+    assert_eq!(scope["observations_total"], 2);
+}
+
+#[test]
+fn subsystem_author_scoped_observations_all_carry_resolvable_authors() {
+    // Deterministic code-graph facts carry no agent_id; an author-scoped
+    // recall must never return a row without one.
+    let (_temp, graph) = fixture_subsystem_multi_agent();
+    for extra in [&["--agent", "agent_1"][..], &["--not-agent", "agent_9"][..]] {
+        let answer = run_subsystem_args("src/alpha", &graph, extra);
+        for row in answer["observations"].as_array().expect("array") {
+            assert!(
+                row["agent_id"].as_str().is_some_and(|a| !a.is_empty()),
+                "author-scoped recall must only return observations with a resolvable agent_id, got {row}"
+            );
+        }
+    }
 }

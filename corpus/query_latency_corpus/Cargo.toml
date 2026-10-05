@@ -1,0 +1,8 @@
+[package]
+name = "query-latency-fixture"
+version = "0.1.0"
+edition = "2021"
+description = "Pinned fixture crate for the egregore cold query-latency benchmark (issue #255). Snapshot of egregore's src/query/ subsystem; not built, only scanned."
+
+[lib]
+path = "lib.rs"

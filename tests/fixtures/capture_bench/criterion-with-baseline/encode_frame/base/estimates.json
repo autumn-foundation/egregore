@@ -1,0 +1,7 @@
+{
+  "mean": {
+    "confidence_interval": {"confidence_level": 0.95, "lower_bound": 990.1, "upper_bound": 1012.4},
+    "point_estimate": 1000.0,
+    "standard_error": 5.6
+  }
+}

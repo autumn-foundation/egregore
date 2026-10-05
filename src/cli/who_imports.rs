@@ -41,9 +41,10 @@ pub(crate) struct WhoImportsHeaderJson<'a> {
 pub(crate) const WHO_IMPORTS_DISCLAIMER: &str = "Rows are the files whose recorded `use` declarations name a module path with the query as a \
      segment-aware prefix (`foo::bar` matches `foo::bar::Baz`, never `foo::barbell`). Only \
      extractor-minted Import nodes are considered, so a doc-comment or string mention of the path \
-     is invisible here. Without `--crate`, a `crate::`-relative import and an absolute \
-     `<crate>::` import are distinct (the graph carries no per-file owning-crate name); pass \
-     `--crate <name>` to unify a leading `crate::` with that crate name. Rows are import-site \
+     is invisible here. A leading `crate::` auto-resolves to each importing file's owning crate \
+     (target name for auxiliary targets, manifest-stamped package name, else the workspace \
+     directory name), so `mycrate::foo` matches both `crate::foo::Bar` and `mycrate::foo::Baz` \
+     written in `mycrate`; pass `--crate <name>` to override the resolution. Rows are import-site \
      LEADS, never proof the imported item is used.";
 
 #[allow(

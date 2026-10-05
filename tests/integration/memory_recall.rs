@@ -22,6 +22,7 @@ use std::path::Path;
 use aletheia_egregore::adapters::{EmbeddedAletheiaSink, GraphSink};
 use aletheia_egregore::embeddings::{EmbeddingVectorKey, EmbeddingVectorMap};
 use aletheia_egregore::ir::{AGENT_MEMORY_SCHEMA_VERSION, VERIFICATION_SCHEMA_VERSION};
+use aletheia_egregore::query::AuthorScope;
 use aletheia_egregore::{EvidenceLink, GraphRecord, NodeKind, SourceSpan, stable_id};
 use assert_cmd::Command;
 
@@ -37,6 +38,8 @@ const fn span(start_line: usize, end_line: usize) -> SourceSpan {
         end_byte: 100,
         start_line,
         end_line,
+        start_column: None,
+        end_column: None,
     }
 }
 
@@ -270,6 +273,28 @@ fn recall(
     limit: usize,
     verified_only: bool,
 ) -> Vec<serde_json::Value> {
+    recall_with_scope(
+        data_dir,
+        query_vector,
+        limit,
+        verified_only,
+        &AuthorScope::default(),
+    )
+}
+
+/// Author-scoped variant of [`recall`] (issue #195).
+///
+/// Mirrors `query_semantic_memory`'s filter order: the author selector applies
+/// to already-recallable memory rows (post kind/provenance gate). An empty
+/// result under an active scope is the production "explicit empty result"
+/// (`ok:true` envelope), not an error and not unscoped recall.
+fn recall_with_scope(
+    data_dir: &Path,
+    query_vector: &[f32],
+    limit: usize,
+    verified_only: bool,
+    author_scope: &AuthorScope,
+) -> Vec<serde_json::Value> {
     let sink = EmbeddedAletheiaSink::open(data_dir).expect("store opens");
     let records = sink.read_all_records().expect("records read");
     let by_id: std::collections::BTreeMap<&str, &GraphRecord> =
@@ -304,6 +329,12 @@ fn recall(
         };
         let has_provenance = source_handle.is_some() || session_id.is_some();
         if !has_provenance {
+            continue;
+        }
+        // Author scoping (issue #195): an active selector keeps only rows
+        // carrying a resolvable authoring `agent_id`. Agentless records —
+        // deterministic code facts included — never satisfy an active scope.
+        if !author_scope.matches(agent_id.as_deref()) {
             continue;
         }
         let verified = evidence_links.as_ref().is_some_and(|links| {
@@ -500,4 +531,96 @@ fn semantic_search_tags_kind_for_trust_separation() {
         code_only.contains(&stable_id(&["node", "File", "src/parser.rs"]).as_str()),
         "the code file should still be retrievable by the code path"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #195: scope semantic-memory recall by authoring agent identity.
+// ---------------------------------------------------------------------------
+//
+// The CLI embeds the query with a model we cannot load offline, so these
+// tests drive `recall_with_scope` — the in-process mirror of
+// `query_semantic_memory`'s filter chain — over the same seeded store.
+
+/// `--agent agent_1` keeps only `agent_1`'s observations; every returned row
+/// still carries its first-class `agent_id` / `session_id`.
+#[test]
+fn semantic_author_include_returns_only_that_agent() {
+    let seed = seed_store();
+    let scope = AuthorScope {
+        include: Some("agent_1".to_owned()),
+        exclude: None,
+    };
+    let rows = recall_with_scope(&seed.data_dir, &[1.0, 1.0, 1.0], 10, false, &scope);
+    // agent_1 authored two recallable observations (verified + floating).
+    assert_eq!(
+        rows.len(),
+        2,
+        "agent_1 must have exactly two recallable observations"
+    );
+    for row in &rows {
+        assert_eq!(row["agent_id"], "agent_1");
+        assert_eq!(row["session_id"], "sess_1");
+    }
+}
+
+/// `--not-agent agent_1` excludes `agent_1`'s observations; `agent_2`'s
+/// unverified observation survives.
+#[test]
+fn semantic_author_exclude_removes_that_agent() {
+    let seed = seed_store();
+    let scope = AuthorScope {
+        include: None,
+        exclude: Some("agent_1".to_owned()),
+    };
+    let rows = recall_with_scope(&seed.data_dir, &[1.0, 1.0, 1.0], 10, false, &scope);
+    assert_eq!(rows.len(), 1, "only agent_2's observation should survive");
+    assert_eq!(rows[0]["agent_id"], "agent_2");
+    assert_eq!(rows[0]["session_id"], "sess_2");
+}
+
+/// An author selector matching nothing yields an empty result set — the
+/// production lane maps this to an explicit `ok:true` empty envelope, not
+/// an error and not a silent fallback to unscoped recall.
+#[test]
+fn semantic_unknown_author_is_explicit_empty_not_error() {
+    let seed = seed_store();
+    let scope = AuthorScope {
+        include: Some("nobody".to_owned()),
+        exclude: None,
+    };
+    let rows = recall_with_scope(&seed.data_dir, &[1.0, 1.0, 1.0], 10, false, &scope);
+    assert!(
+        rows.is_empty(),
+        "unknown author must match no observations, got {rows:?}"
+    );
+}
+
+/// Agentless records (the provenance-less observation, and by contract any
+/// deterministic code fact) never satisfy an active author scope.
+#[test]
+fn semantic_active_scope_rejects_agentless_records() {
+    let seed = seed_store();
+    for scope in [
+        AuthorScope {
+            include: Some("agent_1".to_owned()),
+            exclude: None,
+        },
+        AuthorScope {
+            include: None,
+            exclude: Some("agent_9".to_owned()),
+        },
+    ] {
+        let rows = recall_with_scope(&seed.data_dir, &[1.0, 0.0, 0.0], 10, false, &scope);
+        assert!(
+            rows.iter()
+                .all(|r| r["record_id"] != "agent_memory:v1:obs-noprov"),
+            "agentless record must never appear under an active author scope"
+        );
+        for row in &rows {
+            assert!(
+                row["agent_id"].as_str().is_some_and(|a| !a.is_empty()),
+                "author-scoped recall must only return rows with a resolvable agent_id, got {row}"
+            );
+        }
+    }
 }

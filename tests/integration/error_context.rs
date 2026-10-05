@@ -51,6 +51,8 @@ const fn span(start: usize, end: usize) -> SourceSpan {
         end_byte: 0,
         start_line: start,
         end_line: end,
+        start_column: None,
+        end_column: None,
     }
 }
 
@@ -190,6 +192,7 @@ fn frame_resolves(sig: &str, target: &str, index: u32, resolution: FrameResoluti
         frame_resolution: Some(resolution),
         frame_index: Some(index),
         basis: None,
+        call_site_spans: None,
         is_exhaustive: None,
         temporal: None,
         summary: format!("frame {index} of {sig} resolves to {target}"),
@@ -319,6 +322,7 @@ fn emitted_during(sig: &str, run: &str, basis: CorrelationBasis) -> GraphRecord 
         frame_resolution: None,
         frame_index: None,
         basis: Some(basis),
+        call_site_spans: None,
         is_exhaustive: None,
         temporal: None,
         summary: format!("{sig} emitted during {run}"),
@@ -342,6 +346,7 @@ fn log_edge(label: EdgeLabel, source: &str, target: &str, summary: &str) -> Grap
         frame_resolution: None,
         frame_index: None,
         basis: None,
+        call_site_spans: None,
         is_exhaustive: None,
         temporal: None,
         summary: summary.to_owned(),

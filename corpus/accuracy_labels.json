@@ -128,11 +128,12 @@
       "span": { "start_byte": 565, "end_byte": 595, "start_line": 36, "end_line": 36 }
     },
     {
-      "id": "diag-macro",
-      "kind": "Diagnostic",
+      "id": "sym-macro",
+      "kind": "Symbol",
       "repo_relative_path": "src/lib.rs",
-      "name": "my_macro!",
-      "span": { "start_byte": 675, "end_byte": 700, "start_line": 43, "end_line": 43 }
+      "name": "my_macro",
+      "symbol_kind": "macro",
+      "span": { "start_byte": 597, "end_byte": 674, "start_line": 38, "end_line": 42 }
     },
     {
       "id": "sym-decoy-str",
@@ -172,6 +173,8 @@
     { "label": "IMPORTS", "source": "file-lib", "target": "import-hashmap" },
     { "label": "DEFINES", "source": "file-lib", "target": "sym-decoy-str" },
     { "label": "DEFINES", "source": "file-lib", "target": "sym-decoy-host" },
-    { "label": "CALLS", "source": "sym-impl-mytrait-method", "target": "sym-free-func" }
+    { "label": "DEFINES", "source": "file-lib", "target": "sym-macro" },
+    { "label": "CALLS", "source": "sym-impl-mytrait-method", "target": "sym-free-func" },
+    { "label": "CALLS", "source": "file-lib", "target": "sym-macro" }
   ]
 }

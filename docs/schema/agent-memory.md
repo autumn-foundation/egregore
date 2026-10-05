@@ -112,8 +112,10 @@ compile time.
 | `ToolCall` | `agent_memory` | see `docs/schema/agent-actions.md` | `ToolCall {tool_name} status={status}` | Full field set belongs to [`docs/schema/agent-actions.md`](agent-actions.md). |
 | `FileEdit` | `agent_memory` | see `docs/schema/agent-actions.md` | `FileEdit {repo_relative_path} kind={edit_kind}` | Full field set belongs to [`docs/schema/agent-actions.md`](agent-actions.md). |
 | `Failure` | `agent_memory` | `["node", "failure", kind, turn_id, action_idx]` | `Failure {kind} turn={t}` | Failed command or invalid patch; `failure_kind` = `command_failure` or `patch_invalid`. |
+| `Failure` (live-authored) | `agent_memory` | `["node", "failure", "live", kind, agent_id, agent_kind, session_id, observed_at, source_handle, exit_code, text_hash, links_hash]` | `Failure {kind} by {agent} in {session}: {excerpt}` | Live-authored via `eg write failure` (any reserved `failure_kind`); citable through `FAILED_ON` / `REFERENCES_TASK` evidence links; idempotent on identical inputs. |
 | `Observation` | `agent_memory` | writer-chosen | free | Agent-authored claim with confidence and provenance. Carries `evidence_links`. |
 | `Retraction` | `agent_memory` | `["node", "retraction", target_record_id]` | `Retraction event for {target_record_id}` | Auditable operator retraction event written by `eg forget` (issue #231). One per target: the ID is deterministic in the retracted handle. |
+| `CostUsage` | `agent_memory` | `["node", "cost_usage", run_id]` | `CostUsage actual={actual} total={total} baseline={baseline} tokens={p}/{c}/{o} duration={d}s model={model}` | Per-run cost/token/duration accounting from a trajectory `info` block (issue #132). Transcript-derived, never a code fact. |
 
 #### `Agent` record shape
 
@@ -203,6 +205,53 @@ set:
 
 The record shape itself is unchanged.
 
+#### `RetirementReceipt` record shape
+
+The auditable event `eg retire` writes when an operator retires an
+observation-class agent-memory record from recall without erasing its history
+(issue #156). Retirement is purely additive: the target record and its
+provenance are never mutated. See [`docs/cli/retire.md`](../cli/retire.md).
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `id` | `agent_memory:v1:{hash}` | yes | Stable per (target, transaction time, reason, actor, superseder, evidence handle): `["node", "retirement-receipt", target_id, transaction_time, reason, retired_by, superseded_by, evidence_handle]`. |
+| `kind` | `"RetirementReceipt"` | yes | |
+| `schema_version` | `1` | yes | |
+| `text` | string | yes | Typed reason code: `superseded`, `drifted`, `contradicted`, or `operator-decision`. |
+| `summary` | string | yes | `Retirement receipt for {target_record_id}` |
+| `agent_id` | string | yes | Operator handle recorded as the retiring actor. |
+| `transaction_time` | RFC 3339 | yes | When the retirement was committed (the transaction-time axis `--as-of` pins). |
+| `source_handle` | record ID | yes | The retired record's stable ID. |
+| `valid_time` | RFC 3339 | yes | Mirrors `transaction_time`. |
+| `valid_time_source` | `"inferred_from_transaction_time"` | yes | |
+| `evidence_links` | list | when reason carries evidence | `superseded`: `SUPERSEDES` + `SUPERSEDED_BY` links to the superseder. `drifted`: `DRIFTED_EVIDENCE` link to the cited, now-unresolved handle. `contradicted` / `operator-decision`: `CONTRADICTED_BY` / `CITED_EVIDENCE` link when `--evidence-handle` was supplied. |
+
+Only observation-class records (`Observation`, `Decision`, `Failure`) are
+retireable; deterministic code-graph facts are refused. `superseded` also
+writes a normal `SUPERSEDES` evidence edge from the target to the superseder
+(§6a), so existing supersession views stay consistent; recall exclusion is
+controlled by the receipt.
+
+#### `ReinstatementReceipt` record shape
+
+The auditable event `eg reinstate` writes when an operator returns a retired
+record to active recall (issue #156). The retirement receipt stays in history;
+the newest receipt on the transaction-time axis controls the state. See
+[`docs/cli/retire.md`](../cli/retire.md).
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `id` | `agent_memory:v1:{hash}` | yes | Stable per (target, transaction time, reason, actor): `["node", "reinstatement-receipt", target_id, transaction_time, reason, reinstated_by]`. |
+| `kind` | `"ReinstatementReceipt"` | yes | |
+| `schema_version` | `1` | yes | |
+| `text` | string | yes | Free-text reinstatement reason. |
+| `summary` | string | yes | `Reinstatement receipt for {target_record_id}` |
+| `agent_id` | string | yes | Operator handle recorded as the reinstating actor. |
+| `transaction_time` | RFC 3339 | yes | When the reinstatement was committed. |
+| `source_handle` | record ID | yes | The reinstated record's stable ID. |
+| `valid_time` | RFC 3339 | yes | Mirrors `transaction_time`. |
+| `valid_time_source` | `"inferred_from_transaction_time"` | yes | |
+
 #### `AgentRun` record shape
 
 | Field | Type | Required | Notes |
@@ -252,7 +301,7 @@ A failed command, invalid patch, rejected assumption, or blocked workflow.
 | `failure_kind` | string | yes | `command_failure`, `patch_invalid`, `assumption_rejected`, `workflow_blocked`. |
 | `exit_code` | i64 | optional | Exit code when `failure_kind` is `command_failure` or `patch_invalid`. |
 | `text` | string | yes | Redacted output excerpt. |
-| traj-importer provenance | see above | yes | |
+| traj-importer provenance | see above | yes | Traj-imported failures carry traj provenance; live-authored failures carry the `eg write` provenance contract instead (`agent_id`, `agent_kind`, `session_id`, `observed_at`, `source_handle`). |
 
 #### `Decision` record shape
 
@@ -270,6 +319,68 @@ A durable project or implementation decision inferred from explicit context.
 | provenance fields | see §3 | yes | |
 | `evidence_links` | `EvidenceLink[]` | required | |
 
+#### `CostUsage` record shape
+
+Per-run cost, token, and duration accounting captured from an imported
+trajectory's `info` block (issue #132). The `.traj` importer emits exactly
+one `CostUsage` record per `AgentRun` whenever the source `info` block
+carries any cost, token, or duration field; a trajectory with none of those
+fields produces no record (no empty/placeholder records).
+
+The record is transcript-derived: its values are read verbatim from the
+trajectory, never recomputed, and never presented as deterministic code
+facts. It carries trust class `other` (see `docs/cli/query.md`) and the
+derivation label `transcript_derived`.
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `id` | `agent_memory:v1:{hash}` | yes | ID inputs: `["node", "cost_usage", run_id]`. |
+| `kind` | `"CostUsage"` | yes | |
+| `schema_version` | `1` | yes | |
+| `summary` | string | yes | `CostUsage actual={a} total={t} baseline={b} tokens={p}/{c}/{o} duration={d}s model={m}`; absent values render as `unknown`. |
+| `domain` | `"agent_memory"` | yes | |
+| `importer_id` | string | yes | `"traj-importer"` |
+| `importer_version` | string | yes | semver string |
+| `source_artifact_path` | string | yes | Path to the `.traj` file. |
+| `source_artifact_hash` | string | yes | BLAKE3 hex of the raw `.traj` bytes. |
+| `source_handle` | string | yes | `{source_artifact_path}:{source_artifact_hash}`. |
+| `session_id` | `agent_memory:v1:{hash}` | yes | Owning `AgentSession` (denormalized). |
+| `observed_at` | RFC 3339 | optional | `info.started_at` from the trajectory. |
+| `agent_kind` | `"rust-swe-agent"` | yes | |
+| `text` | JSON object | yes | Canonical cost payload (see below). |
+| `redaction_policy_version` | string | optional | Stamped when any free-text field passed through redaction. |
+
+The `text` payload is a canonical JSON object with fixed key order:
+
+| Key | Type | Required | Notes |
+|-----|------|----------|-------|
+| `derivation` | `"transcript_derived"` | yes | Derivation label. |
+| `model_name` | string \| null | yes | `info.model_name`, redacted. |
+| `actual_cost_usd` | number \| null | yes | `info.actual_cost_usd`, verbatim. |
+| `total_cost_usd` | number \| null | yes | `info.total_cost_usd`, verbatim. |
+| `baseline_cost_usd` | number \| null | yes | `info.baseline_cost_usd`, verbatim. |
+| `baseline_cost_model` | string \| null | yes | `info.baseline_cost_model`, redacted. |
+| `prompt_tokens` | u64 \| null | yes | `info.token_usage.prompt_tokens`, verbatim. |
+| `cache_read_tokens` | u64 \| null | yes | `info.token_usage.cache_read_tokens`, verbatim. |
+| `completion_tokens` | u64 \| null | yes | `info.token_usage.completion_tokens`, verbatim. |
+| `duration_secs` | number \| null | yes | `info.duration_secs`, verbatim. |
+| `task_handle` | string \| null | yes | BLAKE3 hex of the raw `info.task` text; `null` when the source carries no task. The raw text is never inlined into the graph. |
+| `verification_outcome` | string \| null | yes | `info.verification_status`, verbatim (e.g. `"verified"`). |
+
+`null` is the explicit unknown marker: a field absent from the source is
+`null`, never fabricated, defaulted to zero, or inferred. A present zero
+(e.g. `cache_read_tokens: 0`) is real data and stays `0`. Emission is
+presence-gated, not value-gated: any one present field triggers the record.
+
+Graph linkage: `CostUsage -[AuthoredBy]-> AgentRun`, and the run reaches the
+session via its existing `SessionOf` edge (and the touched code via the
+run's `TouchedFile` / `MentionsSymbol` edges).
+
+> **Note:** the Codex and Claude-Code importers (issue #21) emit `CostUsage`
+> nodes with a different, per-turn `text` shape. Those legacy payloads do
+> not parse as the canonical object above and are excluded from the
+> `eg query cost` rollup with a diagnostic rather than being misread.
+
 ### 4b — Agent-memory nodes (reserved, one-line definitions)
 
 These `NodeKind` variants are reserved so future producers cannot invent
@@ -282,7 +393,6 @@ producer.
 | `Artifact` | File, patch, report, or generated output linked to work. |
 | `Verification` | Evidence for a claim, test, or check (emitted by traj importer for test commands). |
 | `CommandEvidence` | Command output or terminal evidence. |
-| `CostUsage` | Token, wall-clock, budget, or provider-cost metadata. |
 
 Adding a new reserved kind requires updating this table and the compile-time
 conformance test in `tests/daemon.rs`.
@@ -353,13 +463,14 @@ removing a label is a schema version bump.
 | `PRODUCED_PATCH` | `agent_memory` | `artifact` | `FileEdit`, `AgentTurn` | `PatchArtifact` | many:1; FileEdit at most one | no |
 | `PRODUCED_EVIDENCE` | `agent_memory` | `verification` | `ToolCall` | `CommandRun`, `TestRun` | many:1 | no |
 | `VALIDATED_BY` | `agent_memory` | `verification` | `Observation`, `Decision` | any verification | many:many | no |
-| `FAILED_ON` | `agent_memory`, `verification` | `codegraph` | `Failure`, `TestRun`, `CIStatus` | `Symbol`, `File` | many:many | no |
+| `FAILED_ON` | `agent_memory`, `verification` | `codegraph`, `artifact` | `Failure`, `TestRun`, `CIStatus` | `Symbol`, `File`, `Artifact` | many:many | no |
 | `EXPLAINS_CHANGE` | `agent_memory` | `codegraph` | `Observation`, `Decision` | `Commit`, `Change` | many:many | yes |
 | `REFERENCES_TASK` | `agent_memory` | `project` | `Observation`, `Decision`, `Failure`, `Lesson` | `Task` | many:many | no |
 | `REFERENCES_TASK` | `log` | `project` | `ErrorSignature` | `Task`, `GitHubIssue`, `LocalTask` | many:many | no |
 | `EMITTED_DURING` | `log` | `agent_memory`, `verification` | `ErrorSignature` | `AgentRun`, `AgentTurn`, `CommandRun` | many:many | yes |
 | `CLOSES_ACCEPTANCE_CRITERION` | `project` | `verification` | `AcceptanceCriterion` | `Verification`, `CommandRun`, `TestRun` | many:1 | no |
 | `OWNED_BY_TASK` | `project` | `project` | `AcceptanceCriterion` | `Task` | many:1 | no |
+| `DEPENDS_ON` | `project` | `project` | `Task` | `Task` | many:many | no |
 | `EXTERNAL_HANDLE` | `project` | `project` | `Task`, `AcceptanceCriterion` | `ExternalLink` | many:1 | no |
 | `TOUCHES_FILE` | `project` | `codegraph` | `Task` | `File` | many:many | no |
 | `DRIFTS_FROM` | `semantic` | `codegraph` | `SemanticDrift` | `File`, `Symbol` | many:1 | no |
@@ -418,6 +529,7 @@ Both functions null-terminate each input part before hashing, so
 | `FileEdit` | defined in [`docs/schema/agent-actions.md`](agent-actions.md) |
 | `Failure` (command) | `["node", "failure", "command_failure", turn_id, action_idx]` |
 | `Failure` (patch) | `["node", "failure", "patch_invalid", turn_id, action_idx]` |
+| `Failure` (live-authored) | `["node", "failure", "live", kind, agent_id, agent_kind, session_id, observed_at, source_handle, exit_code, text_hash, links_hash]` |
 
 ---
 

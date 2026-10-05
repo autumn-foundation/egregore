@@ -71,6 +71,23 @@ pub(crate) fn export_embedded_store(data_dir: &Path, out: &Path) -> Result<()> {
     // That is a wrong-store diagnostic naming the path, never a valid empty
     // export (mirrors `eg inspect --data-dir`, issue #125). Guard before writing.
     if report.records.is_empty() && report.unknown_schema_versions.is_empty() {
+        // Issue #54: for an encrypted store, zero readable records after a
+        // successful open means the key did not decrypt the data (wrong key,
+        // or the key file changed since creation). Refuse with the
+        // machine-readable key-error code rather than the generic
+        // wrong-store diagnostic.
+        #[cfg(feature = "embedded-aletheiadb")]
+        if let Ok(resolved) = crate::encrypted_store::resolve_encryption_config(data_dir)
+            && let (crate::encrypted_store::StorageMode::Encrypted, Some(descriptor)) =
+                (resolved.mode, resolved.key_source)
+        {
+            let err = crate::encrypted_store::classify_encrypted_open_error(
+                data_dir,
+                &descriptor,
+                "decryption produced no readable records",
+            );
+            anyhow::bail!("{err}");
+        }
         anyhow::bail!(
             "error: embedded store at {} contains no Egregore records - \
              run `eg ingest --adapter embedded --data-dir <path>` first",

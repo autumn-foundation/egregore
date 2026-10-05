@@ -237,19 +237,70 @@ pub fn validate_record_version(record: &GraphRecord) -> Result<(), UnknownSchema
 }
 
 /// Returns true when this binary knows how to read the tuple.
+///
+/// The accepted sets live in [`ACCEPTED_RECORD_VERSION_RANGES`]; this gate and
+/// [`accepted_record_tuples`] (the daemon capability manifest, issue #166)
+/// both derive from that table, so the manifest cannot drift from the gate.
 #[must_use]
 pub fn is_known_record_version(version: &RecordVersion) -> bool {
-    match version.domain.as_str() {
-        "codegraph" => (1..=SCHEMA_VERSION).contains(&version.version),
-        "agent_memory" => version.version == AGENT_MEMORY_SCHEMA_VERSION,
-        "verification" => version.version == VERIFICATION_SCHEMA_VERSION,
-        "artifact" => version.version == ARTIFACT_SCHEMA_VERSION,
-        "project" => version.version == PROJECT_SCHEMA_VERSION,
-        "semantic" => version.version == SEMANTIC_SCHEMA_VERSION,
-        "user_context" => version.version == USER_CONTEXT_SCHEMA_VERSION,
-        "log" => (2..=LOG_SCHEMA_VERSION).contains(&version.version),
-        _ => false,
+    ACCEPTED_RECORD_VERSION_RANGES
+        .iter()
+        .any(|(domain, min_version, max_version)| {
+            *domain == version.domain.as_str()
+                && *min_version <= version.version
+                && version.version <= *max_version
+        })
+}
+
+/// The record `(domain, schema_version)` acceptance ranges for this binary,
+/// as `(domain, min_version, max_version)` triples.
+///
+/// Single source of truth for [`is_known_record_version`] and
+/// [`accepted_record_tuples`]. `kind` is deliberately absent: the gate never
+/// checks the record kind, so enumerating kinds would over-constrain the
+/// manifest (see the `"*"` wildcard on [`accepted_record_tuples`]).
+const ACCEPTED_RECORD_VERSION_RANGES: &[(&str, u32, u32)] = &[
+    ("codegraph", 1, SCHEMA_VERSION),
+    (
+        "agent_memory",
+        AGENT_MEMORY_SCHEMA_VERSION,
+        AGENT_MEMORY_SCHEMA_VERSION,
+    ),
+    (
+        "verification",
+        VERIFICATION_SCHEMA_VERSION,
+        VERIFICATION_SCHEMA_VERSION,
+    ),
+    ("artifact", ARTIFACT_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION),
+    ("project", PROJECT_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION),
+    ("semantic", SEMANTIC_SCHEMA_VERSION, SEMANTIC_SCHEMA_VERSION),
+    (
+        "user_context",
+        USER_CONTEXT_SCHEMA_VERSION,
+        USER_CONTEXT_SCHEMA_VERSION,
+    ),
+    ("log", 2, LOG_SCHEMA_VERSION),
+];
+
+/// Every `(domain, kind, schema_version)` tuple this binary accepts on
+/// ingest/read, sorted by `(domain, schema_version)` (issue #166).
+///
+/// `kind` is always the `*` wildcard: the acceptance gate
+/// ([`is_known_record_version`]) checks `domain` + `schema_version` only,
+/// never the record kind, so the wildcard is the honest contract — any kind
+/// under an accepted domain+version is accepted. Clients match their tuple
+/// against the list by `domain` + `schema_version`, treating `*` as any-kind.
+/// Documented in `docs/schema/daemon-query.md`.
+#[must_use]
+pub fn accepted_record_tuples() -> Vec<RecordVersion> {
+    let mut tuples = Vec::new();
+    for (domain, min_version, max_version) in ACCEPTED_RECORD_VERSION_RANGES {
+        for version in *min_version..=*max_version {
+            tuples.push(RecordVersion::new((*domain).to_owned(), "*", version));
+        }
     }
+    tuples.sort_by(|a, b| (a.domain.as_str(), a.version).cmp(&(b.domain.as_str(), b.version)));
+    tuples
 }
 
 fn record_version_from_value(value: &Value) -> Result<RecordVersion, RecordReadError> {
@@ -397,6 +448,7 @@ pub(crate) fn domain_for_edge_label(label: &str) -> &'static str {
             | EdgeLabel::FrameResolvesTo
             | EdgeLabel::EmittedDuring,
         ) => Domain::Log.as_str(),
+        Some(EdgeLabel::MergedAs | EdgeLabel::ReferencesTask) => Domain::Project.as_str(),
         Some(label) if label.is_codegraph_topology_label() => Domain::CodeGraph.as_str(),
         Some(_) | None => Domain::AgentMemory.as_str(),
     }

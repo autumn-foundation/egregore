@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::cli::OutputFormat;
 use crate::ir::{GraphRecord, SourceSpan};
 
-/// Target source byte and line span for expected labels.
+/// Target source byte, line, and column span for expected labels.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SpanSpec {
     /// Start byte of the span, inclusive.
@@ -18,6 +18,16 @@ pub struct SpanSpec {
     pub start_line: usize,
     /// One-based end line.
     pub end_line: usize,
+    /// Zero-based start column (UTF-8 byte offset from line start), if labeled.
+    ///
+    /// Optional so pre-#463 corpus labels without column keys still parse;
+    /// matching stays line-based (see `span_matches`) — columns are carried
+    /// for reporting only.
+    #[serde(default)]
+    pub start_column: Option<usize>,
+    /// Zero-based end column, exclusive, if labeled.
+    #[serde(default)]
+    pub end_column: Option<usize>,
 }
 
 /// An expected node in the labeled corpus.
@@ -357,6 +367,8 @@ pub(crate) fn eval_accuracy_cmd(
                             end_byte: s.end_byte,
                             start_line: s.start_line,
                             end_line: s.end_line,
+                            start_column: s.start_column,
+                            end_column: s.end_column,
                         }),
                     });
                 }

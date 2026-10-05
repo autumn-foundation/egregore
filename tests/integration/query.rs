@@ -111,6 +111,8 @@ const fn span(start_line: usize, end_line: usize) -> aletheia_egregore::SourceSp
         end_byte: 10,
         start_line,
         end_line,
+        start_column: None,
+        end_column: None,
     }
 }
 
@@ -127,6 +129,8 @@ fn ctx_symbol(id: &str, name: &str, path: &str, line: usize) -> GraphRecord {
             end_byte: 50,
             start_line: line,
             end_line: line + 5,
+            start_column: None,
+            end_column: None,
         },
         name.to_owned(),
         format!("Rust fn {name} at {path}:{line}"),
@@ -487,6 +491,7 @@ fn symbol_context_edge_linked_node_backing_evidence_is_classified() {
         frame_resolution: None,
         frame_index: None,
         basis: None,
+        call_site_spans: None,
         is_exhaustive: None,
         temporal: None,
         summary: "obs mentions edge_backed_fn".to_owned(),
@@ -2253,14 +2258,15 @@ fn symbol_context_path_fallback_excludes_tombstoned_file() {
 
 #[test]
 fn symbol_context_partial_defines_per_symbol_path_fallback() {
-    // Two symbols named "partial_defines_fn": sym_with_defines at "src/a.rs" (has DEFINES),
-    // sym_no_defines at "src/b.rs" (no DEFINES edge, but a live file exists at that path).
-    // Both files must appear in source_facts.
+    // Issue #192: two distinct identities sharing one name are ambiguous, so
+    // the DEFINES-vs-path-fallback logic is exercised with distinct names —
+    // one symbol with a DEFINES edge, one without (exercising the path
+    // fallback). Both files must appear in their respective source_facts.
     let sym_with_defines_id = "codegraph:v4:partial_defines_sym_a";
-    let sym_with_defines = ctx_symbol(sym_with_defines_id, "partial_defines_fn", "src/a.rs", 1);
+    let sym_with_defines = ctx_symbol(sym_with_defines_id, "partial_defines_fn_a", "src/a.rs", 1);
 
     let sym_no_defines_id = "codegraph:v4:partial_defines_sym_b";
-    let sym_no_defines = ctx_symbol(sym_no_defines_id, "partial_defines_fn", "src/b.rs", 10);
+    let sym_no_defines = ctx_symbol(sym_no_defines_id, "partial_defines_fn_b", "src/b.rs", 10);
 
     let file_defines_id = aletheia_egregore::ir::stable_id(&["file", "partial_defines_a"]);
     let file_defines = GraphRecord::node(
@@ -2298,16 +2304,27 @@ fn symbol_context_partial_defines_per_symbol_path_fallback() {
         file_fallback,
         defines_edge,
     ];
-    let ctx = symbol_context(&records, "partial_defines_fn");
-
+    let ctx_a = symbol_context(&records, "partial_defines_fn_a");
     assert!(
-        ctx.source_facts
+        !ctx_a.is_ambiguous() && !ctx_a.is_no_match(),
+        "single identity must resolve"
+    );
+    assert!(
+        ctx_a
+            .source_facts
             .iter()
             .any(|r| r.id() == file_defines_id.as_str()),
         "file resolved via DEFINES must be in source_facts"
     );
+
+    let ctx_b = symbol_context(&records, "partial_defines_fn_b");
     assert!(
-        ctx.source_facts
+        !ctx_b.is_ambiguous() && !ctx_b.is_no_match(),
+        "single identity must resolve"
+    );
+    assert!(
+        ctx_b
+            .source_facts
             .iter()
             .any(|r| r.id() == file_fallback_id.as_str()),
         "file for sym_no_defines must be in source_facts via path fallback"
@@ -4057,6 +4074,8 @@ fn sub_symbol(id: &str, name: &str, path: &str) -> GraphRecord {
             end_byte: 50,
             start_line: 1,
             end_line: 5,
+            start_column: None,
+            end_column: None,
         },
         name.to_owned(),
         format!("fn {name} in {path}"),
@@ -4969,6 +4988,8 @@ fn test_orientation_map_happy_path() {
             end_byte: 10,
             start_line: 1,
             end_line: 2,
+            start_column: None,
+            end_column: None,
         },
         "lib_fn".to_owned(),
         "fn lib_fn".to_owned(),
@@ -4982,6 +5003,8 @@ fn test_orientation_map_happy_path() {
             end_byte: 10,
             start_line: 1,
             end_line: 2,
+            start_column: None,
+            end_column: None,
         },
         "bin_fn".to_owned(),
         "fn bin_fn".to_owned(),
@@ -4995,6 +5018,8 @@ fn test_orientation_map_happy_path() {
             end_byte: 10,
             start_line: 5,
             end_line: 6,
+            start_column: None,
+            end_column: None,
         },
         "helper_fn".to_owned(),
         "fn helper_fn".to_owned(),
@@ -6051,4 +6076,263 @@ fn test_symbol_lifeline_non_linear_branching() {
 
     assert_eq!(events[2].event_type, LifelineEventKind::Reintroduced);
     assert_eq!(events[2].commit, "c4");
+}
+
+// ── Issue #192: disambiguate symbol-name recall instead of merging ────────────
+
+/// Two distinct symbols sharing the name `new`, each with its own observation.
+fn ambiguous_new_fixture() -> Vec<GraphRecord> {
+    let foo_id = "codegraph:v4:foo0000new";
+    let bar_id = "codegraph:v4:bar0000new";
+    vec![
+        ctx_symbol(foo_id, "new", "src/foo.rs", 10),
+        ctx_symbol(bar_id, "new", "src/bar.rs", 30),
+        ctx_observation(
+            "obs_foo",
+            "Foo::new is fallible",
+            foo_id,
+            "MENTIONS_SYMBOL",
+            "0.9",
+        ),
+        ctx_observation(
+            "obs_bar",
+            "Bar::new is infallible",
+            bar_id,
+            "MENTIONS_SYMBOL",
+            "0.9",
+        ),
+    ]
+}
+
+#[test]
+fn symbol_context_ambiguous_name_reports_candidates_instead_of_merging() {
+    let records = ambiguous_new_fixture();
+    let ctx = symbol_context(&records, "new");
+
+    assert!(
+        ctx.is_ambiguous(),
+        "two distinct `new` identities must be reported as ambiguous"
+    );
+    assert!(
+        !ctx.is_no_match(),
+        "an ambiguous name is a match, not a no_match"
+    );
+    // AC1: no section may carry merged records from distinct identities.
+    assert!(ctx.source_facts.is_empty(), "source_facts must not merge");
+    assert!(
+        ctx.topology_edges.is_empty(),
+        "topology_edges must not merge"
+    );
+    assert!(ctx.observations.is_empty(), "observations must not merge");
+    assert!(ctx.project_state.is_empty(), "project_state must not merge");
+    assert!(ctx.artifacts.is_empty(), "artifacts must not merge");
+    assert!(
+        ctx.verification_evidence.is_empty(),
+        "verification_evidence must not merge"
+    );
+    assert!(ctx.drift_history.is_empty(), "drift_history must not merge");
+
+    // AC2: one entry per distinct identity, with stable record_id and handle.
+    assert_eq!(
+        ctx.candidates.len(),
+        2,
+        "exactly one candidate per identity"
+    );
+    let handles: Vec<String> = ctx
+        .candidates
+        .iter()
+        .map(aletheia_egregore::query::SymbolCandidate::file_span_handle)
+        .collect();
+    assert_eq!(
+        handles,
+        vec!["src/bar.rs:30-35".to_owned(), "src/foo.rs:10-15".to_owned()],
+        "candidates must be deterministically ordered with repo-relative file:span handles"
+    );
+    let ids: Vec<&str> = ctx.candidates.iter().map(|c| c.record_id).collect();
+    assert!(ids.contains(&"codegraph:v4:foo0000new"));
+    assert!(ids.contains(&"codegraph:v4:bar0000new"));
+}
+
+#[test]
+fn symbol_context_three_way_ambiguity_yields_three_candidates_zero_blend() {
+    let mut records = ambiguous_new_fixture();
+    let baz_id = "codegraph:v4:baz0000new";
+    records.push(ctx_symbol(baz_id, "new", "src/baz.rs", 50));
+    records.push(ctx_observation(
+        "obs_baz",
+        "Baz::new is deprecated",
+        baz_id,
+        "MENTIONS_SYMBOL",
+        "0.7",
+    ));
+
+    let ctx = symbol_context(&records, "new");
+    assert!(ctx.is_ambiguous());
+    assert_eq!(ctx.candidates.len(), 3);
+    assert!(
+        ctx.observations.is_empty() && ctx.source_facts.is_empty(),
+        "0% of fixture runs may blend facts across identities"
+    );
+}
+
+#[test]
+fn symbol_context_disambiguate_by_record_id_is_identity_pure() {
+    use aletheia_egregore::query::record_context;
+    let records = ambiguous_new_fixture();
+
+    let ctx = record_context(&records, "codegraph:v4:foo0000new");
+    assert!(!ctx.is_ambiguous());
+    assert!(!ctx.is_no_match());
+
+    let fact_ids: std::collections::BTreeSet<&str> =
+        ctx.source_facts.iter().map(|r| r.id()).collect();
+    assert!(
+        fact_ids.contains("codegraph:v4:foo0000new"),
+        "the selected symbol must be in source_facts"
+    );
+    assert!(
+        !fact_ids.contains("codegraph:v4:bar0000new"),
+        "the sibling symbol must not appear in source_facts"
+    );
+
+    // 100% identity purity: no sibling-symbol records in any section.
+    let all_ids: std::collections::BTreeSet<&str> = ctx
+        .source_facts
+        .iter()
+        .chain(&ctx.topology_edges)
+        .chain(&ctx.observations)
+        .chain(&ctx.project_state)
+        .chain(&ctx.artifacts)
+        .chain(&ctx.verification_evidence)
+        .chain(&ctx.drift_history)
+        .map(|r| r.id())
+        .collect();
+    assert!(
+        !all_ids.contains("codegraph:v4:bar0000new"),
+        "sibling symbol must not appear in any section"
+    );
+    let obs_texts: Vec<&str> = ctx
+        .observations
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Node { text: Some(t), .. } => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        obs_texts.iter().any(|t| t.contains("Foo::new is fallible")),
+        "the selected symbol's own observation must be present"
+    );
+    assert!(
+        !obs_texts
+            .iter()
+            .any(|t| t.contains("Bar::new is infallible")),
+        "the sibling's observation must not leak in"
+    );
+}
+
+#[test]
+fn symbol_context_disambiguate_by_file_span_handle_is_identity_pure() {
+    use aletheia_egregore::query::{record_context, resolve_symbol_file_span_handle};
+    let records = ambiguous_new_fixture();
+
+    let resolved = resolve_symbol_file_span_handle(&records, "src/foo.rs:10-15")
+        .expect("the candidate handle must resolve");
+    assert_eq!(resolved.id(), "codegraph:v4:foo0000new");
+
+    let ctx = record_context(&records, resolved.id());
+    let all_ids: std::collections::BTreeSet<&str> = ctx
+        .source_facts
+        .iter()
+        .chain(&ctx.observations)
+        .chain(&ctx.project_state)
+        .chain(&ctx.artifacts)
+        .chain(&ctx.verification_evidence)
+        .map(|r| r.id())
+        .collect();
+    assert!(
+        !all_ids.contains("codegraph:v4:bar0000new"),
+        "handle re-query must be identity-pure"
+    );
+
+    // Malformed and unknown handles never resolve, and ambiguity in the
+    // handle itself fails closed.
+    assert!(resolve_symbol_file_span_handle(&records, "not-a-handle").is_none());
+    assert!(resolve_symbol_file_span_handle(&records, "src/foo.rs:99-104").is_none());
+    assert!(resolve_symbol_file_span_handle(&records, "src/foo.rs").is_none());
+}
+
+#[test]
+fn symbol_context_single_match_shape_is_unchanged() {
+    // AC4 regression lock: one identity keeps today's exact output shape.
+    let (records, _) = seeded_context_fixture();
+    let ctx = symbol_context(&records, "compute_answer");
+
+    assert!(!ctx.is_ambiguous());
+    assert!(!ctx.is_no_match());
+    assert!(ctx.candidates.is_empty());
+    assert_eq!(ctx.symbol_name, "compute_answer");
+    assert!(
+        ctx.source_facts
+            .iter()
+            .any(|r| r.id() == "codegraph:v4:aaaa0000symbol"),
+        "single-match source_facts must still contain the symbol"
+    );
+    assert_eq!(ctx.observations.len(), 1);
+    assert_eq!(ctx.project_state.len(), 1);
+    assert_eq!(ctx.verification_evidence.len(), 1);
+}
+
+#[test]
+fn symbol_context_tombstoned_duplicate_does_not_create_ambiguity() {
+    // AC6: a tombstoned current-state symbol is not merged by the recall, so
+    // it must not count toward ambiguity either.
+    let live_id = "codegraph:v4:live0000new";
+    let dead_id = "codegraph:v4:dead0000new";
+    let live = ctx_symbol(live_id, "new", "src/live.rs", 10);
+    let dead = ctx_symbol(dead_id, "new", "src/dead.rs", 20);
+    let tombstone = GraphRecord::Tombstone {
+        id: "tombstone:codegraph:v4:dead0000new".to_owned(),
+        schema_version: 0,
+        deleted_id: dead_id.to_owned(),
+        summary: "symbol removed".to_owned(),
+        producer: None,
+    };
+    let records = vec![live, dead, tombstone];
+
+    let ctx = symbol_context(&records, "new");
+    assert!(
+        !ctx.is_ambiguous(),
+        "a tombstoned duplicate must not force disambiguation"
+    );
+    assert!(!ctx.is_no_match());
+    assert!(
+        ctx.source_facts.iter().any(|r| r.id() == live_id),
+        "the live symbol is still recalled"
+    );
+}
+
+#[test]
+fn symbol_context_temporal_versions_of_one_identity_are_not_ambiguous() {
+    // AC6: historical snapshots share the identity's stable ID — one identity,
+    // not two — so they never trigger disambiguation.
+    let sym_id = "codegraph:v4:solo0000new";
+    let current = ctx_symbol(sym_id, "new", "src/solo.rs", 10);
+    let mut historical = ctx_symbol(sym_id, "new", "src/solo.rs", 4);
+    if let GraphRecord::Node {
+        temporal: ref mut temporal_field,
+        ..
+    } = historical
+    {
+        *temporal_field = Some(temporal("aaaaaaaa", "2026-01-01T00:00:00Z"));
+    }
+    let records = vec![current, historical];
+
+    let ctx = symbol_context(&records, "new");
+    assert!(
+        !ctx.is_ambiguous(),
+        "two versions of one identity must not be ambiguous"
+    );
+    assert!(!ctx.is_no_match());
+    assert!(ctx.candidates.is_empty());
 }

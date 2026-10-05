@@ -6,7 +6,12 @@ Over a temporal store produced by `eg scan-history`, returns files ranked by
 descending count of **distinct commits that modified them** — the
 software-archaeology hotspot signal (change frequency is the frequency half of
 CodeScene-style hotspots; complexity weighting is out of scope for this
-slice). Every row is a stable, citable graph handle an agent can pivot on with
+slice). The complexity half is now available independently:
+[`eg query complexity`](complexity.md) (issue #162) ranks Rust callable
+symbols by deterministic structural complexity (`1 + decision points` in the
+item's own body) — a source-derived code fact, never agent confidence.
+Multiplying the two into one fused churn×complexity hotspot score remains out
+of scope; both multiplicands are queryable, the fusion is not. Every row is a stable, citable graph handle an agent can pivot on with
 `eg query file`, `eg query change-impact`, `eg query failures`, or
 `eg query subsystem` — something raw `git log` shell-mining cannot offer.
 

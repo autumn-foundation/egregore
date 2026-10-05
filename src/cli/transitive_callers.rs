@@ -7,12 +7,12 @@ use super::*;
 /// One hop of a connecting call path in the transitive-callers output.
 #[derive(Serialize)]
 pub(crate) struct TransitivePathStepJson<'a> {
-    source_record_id: &'a str,
-    edge_record_id: &'a str,
-    edge_label: &'a str,
+    pub(crate) source_record_id: &'a str,
+    pub(crate) edge_record_id: &'a str,
+    pub(crate) edge_label: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    resolution: Option<&'static str>,
-    target_record_id: &'a str,
+    pub(crate) resolution: Option<&'static str>,
+    pub(crate) target_record_id: &'a str,
 }
 
 /// One reachable row in the transitive-callers output.
@@ -40,30 +40,30 @@ pub(crate) struct TransitiveCallerRowJson<'a> {
 /// The queried target's own citable handle in the summary envelope.
 #[derive(Serialize)]
 pub(crate) struct TransitiveTargetJson<'a> {
-    record_id: &'a str,
-    schema_version: u32,
+    pub(crate) record_id: &'a str,
+    pub(crate) schema_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<&'a str>,
-    kind: &'a str,
+    pub(crate) name: Option<&'a str>,
+    pub(crate) kind: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    repo_relative_path: Option<&'a str>,
-    span: Option<SourceSpan>,
+    pub(crate) repo_relative_path: Option<&'a str>,
+    pub(crate) span: Option<SourceSpan>,
 }
 
 /// Dropped-frontier count at one depth beyond the bound.
 #[derive(Serialize)]
 pub(crate) struct TransitiveDroppedDepthJson {
-    depth: usize,
-    count: usize,
+    pub(crate) depth: usize,
+    pub(crate) count: usize,
 }
 
 /// Depth-bound truncation diagnostic.
 #[derive(Serialize)]
 pub(crate) struct TransitiveTruncationJson {
-    code: &'static str,
-    max_depth: usize,
-    dropped_frontier: Vec<TransitiveDroppedDepthJson>,
-    dropped_total: usize,
+    pub(crate) code: &'static str,
+    pub(crate) max_depth: usize,
+    pub(crate) dropped_frontier: Vec<TransitiveDroppedDepthJson>,
+    pub(crate) dropped_total: usize,
 }
 
 /// Summary envelope emitted as the first NDJSON line.
@@ -142,16 +142,34 @@ pub(crate) fn transitive_row_json<'a>(
     })
 }
 
-/// Resolves the `--at`/`--as-of` selector against the store's `Commit` nodes
-/// and returns the selected commit SHA. Exits with the documented
-/// machine-readable diagnostics on failure.
-pub(crate) fn resolve_transitive_commit_view(
+/// How a fallible `--at`/`--as-of` commit-view resolution failed: the typed
+/// payload to print, the CLI exit code the verb must use, and which stream
+/// the payload goes to (`true` = stdout for error envelopes, `false` =
+/// stderr for usage diagnostics). Lets the daemon verb (issue #126) reuse
+/// the same resolution without process-exiting.
+pub(crate) struct CommitViewFailure {
+    pub payload: serde_json::Value,
+    pub exit_code: i32,
+    pub to_stdout: bool,
+}
+
+fn commit_view_payload(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).expect("commit-view diagnostic serializes")
+}
+
+/// Fallible core of [`resolve_transitive_commit_view`]: resolves the
+/// `--at`/`--as-of` selector against the store's `Commit` nodes and returns
+/// the selected commit SHA. Behavior matches the exiting wrapper exactly;
+/// the caller prints `payload` to the indicated stream and exits with
+/// `exit_code`.
+#[allow(clippy::too_many_lines)] // the temporal-view failure taxonomy, one branch per failure mode
+pub(crate) fn try_resolve_transitive_commit_view(
     records: &[GraphRecord],
     index: &query::RepositoryIndex,
     repo_scope: Option<&str>,
     at: Option<&str>,
     as_of: Option<&str>,
-) -> Result<String> {
+) -> Result<String, CommitViewFailure> {
     let mut commits: BTreeMap<&str, Option<&str>> = BTreeMap::new();
     for r in records {
         if let GraphRecord::Node {
@@ -177,15 +195,18 @@ pub(crate) fn resolve_transitive_commit_view(
         }
     }
     if commits.is_empty() {
-        let envelope = serde_json::json!({
+        let payload = serde_json::json!({
             "ok": false,
             "error": {
                 "code": "empty_history",
                 "message": "--at/--as-of requires a history store with Commit records (run scan-history)",
             },
         });
-        println!("{}", serde_json::to_string(&envelope)?);
-        std::process::exit(2);
+        return Err(CommitViewFailure {
+            payload,
+            exit_code: 2,
+            to_stdout: true,
+        });
     }
     if let Some(prefix) = at {
         let needle = prefix.to_lowercase();
@@ -196,34 +217,43 @@ pub(crate) fn resolve_transitive_commit_view(
             .collect();
         return match matches.len() {
             0 => {
-                let envelope = serde_json::json!({
+                let payload = serde_json::json!({
                     "ok": false,
                     "error": { "code": "missing_commit", "commit_prefix": prefix },
                 });
-                println!("{}", serde_json::to_string(&envelope)?);
-                std::process::exit(2);
+                Err(CommitViewFailure {
+                    payload,
+                    exit_code: 2,
+                    to_stdout: true,
+                })
             }
             1 => Ok(matches[0].to_owned()),
             _ => {
-                let diag = serde_json::json!({
+                let payload = serde_json::json!({
                     "code": "ambiguous_commit_prefix",
                     "commit_prefix": prefix,
                     "matches": matches,
                 });
-                eprintln!("{diag}");
-                std::process::exit(1);
+                Err(CommitViewFailure {
+                    payload,
+                    exit_code: 1,
+                    to_stdout: false,
+                })
             }
         };
     }
     let as_of = as_of.expect("caller passes exactly one of --at / --as-of");
     let Ok(as_of_dt) = chrono::DateTime::parse_from_rfc3339(as_of) else {
-        let diag = serde_json::json!({
+        let payload = serde_json::json!({
             "code": "invalid_as_of_timestamp",
             "as_of": as_of,
             "message": "--as-of must be an RFC 3339 instant",
         });
-        eprintln!("{diag}");
-        std::process::exit(1);
+        return Err(CommitViewFailure {
+            payload,
+            exit_code: 1,
+            to_stdout: false,
+        });
     };
     // Most recent commit at or before the instant; ascending-SHA iteration
     // with a strict `>` comparison makes ties resolve to the smallest SHA.
@@ -243,12 +273,39 @@ pub(crate) fn resolve_transitive_commit_view(
     if let Some((sha, _)) = best {
         Ok(sha.to_owned())
     } else {
-        let envelope = serde_json::json!({
+        let payload = serde_json::json!({
             "ok": false,
             "error": { "code": "no_commit_at_or_before", "as_of": as_of },
         });
-        println!("{}", serde_json::to_string(&envelope)?);
-        std::process::exit(2);
+        Err(CommitViewFailure {
+            payload,
+            exit_code: 2,
+            to_stdout: true,
+        })
+    }
+}
+
+/// Resolves the `--at`/`--as-of` selector against the store's `Commit` nodes
+/// and returns the selected commit SHA. Exits with the documented
+/// machine-readable diagnostics on failure.
+pub(crate) fn resolve_transitive_commit_view(
+    records: &[GraphRecord],
+    index: &query::RepositoryIndex,
+    repo_scope: Option<&str>,
+    at: Option<&str>,
+    as_of: Option<&str>,
+) -> String {
+    match try_resolve_transitive_commit_view(records, index, repo_scope, at, as_of) {
+        Ok(sha) => sha,
+        Err(failure) => {
+            let text = commit_view_payload(&failure.payload);
+            if failure.to_stdout {
+                println!("{text}");
+            } else {
+                eprintln!("{text}");
+            }
+            std::process::exit(failure.exit_code);
+        }
     }
 }
 
@@ -296,7 +353,7 @@ pub(crate) fn query_transitive_callers_cmd(
     let mut at_commit: Option<String> = None;
     let filtered: Option<Vec<GraphRecord>> =
         if matches!(corpus_mode, query::CorpusMode::CommitPinned) {
-            let sha = resolve_transitive_commit_view(records, index, repo_scope, at, as_of)?;
+            let sha = resolve_transitive_commit_view(records, index, repo_scope, at, as_of);
             let view: Vec<GraphRecord> = records
                 .iter()
                 .filter(|r| match r {

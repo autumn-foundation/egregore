@@ -41,6 +41,9 @@ pub(crate) fn scan_logs(
     producer: Option<&str>,
     captured_at_override: Option<&str>,
 ) -> Result<()> {
+    // The checked-in config still applies: fail fast when malformed and warn
+    // on scope pins this command does not consume (issue #261).
+    warn_on_unconsumed_scope_pins();
     // Validate the protected-capture flag group before doing any work, reusing
     // the #60 `missing_field` diagnostic shape.
     if protected_raw_artifacts {

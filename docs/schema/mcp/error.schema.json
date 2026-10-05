@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "Stable error shape shared by every eg mcp tool (issue #194).",
+  "properties": {
+    "error": {
+      "additionalProperties": true,
+      "properties": {
+        "candidates": {
+          "items": {
+            "type": [
+              "string",
+              "object"
+            ]
+          },
+          "type": "array"
+        },
+        "code": {
+          "type": "string"
+        },
+        "commit_prefix": {
+          "type": "string"
+        },
+        "field": {
+          "type": "string"
+        },
+        "handle": {
+          "type": "string"
+        },
+        "id_or_handle": {
+          "type": "string"
+        },
+        "includes_unattributed_rows": {
+          "type": "boolean"
+        },
+        "matching_commits": {
+          "type": "integer"
+        },
+        "message": {
+          "type": "string"
+        },
+        "repositories": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "symbol_name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code"
+      ],
+      "type": "object"
+    },
+    "ok": {
+      "const": false
+    }
+  },
+  "required": [
+    "ok",
+    "error"
+  ],
+  "title": "Egregore MCP tool error envelope",
+  "type": "object"
+}

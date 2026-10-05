@@ -1,0 +1,10 @@
+#!/bin/sh
+# Stub whose --version output carries no recognizable version token, so the
+# capture must emit an `unsupported_verifier_version` diagnostic.
+set -u
+if [ "${1:-}" = "--version" ]; then
+    printf 'definitely not a version string\n'
+    exit 0
+fi
+printf 'verification results:: 1 verified, 0 errors\n'
+exit 0

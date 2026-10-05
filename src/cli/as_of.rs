@@ -99,6 +99,56 @@ fn current_symbol_versions_at<'records>(
         .collect()
 }
 
+/// Counts the candidate records the one-best-per-repo selection chooses from
+/// (issue #121): same-named symbols passing the repository filter whose valid
+/// time is at or before `as_of`. This mirrors the candidate filter inside
+/// [`query::symbol_as_of_valid_time_by_repo`] — the count is the
+/// `total_matches` denominator for the completeness stamp, so the two must
+/// stay in sync. The query layer signature is shared with the daemon and MCP
+/// transports, so the count is computed here rather than threaded through it.
+fn count_as_of_candidates(
+    records: &[GraphRecord],
+    name: &str,
+    as_of: &str,
+    index: &query::RepositoryIndex,
+    selected_repo: Option<&str>,
+) -> usize {
+    let Ok(as_of_dt) = chrono::DateTime::parse_from_rfc3339(as_of) else {
+        return 0;
+    };
+    records
+        .iter()
+        .filter(|record| {
+            let GraphRecord::Node {
+                kind: NodeKind::Symbol,
+                name: node_name,
+                temporal,
+                valid_time,
+                ..
+            } = record
+            else {
+                return false;
+            };
+            if node_name.as_deref() != Some(name) {
+                return false;
+            }
+            if let Some(repo_id) = selected_repo
+                && index.owner_of(record.id()) != Some(repo_id)
+            {
+                return false;
+            }
+            let vt_str = temporal
+                .as_ref()
+                .map(|t| t.valid_time.as_str())
+                .or(valid_time.as_deref());
+            let Some(vt_str) = vt_str else {
+                return false;
+            };
+            chrono::DateTime::parse_from_rfc3339(vt_str).is_ok_and(|vt| vt <= as_of_dt)
+        })
+        .count()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn query_symbol_as_of(
     records: &[GraphRecord],
@@ -109,6 +159,7 @@ pub(crate) fn query_symbol_as_of(
     selected_repo: Option<&str>,
     package: Option<&str>,
     freshness_code: Option<&(String, &'static str)>,
+    role: RoleFilter,
 ) -> Result<()> {
     // Package scope narrows the candidate records BEFORE the one-best-per-repo
     // selection, for the same reason as the `--at` lane (issue #117): filtering
@@ -155,6 +206,12 @@ pub(crate) fn query_symbol_as_of(
                 .collect()
         });
     let records = scoped_records.as_deref().unwrap_or(records);
+    // Issue #121: `--as-of` is a single-winner selection — bind the
+    // candidate count before the pick so the printed rows can report what
+    // the selection narrowed. Counted over the same slice the selection
+    // reads, with the same filter.
+    let candidates = count_as_of_candidates(records, name, as_of, index, selected_repo);
+    let completeness = RowCompleteness::single_winner(candidates);
     match query::symbol_as_of_valid_time_by_repo(records, name, as_of, index, selected_repo) {
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -178,11 +235,23 @@ pub(crate) fn query_symbol_as_of(
             let deleted = current_deleted_ids(records);
             let mut symbol_results: Vec<SymbolResult<'_>> = results
                 .iter()
-                .filter_map(|r| symbol_result(r, name, index, records, &deleted))
+                .filter_map(|r| {
+                    let mut result = symbol_result(r, name, index, records, &deleted)?;
+                    // `--as-of` is a temporal lane (issue #181): stamp the
+                    // valid-time axis the selector resolved.
+                    stamp_valid_time(&mut result, r);
+                    Some(result)
+                })
                 .collect();
             // Package scope (issue #117), applied to the recorded attribution AT
             // the resolved instant.
             retain_package_scope(&mut symbol_results, package);
+            // Role scope (issue #238), applied to the recorded role AT the
+            // resolved instant: the instant decides WHICH version, and the
+            // selector then decides whether that version's role matches. A
+            // row whose record predates issue #238 (role unknown) survives
+            // only `RoleFilter::All`.
+            symbol_results.retain(|r| role.matches(r.role.copied()));
             if symbol_results.is_empty() {
                 eprintln!("error: no match found for symbol `{name}` at or before `{as_of}`");
                 std::process::exit(2);
@@ -195,6 +264,11 @@ pub(crate) fn query_symbol_as_of(
                 query::CorpusMode::CommitPinned,
                 query::CorpusModeSource::Selector,
             );
+            // Issue #121: one row was picked per repository from `candidates`
+            // — stamp the selection on every printed row.
+            for result in &mut symbol_results {
+                result.completeness = completeness;
+            }
             for result in &symbol_results {
                 print_result(result, format)?;
             }

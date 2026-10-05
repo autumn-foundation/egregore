@@ -1,6 +1,7 @@
 //! Embedded `AletheiaDB` adapter.
 
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
@@ -14,14 +15,15 @@ use crate::embeddings::{EmbeddingVectorKey, EmbeddingVectorMap};
 use crate::{
     adapters::{
         AdapterError, AdapterResult, ExpectedRecordState, GraphSink, InspectStoreReport,
-        validate_adapter_record_version,
+        WriteOutcome, validate_adapter_record_version,
     },
     daemon::StoreLease,
     identity::{is_local_remote_url, repository_id_matches_payload},
     ir::{
-        CrateAttribution, EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord, IdentitySource,
-        MetricKind, NodeKind, Producer, RouteAnnotation, SelectionBasis, SemanticDriftMetadata,
-        SourceSpan, TemporalMetadata, UserContextFields,
+        CrateAttribution, DeprecationMark, EdgeLabel, EmbeddingModel, EntryPointMark, EvidenceLink,
+        GraphRecord, IdentitySource, LintSuppressionFacts, MetricKind, NodeKind, Producer,
+        RouteAnnotation, SelectionBasis, SemanticDriftMetadata, SourceSpan, SymbolRole,
+        TemporalMetadata, UserContextFields,
     },
     schema_constraints::{
         ConformanceStatus, ConstraintProfile, DeclarationOutcome, DeclaredConstraint,
@@ -57,6 +59,36 @@ const VECTOR_INDEX_ARTIFACT_FILES: [&str; 4] = [
     "current.usearch.mappings",
 ];
 
+/// A node selected for re-embedding: it already carries a persisted
+/// `embedding` vector, which is exactly the previously-embedded set
+/// (issue #167).
+#[cfg(feature = "embeddings")]
+#[derive(Debug, Clone)]
+pub struct ReembedNode {
+    /// Stable graph record ID.
+    pub record_id: String,
+    /// Full vector key (record ID + temporal identity): two observations of
+    /// the same stable symbol at different commits are different nodes with
+    /// different vectors, and re-embed must recover each one's own text.
+    pub vector_key: crate::embeddings::EmbeddingVectorKey,
+    /// Engine node to patch.
+    pub node_id: ::aletheiadb::NodeId,
+    /// Dimension of the currently-persisted vector.
+    pub vector_dim: usize,
+}
+
+/// One replacement vector for [`EmbeddedAletheiaSink::reembed_commit`].
+#[cfg(feature = "embeddings")]
+#[derive(Debug, Clone)]
+pub struct ReembedVectorUpdate {
+    /// Stable graph record ID (for diagnostics).
+    pub record_id: String,
+    /// Engine node to patch.
+    pub node_id: ::aletheiadb::NodeId,
+    /// Replacement vector; must match the target model's dimension.
+    pub vector: Vec<f32>,
+}
+
 /// A single result from a semantic similarity search.
 #[cfg(feature = "embeddings")]
 #[derive(Debug, Clone)]
@@ -75,6 +107,29 @@ pub struct SemanticMatch {
     pub score: f32,
     /// Source span when available.
     pub span: Option<SourceSpan>,
+}
+
+/// Canonical total order for semantic result rows (issue #199).
+///
+/// Score descending, then record ID ascending. Scores compare with
+/// [`f32::total_cmp`] (not `partial_cmp`), so NaN takes a deterministic
+/// position instead of collapsing to `Equal`; record IDs are unique per
+/// result row, so this is a true total order — no two distinct records can
+/// ever swap positions across runs, and the order is observable from the
+/// output (both keys are printed on every row).
+///
+/// This is the single definition of the semantic tiebreak: every lane that
+/// emits semantic results sorts by this comparator
+/// ([`EmbeddedAletheiaSink::semantic_search`] applies it to the full
+/// candidate pool before the limit truncation; the CLI lanes re-apply it
+/// after their kind/scope filters as belt-and-braces).
+#[cfg(feature = "embeddings")]
+#[must_use]
+pub fn compare_semantic_matches(left: &SemanticMatch, right: &SemanticMatch) -> Ordering {
+    right
+        .score
+        .total_cmp(&left.score)
+        .then_with(|| left.record_id.cmp(&right.record_id))
 }
 
 /// Graph sink backed by an embedded `AletheiaDB` store.
@@ -272,6 +327,52 @@ impl EmbeddedAletheiaSink {
         Self::open_inner(data_dir, None)
     }
 
+    /// Enable encrypted-at-rest mode on an already-open store (issue #54).
+    ///
+    /// Flips the engine's durable encryption authority (`encryption.state`)
+    /// via [`AletheiaDB::enable_encryption`](::aletheiadb::AletheiaDB::enable_encryption),
+    /// then writes Egregore's storage-mode marker. The marker is written only
+    /// *after* the authority flip, so the marker never leads the authority.
+    /// Called exactly once per store, at creation, by `eg ingest --encrypted`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError::Rejected`] when the key source is a KMS/Vault
+    /// variant Egregore does not offer, when the engine refuses the flip, or
+    /// when the marker cannot be written.
+    pub fn enable_store_encryption(
+        &mut self,
+        key_source: &::aletheiadb::encryption::KeyProviderConfig,
+    ) -> AdapterResult<()> {
+        // Issue #54: for fresh stores, `prepare_encrypted_ingest` already
+        // wrote the authority file and marker before the first open, so the
+        // engine enabled encryption from the start. Skip the migration path.
+        if crate::encrypted_store::read_marker(&self.data_dir)
+            .map_err(|error| error.to_adapter_error())?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let descriptor =
+            crate::encrypted_store::KeySourceDescriptor::from_provider_config(key_source)
+                .ok_or_else(|| AdapterError::Rejected {
+                    record_id: "embedded-store".to_owned(),
+                    message: "unsupported key source: Egregore supports key files and \
+                              passphrase-wrapped key files only, not KMS/Vault sources"
+                        .to_owned(),
+                })?;
+        self.db
+            .enable_encryption(key_source.clone())
+            .map_err(|error| AdapterError::Rejected {
+                record_id: "embedded-store".to_owned(),
+                message: format!("failed to enable encryption on the store: {error}"),
+            })?;
+        let marker = crate::encrypted_store::StoreMarker::new(descriptor);
+        crate::encrypted_store::write_marker(&self.data_dir, &marker)
+            .map_err(|error| error.to_adapter_error())?;
+        Ok(())
+    }
+
     fn open_inner(data_dir: &Path, lease: Option<StoreLease>) -> AdapterResult<Self> {
         // Test-only: cap concurrent embedded stores (and serialise under disk
         // pressure) before spinning up the store's background flush thread.
@@ -281,6 +382,13 @@ impl EmbeddedAletheiaSink {
         if is_fresh_data_dir(data_dir) {
             config.persistence.load_on_startup = false;
         }
+        // Issue #54: resolve the store's storage mode from the Egregore
+        // marker cross-checked against the engine's durable encryption
+        // authority, fail-closed. Absent marker = legacy plaintext; the
+        // default workflow is unchanged.
+        let resolved = crate::encrypted_store::resolve_encryption_config(data_dir)
+            .map_err(|error| error.to_adapter_error())?;
+        config.encryption = resolved.config;
         // Pin the string-interner cap to Egregore's own constant rather than
         // inheriting AletheiaDB's default (issue #439). `MAX_INTERNED_STRINGS`
         // also bounds the ingest preflight estimate, so configuring the store
@@ -291,6 +399,18 @@ impl EmbeddedAletheiaSink {
         config.persistence.max_interned_strings =
             usize::try_from(super::preflight::MAX_INTERNED_STRINGS).unwrap_or(usize::MAX);
         let db = ::aletheiadb::AletheiaDB::with_unified_config(config).map_err(|error| {
+            // Issue #54: the key material loaded (checked pre-open), so a
+            // failed open under an encrypted marker means a wrong key.
+            if let (crate::encrypted_store::StorageMode::Encrypted, Some(descriptor)) =
+                (resolved.mode, &resolved.key_source)
+            {
+                return crate::encrypted_store::classify_encrypted_open_error(
+                    data_dir,
+                    descriptor,
+                    &error.to_string(),
+                )
+                .to_adapter_error();
+            }
             AdapterError::Rejected {
                 record_id: "embedded-store".to_owned(),
                 message: classify_open_error(data_dir, &error.to_string()),
@@ -456,7 +576,12 @@ impl EmbeddedAletheiaSink {
 
     /// Searches for nodes whose stored embedding is most similar to `query_vector`.
     ///
-    /// Returns up to `limit` results ordered by descending similarity.
+    /// Returns up to `limit` results in the canonical total order
+    /// ([`compare_semantic_matches`]: score descending, then record ID
+    /// ascending). The order is imposed on the full filtered candidate pool
+    /// BEFORE the `limit` truncation, so both the row sequence and the set of
+    /// rows kept at the truncation boundary are stable across runs against an
+    /// unchanged store (issue #199).
     ///
     /// # Errors
     ///
@@ -493,8 +618,13 @@ impl EmbeddedAletheiaSink {
                     message: error.to_string(),
                 })?;
             let raw_len = raw.len();
-            results.clear();
-            let mut seen_record_ids = std::collections::BTreeSet::new();
+            // Collect the WHOLE filtered pool for this fetch window: truncating
+            // to `limit` in raw HNSW order would bake the engine's tie-order
+            // instability into the result SET at the boundary (issue #199).
+            // The deterministic dedupe below keeps, per record ID, the row
+            // that sorts first canonically (highest score) rather than
+            // whichever raw hit the index happened to surface first.
+            let mut pool = Vec::new();
             for (node_id, score) in raw {
                 let Ok(node) = self.db.get_node(node_id) else {
                     continue;
@@ -516,10 +646,16 @@ impl EmbeddedAletheiaSink {
                 {
                     continue;
                 }
-                if self.node_lookup.latest_node(&record_id) != Some(node_id) {
-                    continue;
-                }
-                if !seen_record_ids.insert(record_id.clone()) {
+                // The HNSW vector index is keyed by the physical node version
+                // that carried the vector (the tree batch's non-temporal
+                // versions). History ingest appends temporal versions that
+                // supersede in `latest_node`, which would orphan every vector
+                // and break semantic search after `eg init` (issue #229).
+                // Accept the hit when it is the latest version OR the
+                // non-temporal (working-tree) version of the record.
+                let is_current = self.node_lookup.latest_node(&record_id) == Some(node_id)
+                    || self.node_lookup.non_temporal.get(&record_id).copied() == Some(node_id);
+                if !is_current {
                     continue;
                 }
                 let kind = node
@@ -535,7 +671,7 @@ impl EmbeddedAletheiaSink {
                     .and_then(|v| v.as_str())
                     .map(str::to_owned);
                 let span = span_from_properties(|key| node.get_property(key));
-                results.push(SemanticMatch {
+                pool.push(SemanticMatch {
                     record_id,
                     kind,
                     name,
@@ -543,10 +679,20 @@ impl EmbeddedAletheiaSink {
                     score,
                     span,
                 });
-                if results.len() == limit {
-                    break;
-                }
             }
+            // Canonical total order BEFORE truncation (issue #199): equal-score
+            // HNSW hits arrive in an unstable raw order, so the rows kept at
+            // the `limit` boundary — and their sequence — are decided here by
+            // (score desc, record ID asc), never by index traversal order.
+            pool.sort_by(compare_semantic_matches);
+            // Deterministic dedupe: one row per record ID. The same record can
+            // surface via two node versions (latest + non-temporal, issue
+            // #229); after the canonical sort those rows are adjacent and the
+            // first is the highest-scored, so keeping it is deterministic.
+            let mut seen_record_ids = BTreeSet::new();
+            pool.retain(|m| seen_record_ids.insert(m.record_id.clone()));
+            pool.truncate(limit);
+            results = pool;
             if results.len() == limit || raw_len < raw_limit {
                 break;
             }
@@ -1780,6 +1926,11 @@ impl EmbeddedAletheiaSink {
     /// read.
     pub fn inspect_current_records(&self) -> AdapterResult<InspectStoreReport> {
         let active_tombstoned = self.active_deleted_ids()?;
+        // Issue #472: record IDs whose ACTIVE tombstone is a repository-eviction
+        // tombstone (self-verifying). Their temporal candidates are suppressed
+        // from this current-state view; ordinary `forget` tombstones keep
+        // serving temporal candidates (issue #231).
+        let eviction_suppressed = self.active_eviction_tombstoned_ids()?;
         // Physical IDs of the current per-commit temporal candidates:
         // `read_all_records` serves every per-commit candidate (even for
         // tombstoned records, so `--at <commit>` views can resolve past
@@ -1845,7 +1996,11 @@ impl EmbeddedAletheiaSink {
                 record_type.as_deref() == Some("node")
                     && !active_tombstoned.contains(record_id.as_str())
             } else if current_temporal.contains(&node_id) {
-                true
+                // Issue #472: a temporal candidate targeted by an ACTIVE
+                // repository-eviction tombstone is suppressed from the current
+                // view. Ordinary `forget` tombstones keep serving temporal
+                // candidates (issue #231 bi-temporal honesty).
+                !eviction_suppressed.contains(record_id.as_str())
             } else {
                 !active_tombstoned.contains(record_id.as_str())
                     && self.node_lookup.non_temporal.get(record_id.as_str()) == Some(&node_id)
@@ -2230,6 +2385,48 @@ impl EmbeddedAletheiaSink {
         Ok(deleted)
     }
 
+    /// Returns the set of record IDs whose ACTIVE tombstone is a
+    /// repository-eviction tombstone (issue #472).
+    ///
+    /// Mirrors [`Self::active_deleted_ids`] but keeps only self-verifying
+    /// eviction tombstones: the stored tombstone record's own ID must equal
+    /// `repo_evict::eviction_tombstone_id(deleted_id)` recomputed from its
+    /// target — no schema field, no summary marker. Ordinary `forget`
+    /// tombstones are excluded so they keep the issue #231 temporal exemption.
+    /// A tombstone superseded by a later write of its target (stale) suppresses
+    /// nothing, so re-ingest revives the ID under latest-write-wins.
+    fn active_eviction_tombstoned_ids(&self) -> AdapterResult<std::collections::BTreeSet<String>> {
+        let mut suppressed = std::collections::BTreeSet::new();
+        for &tombstone_node_id in self.tombstone_ids.values() {
+            let node = self
+                .db
+                .get_node(tombstone_node_id)
+                .map_err(|e| read_back_error("active_eviction_tombstoned_ids", e.to_string()))?;
+            let Some(tombstone_id) = optional_str_property(
+                "active_eviction_tombstoned_ids",
+                "codegraph_id",
+                node.get_property("codegraph_id"),
+            )?
+            else {
+                continue;
+            };
+            let Some(deleted_id) = optional_str_property(
+                "active_eviction_tombstoned_ids",
+                "deleted_id",
+                node.get_property("deleted_id"),
+            )?
+            else {
+                continue;
+            };
+            if tombstone_id == crate::repo_evict::eviction_tombstone_id(&deleted_id).0
+                && !self.tombstone_node_is_stale(tombstone_node_id, &deleted_id)
+            {
+                suppressed.insert(deleted_id);
+            }
+        }
+        Ok(suppressed)
+    }
+
     /// Returns true when the physical tombstone at `tombstone_node_id` no
     /// longer suppresses `deleted_id` because a newer write of that record
     /// supersedes it.
@@ -2418,7 +2615,7 @@ impl EmbeddedAletheiaSink {
 }
 
 impl GraphSink for EmbeddedAletheiaSink {
-    fn write_record(&mut self, record: &GraphRecord) -> AdapterResult<()> {
+    fn write_record(&mut self, record: &GraphRecord) -> AdapterResult<WriteOutcome> {
         validate_adapter_record_version(record)?;
         match record {
             GraphRecord::Node { .. } => self.write_node(record),
@@ -2433,22 +2630,23 @@ impl GraphSink for EmbeddedAletheiaSink {
 
     fn verify_record(&self, record: &GraphRecord) -> AdapterResult<()> {
         let Some(handle) = self.record_handles.get(record.id()).copied() else {
-            // Write was skipped (Matched); use cleared comparison to stay consistent with the Matched check.
-            return match self.read_back(record.id())? {
-                Some(read_back)
-                    if read_back.with_cleared_producer_started_at()
-                        == record.with_cleared_producer_started_at() =>
-                {
-                    Ok(())
+            // The write was skipped because `expected_record_state` reported
+            // `Matched`. Re-check that exact condition instead of comparing
+            // against `read_back`: one stable ID can name several physical
+            // versions — the history batch re-emits tree edges with temporal
+            // metadata under the same IDs — and `read_back` prefers the
+            // temporal variant, which is not necessarily the version that
+            // matched. Comparing against it spuriously failed verification
+            // for correctly skipped writes on every tree re-ingest that
+            // followed a history ingest.
+            return match self.expected_record_state(record)? {
+                ExpectedRecordState::Matched => Ok(()),
+                ExpectedRecordState::Mismatched | ExpectedRecordState::Missing => {
+                    Err(AdapterError::ReadBack {
+                        record_id: record.id().to_owned(),
+                        message: "record missing after write".to_owned(),
+                    })
                 }
-                Some(_) => Err(AdapterError::ReadBack {
-                    record_id: record.id().to_owned(),
-                    message: "record mismatch".to_owned(),
-                }),
-                None => Err(AdapterError::ReadBack {
-                    record_id: record.id().to_owned(),
-                    message: "record missing after write".to_owned(),
-                }),
             };
         };
 
@@ -2592,7 +2790,7 @@ impl EmbeddedAletheiaSink {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn write_node(&mut self, record: &GraphRecord) -> AdapterResult<()> {
+    fn write_node(&mut self, record: &GraphRecord) -> AdapterResult<WriteOutcome> {
         // Same revive-after-tombstone guard as `write_edge` (#333 Codex round-7):
         // a byte-identical node whose stable ID is actively tombstoned must write
         // a fresh version so the newer NodeId supersedes the tombstone and the
@@ -2603,7 +2801,7 @@ impl EmbeddedAletheiaSink {
         {
             #[cfg(feature = "embeddings")]
             self.backfill_embedding_for_matched_node(record)?;
-            return Ok(());
+            return Ok(WriteOutcome::Unchanged);
         }
         let GraphRecord::Node {
             id,
@@ -2622,6 +2820,12 @@ impl EmbeddedAletheiaSink {
             note,
             content_signature,
             route,
+            deprecated,
+            lint_suppression,
+            cfg,
+            entry_point,
+            role,
+            complexity,
             crate_attribution,
             temporal,
             semantic_drift,
@@ -2631,8 +2835,13 @@ impl EmbeddedAletheiaSink {
             dependency,
             log,
             scan_coverage,
+            history_replay_window,
+            history_replay_tip,
             embedding_model,
             text,
+            // Issue #191: decision-only fields, bound for exhaustiveness.
+            decision_text,
+            rationale_summary,
             superseded_by,
             agent_id,
             agent_kind,
@@ -2753,6 +2962,49 @@ impl EmbeddedAletheiaSink {
         {
             builder = builder.insert("route_json", json.as_str());
         }
+        // Deprecation facts (issue #249). Paired with the read at
+        // `read_node_record_internal`; the two MUST stay symmetric.
+        if let Some(mark) = deprecated
+            && let Ok(json) = serde_json::to_string(mark)
+        {
+            builder = builder.insert("deprecated_json", json.as_str());
+        }
+        // Lint-suppression facts (issue #227). Paired with the read at
+        // `read_node_record_internal`; the two MUST stay symmetric.
+        if let Some(facts) = lint_suppression
+            && let Ok(json) = serde_json::to_string(facts)
+        {
+            builder = builder.insert("lint_suppression_json", json.as_str());
+        }
+        // Conditional-compilation gates (issue #190). Paired with the read
+        // at `read_node_record_internal`; the two MUST stay symmetric.
+        if let Some(gates) = cfg
+            && let Ok(json) = serde_json::to_string(gates)
+        {
+            builder = builder.insert("cfg_json", json.as_str());
+        }
+        // Entry-point facts (issue #240). Paired with the read at
+        // `read_node_record_internal`; the two MUST stay symmetric.
+        if let Some(mark) = entry_point
+            && let Ok(json) = serde_json::to_string(mark)
+        {
+            builder = builder.insert("entry_point_json", json.as_str());
+        }
+        // Test-vs-production role (issue #238). Paired with the read at
+        // `read_node_record_internal`; the two MUST stay symmetric.
+        if let Some(role) = role
+            && let Ok(json) = serde_json::to_string(role)
+        {
+            builder = builder.insert("role_json", json.as_str());
+        }
+        // Structural complexity (issue #162). Paired with the read at
+        // `read_node_record_internal`; the two MUST stay symmetric: the
+        // read is full structural equality of the reconstructed record, so
+        // a written-but-unread property would make every re-ingest write a
+        // new physical version forever.
+        if let Some(score) = complexity {
+            builder = builder.insert("complexity", score.to_string().as_str());
+        }
         // Owning-package attribution (issue #117). Paired with the read at
         // `read_node_record_internal`; the two MUST stay symmetric.
         if let Some(attribution) = crate_attribution
@@ -2849,6 +3101,20 @@ impl EmbeddedAletheiaSink {
         {
             builder = builder.insert("scan_coverage_json", json.as_str());
         }
+        // History-replay window summary (issue #256): persisted beside the
+        // scan-coverage summary so a windowed store round-trips its window.
+        if let Some(payload) = history_replay_window
+            && let Ok(json) = serde_json::to_string(payload.as_ref())
+        {
+            builder = builder.insert("history_replay_window_json", json.as_str());
+        }
+        // History-replay resume marker (issue #224): persisted beside the
+        // window summary so a resumed store round-trips its tip.
+        if let Some(payload) = history_replay_tip
+            && let Ok(json) = serde_json::to_string(payload.as_ref())
+        {
+            builder = builder.insert("history_replay_tip_json", json.as_str());
+        }
         // Vector-index embedding-model identity (issue #104): the queryable
         // index's producing model, persisted so `eg query semantic` can prove
         // the query embedder shares the index's vector space.
@@ -2858,6 +3124,10 @@ impl EmbeddedAletheiaSink {
             builder = builder.insert("embedding_model_json", json.as_str());
         }
         builder = insert_optional(builder, "text", text.as_deref());
+        // Decision-only fields (issue #191). Paired with the read at
+        // `read_node_record_internal`; the two MUST stay symmetric.
+        builder = insert_optional(builder, "decision_text", decision_text.as_deref());
+        builder = insert_optional(builder, "rationale_summary", rationale_summary.as_deref());
         builder = insert_optional(builder, "superseded_by", superseded_by.as_deref());
         builder = insert_optional(builder, "agent_id", agent_id.as_deref());
         builder = insert_optional(builder, "agent_kind", agent_kind.as_deref());
@@ -3016,7 +3286,7 @@ impl EmbeddedAletheiaSink {
         self.node_lookup.insert(id.clone(), node_id, temporal_key);
         self.record_handles
             .insert(id.clone(), StoredRecord::Node(node_id));
-        Ok(())
+        Ok(WriteOutcome::Inserted)
     }
 
     #[cfg(feature = "embeddings")]
@@ -3040,6 +3310,21 @@ impl EmbeddedAletheiaSink {
             .get_property("embedding")
             .and_then(::aletheiadb::PropertyValue::as_vector)
             .map(<[f32]>::to_vec)
+    }
+
+    /// Returns the embedding vector the store holds for `record`, if any
+    /// (issue #163).
+    ///
+    /// Recall-time observation collapse reuses the existing vector index
+    /// instead of re-embedding text: the pairwise cosine test reads each
+    /// candidate's stored vector through this accessor. Read-only: it
+    /// performs no writes, triggers no backfill, and creates no index
+    /// entries — `None` (never embedded, or an unvectorized record) is a
+    /// normal outcome the caller must handle by failing closed.
+    #[cfg(feature = "embeddings")]
+    #[must_use]
+    pub fn stored_embedding_vector(&self, record: &GraphRecord) -> Option<Vec<f32>> {
+        self.existing_embedding_for_record(record)
     }
 
     #[cfg(feature = "embeddings")]
@@ -3096,6 +3381,196 @@ impl EmbeddedAletheiaSink {
         Ok(())
     }
 
+    /// One node selected for re-embedding: the node already carries a
+    /// persisted `embedding` vector, which is exactly the previously-embedded
+    /// set (issue #167).
+    ///
+    /// The fixed #104 identity record is excluded even if it ever carried a
+    /// vector: it has no embeddable text (its kind is never an embedding
+    /// candidate), and re-embedding supersedes it via the identity patch in
+    /// [`reembed_commit`], not via a vector replacement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError::Rejected`] when a candidate's vector property
+    /// cannot be decoded.
+    #[cfg(feature = "embeddings")]
+    pub fn reembed_candidate_nodes(&self) -> AdapterResult<Vec<ReembedNode>> {
+        let identity_id = crate::embeddings::embedding_index_identity_id();
+        let records = self.read_all_records()?;
+        let mut nodes = Vec::new();
+        for record in &records {
+            let GraphRecord::Node { id, temporal, .. } = record else {
+                continue;
+            };
+            if id == &identity_id {
+                continue;
+            }
+            let Some(node_id) = self.node_id_for_observation(id, temporal.as_ref()) else {
+                continue;
+            };
+            let node = self
+                .db
+                .get_node(node_id)
+                .map_err(|error| read_back_error(id, error.to_string()))?;
+            let Some(vector) = node
+                .get_property("embedding")
+                .and_then(::aletheiadb::PropertyValue::as_vector)
+            else {
+                continue;
+            };
+            let Some(vector_key) = crate::embeddings::EmbeddingVectorKey::from_record(record)
+            else {
+                continue;
+            };
+            nodes.push(ReembedNode {
+                record_id: id.clone(),
+                vector_key,
+                node_id,
+                vector_dim: vector.len(),
+            });
+        }
+        // Deterministic order: record ID ascending, mirroring the candidate
+        // ordering in `crate::embeddings::embedding_candidates`.
+        nodes.sort_by(|left, right| left.record_id.cmp(&right.record_id));
+        Ok(nodes)
+    }
+
+    /// Reads every persisted `embedding` vector, keyed by record ID, in
+    /// deterministic (record-ID ascending) order.
+    ///
+    /// This is an introspection helper for issue #167 verification: it lets a
+    /// test prove the stored vectors are all at the target dimension with no
+    /// mixed vector spaces, and byte-identical across deterministic runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError::Rejected`] when a vector property cannot be
+    /// decoded.
+    #[cfg(feature = "embeddings")]
+    pub fn read_persisted_vectors(&self) -> AdapterResult<Vec<(String, Vec<f32>)>> {
+        let mut vectors = Vec::new();
+        for node in self.reembed_candidate_nodes()? {
+            let stored = self
+                .db
+                .get_node(node.node_id)
+                .map_err(|error| read_back_error(&node.record_id, error.to_string()))?;
+            let Some(vector) = stored
+                .get_property("embedding")
+                .and_then(::aletheiadb::PropertyValue::as_vector)
+            else {
+                return Err(AdapterError::Rejected {
+                    record_id: node.record_id,
+                    message: "node lost its embedding vector".to_owned(),
+                });
+            };
+            vectors.push((node.record_id, vector.to_vec()));
+        }
+        Ok(vectors)
+    }
+
+    /// Commits a re-embedding in ONE transaction: every node's `embedding`
+    /// property is replaced and the fixed identity record is superseded with
+    /// the target model's identity (issue #167).
+    ///
+    /// Single-transaction is the whole point: a crash can never leave the
+    /// store with identity B and vectors A (or the reverse), the two states
+    /// that would silently misrank. Every vector is validated against the
+    /// target dimension BEFORE the transaction opens, so a dimension slip
+    /// fails closed without touching the store.
+    ///
+    /// Returns the number of node vectors replaced.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError::Rejected`] when the store has no #104
+    /// identity record, when any vector's dimension differs from the
+    /// target's, or when the transaction fails (it is rolled back).
+    #[cfg(feature = "embeddings")]
+    pub fn reembed_commit(
+        &self,
+        updates: &[ReembedVectorUpdate],
+        target_model: &EmbeddingModel,
+    ) -> AdapterResult<usize> {
+        for update in updates {
+            if update.vector.len() != target_model.dim as usize {
+                return Err(AdapterError::Rejected {
+                    record_id: update.record_id.clone(),
+                    message: format!(
+                        "re-embed vector for {} has {} dimensions but the target model {} has {}; \
+                         refusing before any write",
+                        update.record_id,
+                        update.vector.len(),
+                        target_model.name,
+                        target_model.dim,
+                    ),
+                });
+            }
+        }
+        let identity_id = crate::embeddings::embedding_index_identity_id();
+        let identity_node_id = self
+            .node_id_for_observation(&identity_id, None)
+            .ok_or_else(|| AdapterError::Rejected {
+                record_id: identity_id.clone(),
+                message: "re-embed requires the #104 identity record; \
+                              the store was never --embed'ed under a recorded model"
+                    .to_owned(),
+            })?;
+        let identity_patch = reembed_identity_patch(target_model)?;
+
+        self.db
+            .write(|tx| {
+                for update in updates {
+                    let properties = ::aletheiadb::PropertyMapBuilder::new()
+                        .insert_vector("embedding", &update.vector)
+                        .build();
+                    tx.update_node(update.node_id, properties)?;
+                }
+                tx.update_node(identity_node_id, identity_patch)?;
+                Ok::<(), ::aletheiadb::Error>(())
+            })
+            .map_err(|error| AdapterError::Rejected {
+                record_id: "embedded-store".to_owned(),
+                message: format!("re-embed transaction failed and was rolled back: {error}"),
+            })?;
+        Ok(updates.len())
+    }
+
+    /// Rebuilds the `embedding` vector index at `dimensions` from the node
+    /// vector properties currently in the store (issue #167).
+    ///
+    /// This is the dimension-change path: after [`remove_persisted_vector_index`]
+    /// deleted the old-dimension artifacts and [`reembed_commit`] replaced
+    /// every node vector, the fresh index is backfilled from those vectors.
+    /// `enable_vector_index` alone would create an EMPTY index (upstream
+    /// documents the overwrite footgun); `rebuild_vector_index` backfills.
+    /// Returns the number of node vectors indexed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError::Rejected`] when `dimensions` is zero or the
+    /// index rebuild fails.
+    #[cfg(feature = "embeddings")]
+    pub fn reembed_rebuild_vector_index(&self, dimensions: usize) -> AdapterResult<usize> {
+        if dimensions == 0 {
+            return Err(AdapterError::Rejected {
+                record_id: "embedded-store".to_owned(),
+                message: "embedding vector dimensions must be greater than zero".to_owned(),
+            });
+        }
+        let config = ::aletheiadb::index::vector::hnsw::HnswConfig {
+            dimensions,
+            metric: ::aletheiadb::index::vector::DistanceMetric::Cosine,
+            ..Default::default()
+        };
+        self.db
+            .rebuild_vector_index(EMBEDDING_INDEX_PROPERTY, config)
+            .map_err(|error| AdapterError::Rejected {
+                record_id: "embedded-store".to_owned(),
+                message: error.to_string(),
+            })
+    }
+
     #[cfg(feature = "embeddings")]
     fn node_id_for_observation(
         &self,
@@ -3117,7 +3592,7 @@ impl EmbeddedAletheiaSink {
         }
     }
 
-    fn write_tombstone(&mut self, record: &GraphRecord) -> AdapterResult<()> {
+    fn write_tombstone(&mut self, record: &GraphRecord) -> AdapterResult<WriteOutcome> {
         // A byte-identical tombstone is only a no-op while the stored copy is
         // still active. Once a newer write of the deleted ID supersedes it
         // (a revived record), re-issuing the same tombstone must land as a
@@ -3126,7 +3601,7 @@ impl EmbeddedAletheiaSink {
         if self.expected_record_state(record)? == ExpectedRecordState::Matched
             && !self.stored_tombstone_is_stale(record.id())?
         {
-            return Ok(());
+            return Ok(WriteOutcome::Unchanged);
         }
         let GraphRecord::Tombstone {
             id,
@@ -3179,10 +3654,10 @@ impl EmbeddedAletheiaSink {
         self.tombstone_node_seqs.insert(node_id, seq);
         self.record_handles
             .insert(id.clone(), StoredRecord::Tombstone(node_id));
-        Ok(())
+        Ok(WriteOutcome::Inserted)
     }
 
-    fn write_edge(&mut self, record: &GraphRecord) -> AdapterResult<()> {
+    fn write_edge(&mut self, record: &GraphRecord) -> AdapterResult<WriteOutcome> {
         // A re-emitted edge whose bytes match an existing physical edge is
         // normally a no-op. But when the edge's stable ID is CURRENTLY actively
         // tombstoned, that matching physical edge is being SUPPRESSED by the
@@ -3195,7 +3670,7 @@ impl EmbeddedAletheiaSink {
         if self.expected_record_state(record)? == ExpectedRecordState::Matched
             && !self.active_deleted_ids()?.contains(record.id())
         {
-            return Ok(());
+            return Ok(WriteOutcome::Unchanged);
         }
 
         let GraphRecord::Edge {
@@ -3209,6 +3684,7 @@ impl EmbeddedAletheiaSink {
             frame_resolution,
             frame_index,
             basis,
+            call_site_spans,
             is_exhaustive,
             temporal,
             summary,
@@ -3248,6 +3724,16 @@ impl EmbeddedAletheiaSink {
         // Struct-literal exhaustiveness marker on `CONSTRUCTS` edges (issue #443).
         let is_exhaustive_str = is_exhaustive.map(|value| if value { "true" } else { "false" });
         builder = insert_optional(builder, "is_exhaustive", is_exhaustive_str);
+        // Retained per-call-site spans on resolved `CALLS` edges (issue #462),
+        // stored as a JSON array of `SourceSpan`s, mirroring `producer_json`.
+        let call_site_spans_json = call_site_spans
+            .as_deref()
+            .and_then(|spans| serde_json::to_string(spans).ok());
+        builder = insert_optional(
+            builder,
+            "call_site_spans_json",
+            call_site_spans_json.as_deref(),
+        );
         builder = insert_temporal(builder, temporal.as_ref());
         if let Some(p) = producer
             && let Ok(json) = serde_json::to_string(p)
@@ -3286,7 +3772,7 @@ impl EmbeddedAletheiaSink {
         self.record_handles
             .insert(id.clone(), StoredRecord::Edge(edge_id));
         self.edge_seqs.insert(id.clone(), seq);
-        Ok(())
+        Ok(WriteOutcome::Inserted)
     }
 
     fn resolve_node_id(
@@ -3509,6 +3995,71 @@ impl EmbeddedAletheiaSink {
                 .map(serde_json::from_str::<Vec<RouteAnnotation>>)
                 .transpose()
                 .map_err(|e| read_back_error(record_id, format!("route_json invalid: {e}")))?,
+            // Deprecation facts (issue #249). The read MUST mirror the
+            // write: `compare_node_record` is full structural equality of the
+            // reconstructed record, so a written-but-unread property would make
+            // every re-ingest write a new physical version forever.
+            deprecated: optional_str_property(
+                record_id,
+                "deprecated_json",
+                node.get_property("deprecated_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<DeprecationMark>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("deprecated_json invalid: {e}")))?,
+            // Lint-suppression facts (issue #227). The read MUST mirror the
+            // write, for the same structural-equality reason as above.
+            lint_suppression: optional_str_property(
+                record_id,
+                "lint_suppression_json",
+                node.get_property("lint_suppression_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<LintSuppressionFacts>)
+            .transpose()
+            .map_err(|e| {
+                read_back_error(record_id, format!("lint_suppression_json invalid: {e}"))
+            })?,
+            // Conditional-compilation gates (issue #190). The read MUST
+            // mirror the write, for the same structural-equality reason as
+            // above.
+            cfg: optional_str_property(record_id, "cfg_json", node.get_property("cfg_json"))?
+                .as_deref()
+                .map(serde_json::from_str::<Vec<String>>)
+                .transpose()
+                .map_err(|e| read_back_error(record_id, format!("cfg_json invalid: {e}")))?,
+            // Entry-point facts (issue #240). The read MUST mirror the
+            // write: `compare_node_record` is full structural equality of the
+            // reconstructed record, so a written-but-unread property would make
+            // every re-ingest write a new physical version forever.
+            entry_point: optional_str_property(
+                record_id,
+                "entry_point_json",
+                node.get_property("entry_point_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<EntryPointMark>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("entry_point_json invalid: {e}")))?,
+            // Test-vs-production role (issue #238). The read MUST mirror the
+            // write, for the same structural-equality reason as above.
+            role: optional_str_property(record_id, "role_json", node.get_property("role_json"))?
+                .as_deref()
+                .map(serde_json::from_str::<SymbolRole>)
+                .transpose()
+                .map_err(|e| read_back_error(record_id, format!("role_json invalid: {e}")))?,
+            // Structural complexity (issue #162). The read MUST mirror the
+            // write, for the same structural-equality reason as above.
+            complexity: optional_str_property(
+                record_id,
+                "complexity",
+                node.get_property("complexity"),
+            )?
+            .as_deref()
+            .map(str::parse::<u32>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("complexity invalid: {e}")))?,
             // Owning-package attribution (issue #117). The read MUST mirror the
             // write: `compare_node_record` is full structural equality of the
             // reconstructed record, so a written-but-unread property would make
@@ -3538,6 +4089,17 @@ impl EmbeddedAletheiaSink {
             .transpose()
             .map_err(|e| read_back_error(record_id, format!("evidence_links_json invalid: {e}")))?,
             text: optional_str_property(record_id, "text", node.get_property("text"))?,
+            // Decision-only fields (issue #191); symmetric with `write_node`.
+            decision_text: optional_str_property(
+                record_id,
+                "decision_text",
+                node.get_property("decision_text"),
+            )?,
+            rationale_summary: optional_str_property(
+                record_id,
+                "rationale_summary",
+                node.get_property("rationale_summary"),
+            )?,
             superseded_by: optional_str_property(
                 record_id,
                 "superseded_by",
@@ -3637,6 +4199,33 @@ impl EmbeddedAletheiaSink {
             .map(serde_json::from_str::<crate::ir::ScanCoveragePayload>)
             .transpose()
             .map_err(|e| read_back_error(record_id, format!("scan_coverage_json invalid: {e}")))?
+            .map(Box::new),
+            history_replay_window: optional_str_property(
+                record_id,
+                "history_replay_window_json",
+                node.get_property("history_replay_window_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<crate::ir::HistoryReplayWindowPayload>)
+            .transpose()
+            .map_err(|e| {
+                read_back_error(
+                    record_id,
+                    format!("history_replay_window_json invalid: {e}"),
+                )
+            })?
+            .map(Box::new),
+            history_replay_tip: optional_str_property(
+                record_id,
+                "history_replay_tip_json",
+                node.get_property("history_replay_tip_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<crate::ir::HistoryReplayTipPayload>)
+            .transpose()
+            .map_err(|e| {
+                read_back_error(record_id, format!("history_replay_tip_json invalid: {e}"))
+            })?
             .map(Box::new),
             embedding_model: optional_str_property(
                 record_id,
@@ -4129,8 +4718,9 @@ impl EmbeddedAletheiaSink {
     }
 
     // A long but flat field-by-field edge reconstruction; each optional edge
-    // property (resolution, frame_resolution, frame_index, basis, is_exhaustive,
-    // …) is parsed inline, so the line count exceeds the default lint threshold.
+    // property (resolution, frame_resolution, frame_index, basis,
+    // call_site_spans_json, is_exhaustive, …) is parsed inline, so the line
+    // count exceeds the default lint threshold.
     #[allow(clippy::too_many_lines)]
     fn read_edge_record_internal(
         &self,
@@ -4229,6 +4819,18 @@ impl EmbeddedAletheiaSink {
                 )?
                 .as_deref(),
             )?,
+            call_site_spans: optional_str_property(
+                record_id,
+                "call_site_spans_json",
+                edge.get_property("call_site_spans_json"),
+            )?
+            .as_deref()
+            .map(|json| {
+                serde_json::from_str::<Vec<SourceSpan>>(json).map_err(|error| {
+                    read_back_error(record_id, format!("call_site_spans_json invalid: {error}"))
+                })
+            })
+            .transpose()?,
             temporal: temporal_from_properties(record_id, |key| edge.get_property(key))?,
             summary: required_str_property(record_id, "summary", edge.get_property("summary"))?,
             producer: optional_str_property(
@@ -4445,11 +5047,19 @@ fn source_span_from_properties<'a>(
     match (start_byte, end_byte, start_line, end_line) {
         (None, None, None, None) => Ok(None),
         (Some(start_byte), Some(end_byte), Some(start_line), Some(end_line)) => {
+            // Columns are optional extras: present when the producer recorded
+            // them, absent (UNKNOWN) on legacy records; they never participate
+            // in the all-or-nothing span check (issue #463).
+            let start_column =
+                optional_usize_property(record_id, "start_column", get("start_column"))?;
+            let end_column = optional_usize_property(record_id, "end_column", get("end_column"))?;
             Ok(Some(SourceSpan {
                 start_byte,
                 end_byte,
                 start_line,
                 end_line,
+                start_column,
+                end_column,
             }))
         }
         _ => Err(read_back_error(
@@ -4685,6 +5295,7 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "PanicRiskSite" => Ok(NodeKind::PanicRiskSite),
         "DebtMarker" => Ok(NodeKind::DebtMarker),
         "UnsafeSite" => Ok(NodeKind::UnsafeSite),
+        "LintSuppression" => Ok(NodeKind::LintSuppression),
         "Commit" => Ok(NodeKind::Commit),
         "Change" => Ok(NodeKind::Change),
         "SemanticDrift" => Ok(NodeKind::SemanticDrift),
@@ -4714,6 +5325,9 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "CommandRun" => Ok(NodeKind::CommandRun),
         "FileEdit" => Ok(NodeKind::FileEdit),
         "PatchArtifact" => Ok(NodeKind::PatchArtifact),
+        "ADR" => Ok(NodeKind::Adr),
+        "PRD" => Ok(NodeKind::Prd),
+        "PlanDoc" => Ok(NodeKind::PlanDoc),
         "Failure" => Ok(NodeKind::Failure),
         "Decision" => Ok(NodeKind::Decision),
         "TestRun" => Ok(NodeKind::TestRun),
@@ -4730,8 +5344,14 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "Constraint" => Ok(NodeKind::Constraint),
         "CostUsage" => Ok(NodeKind::CostUsage),
         "Retraction" => Ok(NodeKind::Retraction),
+        "RetirementReceipt" => Ok(NodeKind::RetirementReceipt),
+        "ReinstatementReceipt" => Ok(NodeKind::ReinstatementReceipt),
         "DependencyDeclaration" => Ok(NodeKind::DependencyDeclaration),
         "ScanCoverage" => Ok(NodeKind::ScanCoverage),
+        // History-replay window summary (issue #256).
+        "HistoryReplayWindow" => Ok(NodeKind::HistoryReplayWindow),
+        // History-replay resume marker (issue #224).
+        "HistoryReplayTip" => Ok(NodeKind::HistoryReplayTip),
         // Log-signature node kinds (issues #319 / #320).
         "LogSource" => Ok(NodeKind::LogSource),
         "ErrorSignature" => Ok(NodeKind::ErrorSignature),
@@ -4788,6 +5408,7 @@ fn parse_edge_label(record_id: &str, label: &str) -> AdapterResult<EdgeLabel> {
         "CLOSES_ACCEPTANCE_CRITERION" => Ok(EdgeLabel::ClosesAcceptanceCriterion),
         "OWNED_BY_TASK" => Ok(EdgeLabel::OwnedByTask),
         "EXTERNAL_HANDLE" => Ok(EdgeLabel::ExternalHandle),
+        "DEPENDS_ON" => Ok(EdgeLabel::DependsOn),
         "TOUCHES_FILE" => Ok(EdgeLabel::TouchesFile),
         "MERGED_AS" => Ok(EdgeLabel::MergedAs),
         "REVIEWS_COMMIT" => Ok(EdgeLabel::ReviewsCommit),
@@ -4917,11 +5538,20 @@ where
     let end_byte = usize::try_from(get("end_byte")?.as_int()?).ok()?;
     let start_line = usize::try_from(get("start_line")?.as_int()?).ok()?;
     let end_line = usize::try_from(get("end_line")?.as_int()?).ok()?;
+    // Columns are optional: legacy records carry none (issue #463).
+    let start_column = get("start_column")
+        .and_then(::aletheiadb::PropertyValue::as_int)
+        .and_then(|raw| usize::try_from(raw).ok());
+    let end_column = get("end_column")
+        .and_then(::aletheiadb::PropertyValue::as_int)
+        .and_then(|raw| usize::try_from(raw).ok());
     Some(SourceSpan {
         start_byte,
         end_byte,
         start_line,
         end_line,
+        start_column,
+        end_column,
     })
 }
 
@@ -4929,7 +5559,7 @@ fn insert_span(
     builder: ::aletheiadb::PropertyMapBuilder,
     span: SourceSpan,
 ) -> ::aletheiadb::PropertyMapBuilder {
-    builder
+    let builder = builder
         .insert(
             "start_byte",
             i64::try_from(span.start_byte).unwrap_or(i64::MAX),
@@ -4939,7 +5569,17 @@ fn insert_span(
             "start_line",
             i64::try_from(span.start_line).unwrap_or(i64::MAX),
         )
-        .insert("end_line", i64::try_from(span.end_line).unwrap_or(i64::MAX))
+        .insert("end_line", i64::try_from(span.end_line).unwrap_or(i64::MAX));
+    // Column properties are only written when the producer recorded them;
+    // their absence on read-back means UNKNOWN (issue #463).
+    let builder = match span.start_column {
+        Some(column) => builder.insert("start_column", i64::try_from(column).unwrap_or(i64::MAX)),
+        None => builder,
+    };
+    match span.end_column {
+        Some(column) => builder.insert("end_column", i64::try_from(column).unwrap_or(i64::MAX)),
+        None => builder,
+    }
 }
 
 fn insert_temporal(
@@ -5011,6 +5651,7 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::PanicRiskSite
         | NodeKind::DebtMarker
         | NodeKind::UnsafeSite
+        | NodeKind::LintSuppression
         | NodeKind::Commit
         | NodeKind::Change
         | NodeKind::SemanticDrift
@@ -5040,6 +5681,9 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::CommandRun
         | NodeKind::FileEdit
         | NodeKind::PatchArtifact
+        | NodeKind::Adr
+        | NodeKind::Prd
+        | NodeKind::PlanDoc
         | NodeKind::Failure
         | NodeKind::Decision
         | NodeKind::TestRun
@@ -5056,8 +5700,12 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::Constraint
         | NodeKind::CostUsage
         | NodeKind::Retraction
+        | NodeKind::RetirementReceipt
+        | NodeKind::ReinstatementReceipt
         | NodeKind::DependencyDeclaration
         | NodeKind::ScanCoverage
+        | NodeKind::HistoryReplayWindow
+        | NodeKind::HistoryReplayTip
         | NodeKind::LogSource
         | NodeKind::ErrorSignature
         | NodeKind::LogEvent
@@ -5180,6 +5828,81 @@ fn probe_persisted_vector_index(
         };
     }
     VectorIndexState::Absent
+}
+
+/// Deletes the persisted `embedding` vector-index artifacts for a data dir
+/// (issue #167).
+///
+/// Used when re-embedding changes the vector dimension: `AletheiaDB` 0.2.0
+/// has no API to change a loaded vector index's dimension, so the old
+/// artifacts are removed and a fresh index is enabled at the new dimension.
+/// Only the `embedding` property directory is removed — graph data, the WAL,
+/// and every other index are untouched.
+///
+/// Returns the number of property directories removed (0, 1, or 2).
+///
+/// # Errors
+///
+/// Returns the underlying [`std::io::Error`] when a directory cannot be
+/// removed.
+#[cfg(feature = "embeddings")]
+pub fn remove_persisted_vector_index(data_dir: &Path) -> std::io::Result<usize> {
+    let mut removed = 0;
+    for dir in persisted_vector_index_dirs(data_dir, EMBEDDING_INDEX_PROPERTY) {
+        if dir.is_dir() {
+            std::fs::remove_dir_all(&dir)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Builds the property PATCH that supersedes the fixed #104 identity record
+/// with a new model's identity (issue #167).
+///
+/// The identity record's shape is fixed — it is always built by
+/// [`crate::embeddings::embedding_index_identity_record`] — so patching the
+/// four model-derived properties (`name`, `summary`, `embedding_model_json`,
+/// `producer_json`) is exactly equivalent to a full node rewrite: every other
+/// property (id, kind, domain, schema version) is identical between the old
+/// and new record.
+#[cfg(feature = "embeddings")]
+fn reembed_identity_patch(
+    target_model: &EmbeddingModel,
+) -> AdapterResult<::aletheiadb::PropertyMap> {
+    let record = crate::embeddings::embedding_index_identity_record(target_model);
+    let GraphRecord::Node {
+        name,
+        summary,
+        embedding_model: Some(model),
+        producer: Some(producer),
+        ..
+    } = &record
+    else {
+        return Err(AdapterError::Rejected {
+            record_id: crate::embeddings::embedding_index_identity_id(),
+            message: "embedding_index_identity_record did not produce the expected node shape"
+                .to_owned(),
+        });
+    };
+    let mut builder = ::aletheiadb::PropertyMapBuilder::new();
+    if let Some(name) = name {
+        builder = builder.insert("name", name.as_str());
+    }
+    builder = builder.insert("summary", summary.as_str());
+    let model_json =
+        serde_json::to_string(model.as_ref()).map_err(|error| AdapterError::Rejected {
+            record_id: crate::embeddings::embedding_index_identity_id(),
+            message: format!("failed to serialize target model identity: {error}"),
+        })?;
+    builder = builder.insert("embedding_model_json", model_json.as_str());
+    let producer_json =
+        serde_json::to_string(producer).map_err(|error| AdapterError::Rejected {
+            record_id: crate::embeddings::embedding_index_identity_id(),
+            message: format!("failed to serialize identity producer: {error}"),
+        })?;
+    builder = builder.insert("producer_json", producer_json.as_str());
+    Ok(builder.build())
 }
 
 fn is_fresh_data_dir(data_dir: &Path) -> bool {
@@ -6324,6 +7047,211 @@ mod tests {
     }
 
     #[test]
+    fn history_replay_window_payload_round_trips_through_the_embedded_store() {
+        // Issue #256: a windowed `scan-history` emits a `HistoryReplayWindow`
+        // summary node; the embedded adapter must persist its payload and read
+        // it back unchanged, so a windowed store is never mistaken for full
+        // history after an ingest round trip.
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("history-window-round-trip-store");
+        let node_id = stable_id(&["node", "history-replay-window", "count", "3"]);
+        let payload = crate::ir::HistoryReplayWindowPayload {
+            window: "count".to_owned(),
+            selected_commit_count: 3,
+            max_commits: Some(3),
+            since_instant: None,
+            from_rev: None,
+            to_rev: None,
+            from_sha: None,
+            to_sha: None,
+            oldest_commit_sha: "aaa".to_owned(),
+            newest_commit_sha: "ccc".to_owned(),
+        };
+        let node = GraphRecord::node(
+            node_id,
+            NodeKind::HistoryReplayWindow,
+            None,
+            None,
+            None,
+            "windowed history replay: newest 3 commits".to_owned(),
+        )
+        .with_history_replay_window(payload);
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&node).expect("window node should write");
+        let StoredRecord::Node(stored) = sink.record_handles[node.id()] else {
+            panic!("node handle should point at a node");
+        };
+        let read_back = sink
+            .read_node_record(node.id(), stored)
+            .expect("window node should read back");
+
+        assert_eq!(
+            read_back.history_replay_window(),
+            node.history_replay_window(),
+            "history-replay window payload must survive the embedded round trip"
+        );
+        assert_eq!(read_back, node, "window node must round-trip byte-for-byte");
+    }
+
+    #[test]
+    fn history_replay_tip_payload_round_trips_through_the_embedded_store() {
+        // Issue #224: a full `scan-history` emits a `HistoryReplayTip`
+        // resume-marker node; the embedded adapter must persist its payload
+        // and read it back unchanged, so a resumed store keeps its resume
+        // frontier after an ingest round trip.
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("history-tip-round-trip-store");
+        let repository_id = stable_id(&["repository", "local-root-commit", "abc"]);
+        let node_id = stable_id(&["node", "history-replay-tip", &repository_id]);
+        let payload = crate::ir::HistoryReplayTipPayload {
+            repository_id,
+            tip_sha: "abc123".to_owned(),
+            covered_commit_count: 11,
+            tip_committed_at: "2026-01-11T00:00:00Z".to_owned(),
+        };
+        let node = GraphRecord::node(
+            node_id,
+            NodeKind::HistoryReplayTip,
+            None,
+            None,
+            None,
+            "history replay tip abc123".to_owned(),
+        )
+        .with_history_replay_tip(payload);
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&node).expect("tip node should write");
+        let StoredRecord::Node(stored) = sink.record_handles[node.id()] else {
+            panic!("node handle should point at a node");
+        };
+        let read_back = sink
+            .read_node_record(node.id(), stored)
+            .expect("tip node should read back");
+
+        assert_eq!(
+            read_back.history_replay_tip(),
+            node.history_replay_tip(),
+            "history-replay tip payload must survive the embedded round trip"
+        );
+        assert_eq!(read_back, node, "tip node must round-trip byte-for-byte");
+    }
+
+    #[test]
+    fn span_columns_round_trip_through_the_embedded_store() {
+        // Issue #463: Tree-sitter-recorded span columns must persist through
+        // the embedded adapter and read back unchanged; a legacy column-less
+        // span must read back as UNKNOWN (None), never column 0.
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("span-columns-store");
+        let file_id = stable_id(&["node", "file", "src/lib.rs"]);
+        let column_id = stable_id(&["node", "symbol", "src/lib.rs", "columnar"]);
+        let legacy_id = stable_id(&["node", "symbol", "src/lib.rs", "legacy"]);
+        let columnar = GraphRecord::symbol(
+            column_id.clone(),
+            "function",
+            "src/lib.rs".to_owned(),
+            SourceSpan {
+                start_byte: 4,
+                end_byte: 20,
+                start_line: 2,
+                end_line: 2,
+                start_column: Some(4),
+                end_column: Some(20),
+            },
+            "columnar".to_owned(),
+            "fn columnar".to_owned(),
+        );
+        let legacy = GraphRecord::symbol(
+            legacy_id.clone(),
+            "function",
+            "src/lib.rs".to_owned(),
+            SourceSpan {
+                start_byte: 0,
+                end_byte: 20,
+                start_line: 1,
+                end_line: 1,
+                start_column: None,
+                end_column: None,
+            },
+            "legacy".to_owned(),
+            "fn legacy".to_owned(),
+        );
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&file_record(&file_id, "current file"))
+            .expect("file should write");
+        sink.write_record(&columnar).expect("columnar should write");
+        sink.write_record(&legacy).expect("legacy should write");
+
+        let read_columnar = sink
+            .read_back(column_id.as_str())
+            .expect("columnar read should succeed")
+            .expect("columnar record should be found");
+        let GraphRecord::Node {
+            span: Some(span), ..
+        } = read_columnar
+        else {
+            panic!("columnar symbol should read back with a span");
+        };
+        assert_eq!(span.start_column, Some(4), "start column must survive");
+        assert_eq!(span.end_column, Some(20), "end column must survive");
+
+        let read_legacy = sink
+            .read_back(legacy_id.as_str())
+            .expect("legacy read should succeed")
+            .expect("legacy record should be found");
+        let GraphRecord::Node {
+            span: Some(span), ..
+        } = read_legacy
+        else {
+            panic!("legacy symbol should read back with a span");
+        };
+        assert_eq!(span.start_column, None, "legacy span stays UNKNOWN");
+        assert_eq!(span.end_column, None, "legacy span stays UNKNOWN");
+    }
+
+    #[test]
+    fn symbol_role_round_trips_through_the_embedded_store() {
+        // Issue #238: the test-vs-production role must persist through the
+        // embedded adapter and read back unchanged; a legacy role-less record
+        // must read back as UNKNOWN (None), never a fabricated production.
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("role-round-trip-store");
+        let file_id = stable_id(&["node", "file", "src/lib.rs"]);
+        let test_id = stable_id(&["node", "symbol", "src/lib.rs", "test_fn"]);
+        let prod_id = stable_id(&["node", "symbol", "src/lib.rs", "prod_fn"]);
+        let legacy_id = stable_id(&["node", "symbol", "src/lib.rs", "legacy_fn"]);
+        let test_sym =
+            current_symbol_record(&test_id, "test fn", 20).with_role(crate::ir::SymbolRole::Test);
+        let prod_sym = current_symbol_record(&prod_id, "prod fn", 20)
+            .with_role(crate::ir::SymbolRole::Production);
+        let legacy_sym = current_symbol_record(&legacy_id, "legacy fn", 20);
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&file_record(&file_id, "current file"))
+            .expect("file should write");
+        sink.write_record(&test_sym)
+            .expect("test symbol should write");
+        sink.write_record(&prod_sym)
+            .expect("prod symbol should write");
+        sink.write_record(&legacy_sym)
+            .expect("legacy symbol should write");
+
+        for (id, expected) in [
+            (test_id.as_str(), Some(crate::ir::SymbolRole::Test)),
+            (prod_id.as_str(), Some(crate::ir::SymbolRole::Production)),
+            (legacy_id.as_str(), None),
+        ] {
+            let read_back = sink
+                .read_back(id)
+                .expect("read should succeed")
+                .expect("record should be found");
+            assert_eq!(
+                read_back.role().copied(),
+                expected,
+                "role must survive the embedded round trip for {id}"
+            );
+        }
+    }
+
+    #[test]
     fn identical_non_temporal_node_write_is_noop() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let data_dir = temp.path().join("duplicate-exact-node-store");
@@ -6907,6 +7835,217 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn semantic_search_finds_non_temporal_version_after_temporal_reemit() {
+        // Issue #229: `eg init` ingests the tree with embeddings, then replays
+        // history which re-emits the same nodes with temporal metadata. The
+        // HNSW index keys vectors by the tree (non-temporal) versions; the
+        // temporal re-emit must not orphan them from semantic search.
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("history-reemit-semantic-store");
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "reemit"]);
+        let tree_symbol = GraphRecord::symbol(
+            symbol_id.clone(),
+            "function",
+            "src/lib.rs".to_owned(),
+            SourceSpan {
+                start_byte: 0,
+                end_byte: 20,
+                start_line: 1,
+                end_line: 1,
+                start_column: None,
+                end_column: None,
+            },
+            "stable".to_owned(),
+            "reemitted semantic symbol".to_owned(),
+        );
+        let history_symbol = symbol_record(
+            &symbol_id,
+            "reemitted semantic symbol",
+            temporal_observed("aaaaaaaa", "2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z"),
+        );
+        let mut vectors = EmbeddingVectorMap::new();
+        vectors.insert(
+            EmbeddingVectorKey::from_record(&tree_symbol).expect("symbol should be embeddable"),
+            vec![1.0, 0.0],
+        );
+
+        // Tree batch: embedded.
+        {
+            let mut sink = EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, 2)
+                .expect("semantic store should open");
+            sink.write_record(&tree_symbol)
+                .expect("tree symbol should write with an embedding");
+        }
+        // History batch: structural re-emit with temporal metadata, no vectors.
+        {
+            let mut sink =
+                EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+            sink.write_record(&history_symbol)
+                .expect("temporal re-emit should write");
+        }
+        // Semantic search must still find the symbol via its tree version.
+        {
+            let sink =
+                EmbeddedAletheiaSink::open_unleased(&data_dir).expect("embedded store should open");
+            let matches = sink
+                .semantic_search(&[1.0, 0.0], 10)
+                .expect("semantic search should succeed");
+            assert!(
+                matches.iter().any(|m| m.record_id == symbol_id),
+                "semantic search should find the symbol after temporal re-emit, got {:?}",
+                matches.iter().map(|m| &m.record_id).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Issue #199: the canonical semantic total order (score descending, then
+    /// record ID ascending) is a true total order — score dominates, ties
+    /// break on the record ID, and NaN scores take a deterministic position
+    /// via `total_cmp` instead of collapsing to `Equal`.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn compare_semantic_matches_is_a_total_order() {
+        let make = |record_id: &str, score: f32| SemanticMatch {
+            record_id: record_id.to_owned(),
+            kind: None,
+            name: None,
+            repo_relative_path: None,
+            score,
+            span: None,
+        };
+        // Score dominates: the higher-scored row sorts first.
+        assert_eq!(
+            compare_semantic_matches(&make("b", 0.9), &make("a", 0.5)),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_semantic_matches(&make("a", 0.5), &make("b", 0.9)),
+            Ordering::Greater
+        );
+        // Tied scores break by record ID ascending — observable in the output.
+        assert_eq!(
+            compare_semantic_matches(&make("b", 0.5), &make("a", 0.5)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_semantic_matches(&make("a", 0.5), &make("b", 0.5)),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_semantic_matches(&make("a", 0.5), &make("a", 0.5)),
+            Ordering::Equal
+        );
+        // NaN never collapses to Equal: `total_cmp` ranks it deterministically
+        // (above every finite score in descending order), then record ID.
+        assert_eq!(
+            compare_semantic_matches(&make("n", f32::NAN), &make("a", 1.0)),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_semantic_matches(&make("n", f32::NAN), &make("z", f32::NAN)),
+            Ordering::Less
+        );
+    }
+
+    /// Issue #199: HNSW returns equal-score hits in an unstable order, so
+    /// `semantic_search` must impose the canonical total order BEFORE the
+    /// limit truncation — otherwise tied rows swap positions run to run and
+    /// the truncation boundary keeps a varying set.
+    ///
+    /// All three symbols carry byte-identical vectors, so their cosine scores
+    /// tie exactly; insertion order is deliberately NOT record-ID order.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn semantic_search_applies_canonical_total_order_at_score_ties() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("tie-order-store");
+        let ids = ["tie/zeta", "tie/alpha", "tie/mike"];
+        let records: Vec<GraphRecord> = ids
+            .iter()
+            .map(|id| current_symbol_record(id, "tied symbol", 20))
+            .collect();
+        let mut vectors = EmbeddingVectorMap::new();
+        for record in &records {
+            vectors.insert(
+                EmbeddingVectorKey::from_record(record).expect("symbol should be embeddable"),
+                vec![1.0, 0.0],
+            );
+        }
+        {
+            let mut sink = EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, 2)
+                .expect("semantic store should open");
+            for record in &records {
+                sink.write_record(record).expect("tied symbol should write");
+            }
+        }
+        let sink =
+            EmbeddedAletheiaSink::open_unleased(&data_dir).expect("embedded store should open");
+        let matches = sink
+            .semantic_search(&[1.0, 0.0], 10)
+            .expect("semantic search should succeed");
+        let order: Vec<&str> = matches.iter().map(|m| m.record_id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["tie/alpha", "tie/mike", "tie/zeta"],
+            "tied scores must break by record ID ascending, got {order:?}"
+        );
+    }
+
+    /// Issue #199: the same semantic query against an unchanged store must
+    /// return byte-identical ordered rows (record ID, score bits, span) on
+    /// every run — the regression pin for the cross-run stability contract.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn semantic_search_is_byte_stable_across_repeated_runs() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("stability-store");
+        let ids = ["tie/zeta", "tie/alpha", "tie/mike", "tie/beta"];
+        let records: Vec<GraphRecord> = ids
+            .iter()
+            .map(|id| current_symbol_record(id, "tied symbol", 20))
+            .collect();
+        let mut vectors = EmbeddingVectorMap::new();
+        for record in &records {
+            vectors.insert(
+                EmbeddingVectorKey::from_record(record).expect("symbol should be embeddable"),
+                vec![1.0, 0.0],
+            );
+        }
+        {
+            let mut sink = EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, 2)
+                .expect("semantic store should open");
+            for record in &records {
+                sink.write_record(record).expect("tied symbol should write");
+            }
+        }
+        let sink =
+            EmbeddedAletheiaSink::open_unleased(&data_dir).expect("embedded store should open");
+        let fingerprint = |matches: &[SemanticMatch]| {
+            matches
+                .iter()
+                .map(|m| (m.record_id.clone(), m.score.to_bits(), m.span))
+                .collect::<Vec<_>>()
+        };
+        let reference = fingerprint(
+            &sink
+                .semantic_search(&[1.0, 0.0], 10)
+                .expect("semantic search should succeed"),
+        );
+        for run in 0..20 {
+            let rows = fingerprint(
+                &sink
+                    .semantic_search(&[1.0, 0.0], 10)
+                    .expect("semantic search should succeed"),
+            );
+            assert_eq!(
+                rows, reference,
+                "run {run}: semantic results must be byte-identical across runs"
+            );
+        }
+    }
+
     #[test]
     fn read_back_until_honors_expired_deadline_before_edge_scan() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -6954,6 +8093,8 @@ mod tests {
                 end_byte,
                 start_line: 1,
                 end_line: 1,
+                start_column: None,
+                end_column: None,
             },
             "stable".to_owned(),
             summary.to_owned(),
@@ -6970,6 +8111,8 @@ mod tests {
                 end_byte: 20,
                 start_line: 1,
                 end_line: 1,
+                start_column: None,
+                end_column: None,
             },
             "stable".to_owned(),
             summary.to_owned(),
@@ -7815,6 +8958,80 @@ mod tests {
         assert_latest_edge_wins(&sink);
     }
 
+    #[test]
+    fn edge_call_site_spans_round_trip_through_embedded_store() {
+        // Issue #462: the retained per-call-site spans on a resolved CALLS
+        // edge must survive the embedded store's property encoding, so a
+        // re-ingest and a read-back both preserve them.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let data_dir = temp.path().join("call-site-spans-store");
+        let source_symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "caller"]);
+        let target_symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "callee"]);
+        let spans = vec![
+            SourceSpan {
+                start_byte: 10,
+                end_byte: 16,
+                start_line: 2,
+                end_line: 2,
+                start_column: None,
+                end_column: None,
+            },
+            SourceSpan {
+                start_byte: 40,
+                end_byte: 46,
+                start_line: 5,
+                end_line: 5,
+                start_column: None,
+                end_column: None,
+            },
+        ];
+        let edge = GraphRecord::edge(
+            EdgeLabel::Calls,
+            source_symbol_id.clone(),
+            target_symbol_id.clone(),
+            Some("1.0".to_owned()),
+            "caller calls callee".to_owned(),
+        )
+        .with_resolution(crate::ir::CallResolution::Resolved)
+        .with_call_site_spans(spans.clone());
+        let edge_id = edge.id().to_owned();
+
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&current_symbol_record(
+            &source_symbol_id,
+            "caller symbol",
+            10,
+        ))
+        .expect("caller should write");
+        sink.write_record(&current_symbol_record(
+            &target_symbol_id,
+            "callee symbol",
+            10,
+        ))
+        .expect("callee should write");
+        sink.write_record(&edge).expect("edge should write");
+
+        let assert_spans_round_tripped = |sink: &EmbeddedAletheiaSink| {
+            let round_tripped = sink
+                .read_all_records()
+                .expect("read_all_records should succeed")
+                .into_iter()
+                .find(|record| record.id() == edge_id)
+                .expect("edge must appear in read_all_records");
+            assert_eq!(
+                round_tripped.call_site_spans(),
+                Some(spans.as_slice()),
+                "call-site spans must survive the embedded round-trip"
+            );
+        };
+        assert_spans_round_tripped(&sink);
+
+        // Reopen: the spans must survive a rebuild from persisted properties.
+        drop(sink);
+        let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+        assert_spans_round_tripped(&sink);
+    }
+
     fn temporal_observed(
         git_commit: &str,
         valid_time: &str,
@@ -8165,5 +9382,78 @@ mod tests {
         assert_eq!(unknown.version.domain, "codegraph");
         assert_eq!(unknown.version.kind, "NewFutureKind");
         assert_eq!(unknown.version.version, future);
+    }
+
+    /// Regression test: re-ingesting the tree batch after a history ingest
+    /// must verify cleanly. The history batch re-emits tree edges (DEFINES,
+    /// CONTAINS) with temporal metadata under the same stable IDs, so a
+    /// store holds two physical versions of one edge ID. On re-ingest the
+    /// tree edge's write is correctly skipped as `Matched`, and verification
+    /// must re-check that `Matched` condition — not compare the tree record
+    /// against `read_back`, which prefers the temporal history version and
+    /// used to fail every such re-ingest with "record mismatch" (this broke
+    /// `eg init` rebuilds and any `eg ingest` of a changed tree after a
+    /// history ingest).
+    #[test]
+    fn tree_reingest_after_history_ingest_verifies_skipped_edges() {
+        use crate::adapters::ingest_records;
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("tree-history-reingest-store");
+        let file_id = stable_id(&["node", "file", "src/lib.rs"]);
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "stable"]);
+
+        let tree_edge = GraphRecord::edge(
+            EdgeLabel::Defines,
+            file_id.clone(),
+            symbol_id.clone(),
+            Some("1.0".to_owned()),
+            "defines edge".to_owned(),
+        );
+        let history_edge = tree_edge.clone().with_temporal(temporal_observed(
+            "deadbeef",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:01Z",
+        ));
+        assert_eq!(
+            tree_edge.id(),
+            history_edge.id(),
+            "history replay re-emits tree edges under the same stable ID"
+        );
+
+        let tree_batch = vec![
+            file_record(&file_id, "file"),
+            current_symbol_record(&symbol_id, "symbol", 10),
+            tree_edge,
+        ];
+        // The history batch re-emits the same edge with temporal metadata.
+        let history_batch = vec![history_edge];
+
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        let tree_report = ingest_records(&tree_batch, &mut sink);
+        assert_eq!(
+            tree_report.failed, 0,
+            "tree batch should ingest cleanly: {:?}",
+            tree_report.failures
+        );
+        let history_report = ingest_records(&history_batch, &mut sink);
+        assert_eq!(
+            history_report.failed, 0,
+            "history batch should ingest cleanly: {:?}",
+            history_report.failures
+        );
+
+        // Re-ingest the unchanged tree batch, as `eg init` does on rebuild:
+        // the edge write is skipped as Matched and verification must pass.
+        // Drop the first sink to release the exclusive write lease.
+        drop(sink);
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+        let reingest_report = ingest_records(&tree_batch, &mut sink);
+        assert_eq!(
+            reingest_report.failed, 0,
+            "tree re-ingest after history ingest should verify cleanly: {:?}",
+            reingest_report.failures
+        );
+        assert_eq!(reingest_report.succeeded, tree_batch.len());
     }
 }

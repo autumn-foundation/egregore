@@ -66,6 +66,8 @@ fn seed_records() -> Vec<GraphRecord> {
                 end_byte: 20,
                 start_line: 1,
                 end_line: 1,
+                start_column: None,
+                end_column: None,
             },
             "contended".to_owned(),
             "contended target symbol".to_owned(),
@@ -106,6 +108,7 @@ fn observation_batch(writer: usize) -> (String, Vec<GraphRecord>) {
             target_span: None,
             target_git_commit: None,
         }],
+        supersession: None,
     };
     let outcome = build_observation_records(&req).expect("observation batch should build");
     (outcome.record_id, outcome.records)

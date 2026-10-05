@@ -1523,6 +1523,12 @@ fn make_node(
         None
     };
     GraphRecord::Node {
+        deprecated: None,
+        lint_suppression: None,
+        cfg: None,
+        entry_point: None,
+        role: None,
+        complexity: None,
         id,
         kind,
         schema_version: extra
@@ -1548,6 +1554,10 @@ fn make_node(
         author_name: None,
         author_email: None,
         text: extra.text,
+        // Issue #191: decision-only fields; this importer never emits
+        // Decision records.
+        decision_text: None,
+        rationale_summary: None,
         superseded_by: None,
         agent_id: Some(IMPORTER_ID.to_owned()),
         agent_kind: extra.agent_kind.or_else(|| Some("claude-code".to_owned())),
@@ -1642,6 +1652,8 @@ fn make_node(
         dependency: None,
         log: None,
         scan_coverage: None,
+        history_replay_window: None,
+        history_replay_tip: None,
         embedding_model: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: None,
@@ -1667,6 +1679,7 @@ fn make_edge(
         frame_resolution: None,
         frame_index: None,
         basis: None,
+        call_site_spans: None,
         is_exhaustive: None,
         temporal: None,
         summary: summary.to_owned(),

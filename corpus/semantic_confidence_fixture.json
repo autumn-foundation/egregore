@@ -1,0 +1,60 @@
+{
+  "abstain_case": {
+    "expected_verdict": "abstain",
+    "query": "how does the system send email notifications to users",
+    "ranked_hits": [
+      {
+        "record_id": "codegraph:v10:d8227d894265f6c3da2afecedc13bbd1cc04917a2256f7ff225c490e6e944ee0",
+        "score": 0.1445
+      },
+      {
+        "record_id": "codegraph:v10:5a334a025c30f2a9da8d3a591a49190d7eb0d4cd50c935eabadd0b38aecd8e51",
+        "score": 0.1223
+      },
+      {
+        "record_id": "codegraph:v10:37fd385c1e162c8a36fa34d76f2e4fc23602a4f392a27e5ffa996cb4082f5891",
+        "score": 0.1136
+      }
+    ]
+  },
+  "confident_case": {
+    "expected_verdict": "confident",
+    "query": "what error is returned when the embedded store directory does not exist",
+    "ranked_hits": [
+      {
+        "record_id": "codegraph:v10:7e2474e96e9ba3e658034ae8249cad9973ce89c8497f5663a2dca7888428dc4b",
+        "score": 0.6191
+      },
+      {
+        "record_id": "codegraph:v10:daac3dc6e4b8beb7f1cac487f505ee24530129ef36bbc439aceb94a2b2313b85",
+        "score": 0.6626
+      },
+      {
+        "record_id": "codegraph:v10:f8580f72ecd22989e593fe86d6a1c22dcf4de0728b31f589f12c12ae5fdf0eca",
+        "score": 0.6603
+      }
+    ]
+  },
+  "confident_threshold": 0.39,
+  "derivation": "Measured 2026-09-23 on a full-repo graph (15,098 File/Symbol candidates - the exact candidate_from_record population - embedded with all-MiniLM-L6-v2 via sentence-transformers, exact candidate_text format). 27 answerable queries from corpus/semantic_relevance_corpus.json, 20 unanswerable (5 ambiguous + 15 held-out from corpus/semantic_confidence_unanswerable.json). With confident>=0.39: 24/27 answerable (88.9%) classify confident, meeting the >=85% bar. With weak>=0.34: 19/20 unanswerable (95.0%) classify weak/abstain, meeting the >=90% bar. The candidate 0.55/0.50 thresholds were rejected: only 3/27 answerable (11%) scored >=0.55. This supersedes the flawed 2026-09-22 measurement, which embedded every node with non-empty text (4,501 nodes including Diagnostics/PanicRiskSites) and omitted src/cli/mod.rs, claiming 23/27 (85.2%) and 18/20 (90%). Scores are max cosine similarities per query; the fixture cases are q016 (confident, 0.6191), q025 (weak, 0.3525), u01 (abstain, 0.1445).",
+  "selection_basis": "corpus_calibrated_confidence_floor",
+  "weak_case": {
+    "expected_verdict": "weak",
+    "query": "which file handles network authentication and authorization for remote services",
+    "ranked_hits": [
+      {
+        "record_id": "codegraph:v10:57a38009844f41f2ca5858ae11a04f3fde465a7f9d5f50e391d4584b8fd490a3",
+        "score": 0.3525
+      },
+      {
+        "record_id": "codegraph:v10:cb15c3546ec083dae431570d69e5075785b8ea3ce1565cb53458dd1431191f52",
+        "score": 0.3086
+      },
+      {
+        "record_id": "codegraph:v10:08ce49efce956a4a36f3b59279d6bf5aa99bf0b58e5b79a34af9d1687a81f139",
+        "score": 0.3035
+      }
+    ]
+  },
+  "weak_threshold": 0.34
+}

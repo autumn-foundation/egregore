@@ -105,10 +105,38 @@ pub(crate) fn embedded_write_open_error(data_dir: &Path, error: AdapterError) ->
         println!("{envelope}");
         return anyhow::anyhow!("{error}");
     }
-    anyhow::Error::new(error).context(format!(
-        "failed to open embedded store {}",
-        data_dir.display()
-    ))
+    // Issue #54: machine-readable envelopes for the encrypted-store refusals.
+    // The `message` already names the diagnosis and remedy; the envelope adds
+    // the stable code for programmatic handling. Key material is never echoed.
+    let (code, message) = match &error {
+        AdapterError::StorageModeMismatch { message, .. } => {
+            (crate::encrypted_store::STORAGE_MODE_MISMATCH_CODE, message)
+        }
+        AdapterError::EncryptedStoreKeyUnavailable { message, .. } => (
+            crate::encrypted_store::ENCRYPTED_STORE_KEY_UNAVAILABLE_CODE,
+            message,
+        ),
+        AdapterError::EncryptedStoreKeyError { message, .. } => (
+            crate::encrypted_store::ENCRYPTED_STORE_KEY_ERROR_CODE,
+            message,
+        ),
+        _ => {
+            return anyhow::Error::new(error).context(format!(
+                "failed to open embedded store {}",
+                data_dir.display()
+            ));
+        }
+    };
+    let envelope = serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": code,
+            "message": message,
+            "data_dir": data_dir.display().to_string(),
+        },
+    });
+    println!("{envelope}");
+    anyhow::anyhow!("{error}")
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -120,10 +148,45 @@ pub(crate) fn ingest(
     session_id: &str,
     idempotency_key: Option<&str>,
     #[cfg(feature = "embeddings")] embed: bool,
+    #[cfg(feature = "embeddings")] embed_model: Option<String>,
     #[cfg(feature = "embedded-aletheiadb")] force: bool,
+    // Encrypted local store mode (issue #54): creation-time opt-in.
+    #[cfg(feature = "embedded-aletheiadb")] encrypted: bool,
+    #[cfg(feature = "embedded-aletheiadb")] key_file: Option<&Path>,
+    #[cfg(feature = "embedded-aletheiadb")] passphrase_env: Option<&str>,
+    // Dangling cross-domain evidence citation policy (issue #241).
+    dangling_citation_policy: DanglingCitationPolicy,
 ) -> Result<()> {
+    // Resolve the data directory: explicit `--data-dir` > `egregore.toml` >
+    // `.egregore` (issue #261). Discovery fails fast on a malformed config
+    // before the graph is read, so a bad config never yields a half-ingested
+    // store.
+    let data_dir = resolve_data_dir(data_dir);
+
     #[cfg(not(feature = "embedded-aletheiadb"))]
     let _ = (data_dir, agent_id, session_id, idempotency_key);
+
+    // Encrypted local store mode (issue #54): validate the flag combination
+    // before touching the store. The key source is pinned at creation; the
+    // flags are refused for non-embedded adapters and refused without
+    // `--encrypted`.
+    #[cfg(feature = "embedded-aletheiadb")]
+    if !encrypted && (key_file.is_some() || passphrase_env.is_some()) {
+        anyhow::bail!(
+            "--key-file/--passphrase-env require --encrypted; refusing to ignore key material silently"
+        );
+    }
+    #[cfg(feature = "embedded-aletheiadb")]
+    if encrypted && adapter != IngestAdapter::Embedded {
+        anyhow::bail!("--encrypted requires --adapter embedded");
+    }
+    #[cfg(feature = "embedded-aletheiadb")]
+    let enable_encryption_key_source = if encrypted {
+        crate::encrypted_store::prepare_encrypted_ingest(&data_dir, key_file, passphrase_env)
+            .map_err(|error| embedded_write_open_error(&data_dir, error.to_adapter_error()))?
+    } else {
+        None
+    };
 
     #[cfg(feature = "embeddings")]
     if embed && adapter != IngestAdapter::Embedded {
@@ -138,11 +201,10 @@ pub(crate) fn ingest(
     let report = match adapter {
         IngestAdapter::DryRun => {
             let mut sink = DryRunSink::default();
-            ingest_records(&records, &mut sink)
+            ingest_records_with_policy(&records, &mut sink, dangling_citation_policy)
         }
         #[cfg(feature = "embedded-aletheiadb")]
         IngestAdapter::Embedded => {
-            let data_dir = data_dir.map_or_else(|| PathBuf::from(".egregore"), Path::to_path_buf);
             // Capacity preflight (issue #439): refuse fast BEFORE opening the
             // store when a graph is estimated to overflow the configured
             // string-interner cap, rather than writing for a long time and
@@ -162,7 +224,13 @@ pub(crate) fn ingest(
             }
             #[cfg(feature = "embeddings")]
             let mut sink = if embed {
-                let (vectors, dimensions, model) = generate_embeddings(&records)?;
+                // Resolve the embedding model (issue #261): `--embed-model` >
+                // `[embeddings].model` > built-in default. The resolved name is
+                // what the embedder loads AND what the vector-index identity
+                // records, so a config-pinned model is honored and described
+                // honestly instead of refused.
+                let (embed_model, _) = resolve_embed_model(embed_model);
+                let (vectors, dimensions, model) = generate_embeddings(&records, &embed_model)?;
                 let sink =
                     EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, dimensions)
                         .map_err(|error| embedded_write_open_error(&data_dir, error))?;
@@ -184,7 +252,15 @@ pub(crate) fn ingest(
             #[cfg(not(feature = "embeddings"))]
             let mut sink = EmbeddedAletheiaSink::open(&data_dir)
                 .map_err(|error| embedded_write_open_error(&data_dir, error))?;
-            let report = ingest_records(&records, &mut sink);
+            // Issue #54: fresh store + --encrypted — flip the engine's
+            // durable encryption authority, then the marker is written inside
+            // `enable_store_encryption`. Must happen before any record is
+            // written so the store is encrypted from the first byte.
+            if let Some(key_source) = &enable_encryption_key_source {
+                sink.enable_store_encryption(key_source)
+                    .map_err(|error| embedded_write_open_error(&data_dir, error))?;
+            }
+            let report = ingest_records_with_policy(&records, &mut sink, dangling_citation_policy);
             // A capacity overflow surfaced as a per-record write failure is
             // fatal (never a generic exit-1 failure): a partial store whose
             // interner is at the cap cannot be persisted.
@@ -223,14 +299,20 @@ pub(crate) fn ingest(
         }
         #[cfg(feature = "embedded-aletheiadb")]
         IngestAdapter::Daemon => {
-            let data_dir = data_dir.map_or_else(|| PathBuf::from(".egregore"), Path::to_path_buf);
             let idempotency_key =
                 idempotency_key.context("--idempotency-key is required for --adapter daemon")?;
             let client = DaemonClient::from_data_dir(&data_dir)
                 .with_context(|| format!("failed to load daemon for {}", data_dir.display()))?;
-            let response =
-                client.ingest_records(&records, agent_id, session_id, idempotency_key)?;
+            let response = client.ingest_records(
+                &records,
+                agent_id,
+                session_id,
+                idempotency_key,
+                dangling_citation_policy,
+            )?;
             println!("attempted: {}", response.attempted);
+            println!("inserted: {}", response.inserted);
+            println!("unchanged: {}", response.unchanged);
             println!("succeeded: {}", response.succeeded);
             println!("failed: {}", response.failed);
             println!("idempotent: {}", response.idempotent);
@@ -244,7 +326,14 @@ pub(crate) fn ingest(
         }
     };
 
+    // Upsert summary (issue #130): `inserted` counts records newly written by
+    // this ingest, `unchanged` counts records skipped because the sink already
+    // held byte-identical state. A no-op re-ingest of an unchanged source
+    // reports `inserted: 0` / `unchanged: N` instead of silent `+N` growth.
+    // `succeeded` is kept as the `inserted + unchanged` total for back-compat.
     println!("attempted: {}", report.attempted);
+    println!("inserted: {}", report.inserted);
+    println!("unchanged: {}", report.unchanged);
     println!("succeeded: {}", report.succeeded);
     println!("failed: {}", report.failed);
 

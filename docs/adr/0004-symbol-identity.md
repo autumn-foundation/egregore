@@ -49,9 +49,12 @@ stable_id([
 ])
 ```
 
-`span.start_byte`, `span.end_byte`, `span.start_line`, and `span.end_line` are
-explicitly rejected as identity inputs. They remain on every `Symbol` record as
-non-identity fields so queries can return file coordinates.
+`span.start_byte`, `span.end_byte`, `span.start_line`, `span.end_line`,
+`span.start_column`, and `span.end_column` are explicitly rejected as identity
+inputs. They remain on every `Symbol` record as non-identity fields so queries
+can return file coordinates. (Columns were added by issue #463 as optional
+Tree-sitter byte-offset coordinates; like the other span fields, they are
+coordinates, never identity.)
 
 ## Disambiguator Algorithm
 

@@ -16,17 +16,26 @@
 //! current-state read/serving lane drops the repo. Provenance survives in the
 //! eviction event, which references the evicted identity as a string handle.
 //!
-//! # Scan-history temporal residual
+//! # Scan-history temporal snapshots (issue #472)
 //!
 //! On a NON-temporal (`eg scan`) store a base-ID tombstone fully suppresses every
 //! evicted record from every current-state read. On a `scan-history` (temporal)
 //! store the shared `read_all_records` re-emits every commit-anchored code
 //! snapshot with NO tombstone check — the same read path that serves issue #231
 //! `forget`'s deliberate `--at`-after-deletion bi-temporal honesty — so a base-ID
-//! tombstone CANNOT suppress commit-anchored code snapshots from the HEAD-anchored
-//! current-state code lanes. The plan therefore discloses those still-visible
-//! snapshots under `temporal_snapshots_retained` (empty on a non-temporal store)
-//! rather than silently leaking them. See `docs/cli/forget-repo.md`.
+//! tombstone alone CANNOT suppress commit-anchored code snapshots.
+//!
+//! Eviction tombstones are SELF-VERIFYING and distinguishable from ordinary
+//! `forget` tombstones without a schema change: a tombstone is an eviction
+//! tombstone iff its own ID equals [`eviction_tombstone_id`] recomputed from its
+//! target (see [`is_eviction_tombstone`]). Current-state serving paths consult
+//! [`active_eviction_tombstoned_ids`] and suppress the targets' temporal
+//! snapshots — the bytes stay in the store for `--at <commit>` history views,
+//! but no current-state lane (`query symbol`/`symbols`/`context`, the `inspect`
+//! serving view) surfaces them. Ordinary `forget` tombstones keep the issue #231
+//! temporal exemption. The eviction report still discloses the history-retained
+//! snapshots under `temporal_snapshots_retained` (empty on a non-temporal store).
+//! See `docs/cli/forget-repo.md`.
 //!
 //! # Cross-domain attribution
 //!
@@ -327,13 +336,62 @@ fn is_eviction_event(record: &GraphRecord) -> bool {
 /// idempotent no-op: the resolution index is built with these tombstones stripped,
 /// so a re-run finds the surviving eviction EVENT (never a second tombstone pass)
 /// even though the identity node is now tombstoned for every serving lane.
+///
+/// Public for issue #472: current-state serving paths use this to distinguish
+/// repository-eviction tombstones (which suppress evicted temporal snapshots)
+/// from ordinary `forget` tombstones (which keep the issue #231 temporal
+/// exemption). The check is self-verifying — no schema field, no summary marker.
 #[must_use]
-fn is_eviction_tombstone(record: &GraphRecord) -> bool {
+pub fn is_eviction_tombstone(record: &GraphRecord) -> bool {
     matches!(
         record,
         GraphRecord::Tombstone { id, deleted_id, .. }
             if id == &eviction_tombstone_id(deleted_id).0
     )
+}
+
+/// Returns the set of record IDs currently suppressed by an ACTIVE
+/// repository-eviction tombstone (issue #472).
+///
+/// A record ID is included only when an eviction tombstone (self-verifying via
+/// [`is_eviction_tombstone`]) is the ID's latest write: a later node/edge write
+/// of the same ID (re-ingest) revives it under latest-write-wins and the ID is
+/// not reported. Ordinary `forget` tombstones are never included — they keep
+/// the issue #231 temporal exemption.
+///
+/// `records` must be in append (write) order, as produced by
+/// `EmbeddedAletheiaSink::read_all_records` and `--graph` JSONL inputs.
+#[must_use]
+pub fn active_eviction_tombstoned_ids(
+    records: &[GraphRecord],
+) -> std::collections::HashSet<String> {
+    use std::collections::HashMap;
+    // Greatest append index of a node/edge write per ID (cross-kind, mirrors
+    // `query::Liveness`).
+    let mut last_write: HashMap<&str, usize> = HashMap::new();
+    // Greatest append index of an EVICTION tombstone per deleted ID.
+    let mut last_eviction_tomb: HashMap<&str, usize> = HashMap::new();
+    for (index, record) in records.iter().enumerate() {
+        match record {
+            GraphRecord::Node { id, .. } | GraphRecord::Edge { id, .. } => {
+                last_write.insert(id.as_str(), index);
+            }
+            GraphRecord::Tombstone { deleted_id, .. } => {
+                if is_eviction_tombstone(record) {
+                    last_eviction_tomb.insert(deleted_id.as_str(), index);
+                }
+            }
+        }
+    }
+    last_eviction_tomb
+        .into_iter()
+        .filter(|(deleted_id, tomb_index)| {
+            last_write
+                .get(deleted_id)
+                .is_none_or(|&write_index| *tomb_index > write_index)
+        })
+        .map(|(deleted_id, _)| deleted_id.to_owned())
+        .collect()
 }
 
 /// Classifies an [`EdgeLabel`] as a cross-domain evidence/provenance edge the
@@ -347,7 +405,7 @@ fn is_eviction_tombstone(record: &GraphRecord) -> bool {
 const fn is_evidence_edge(label: EdgeLabel) -> bool {
     use EdgeLabel::{
         Aggregates, AuthoredBy, Calls, CapturedFrom, ChangedIn, ClosesAcceptanceCriterion,
-        Constructs, Contains, Contradicts, DecidedOn, Defines, DriftsFrom, DriftsPrior,
+        Constructs, Contains, Contradicts, DecidedOn, Defines, DependsOn, DriftsFrom, DriftsPrior,
         EmittedDuring, ExplainsChange, ExternalHandle, FailedOn, FingerprintedAs, FrameResolvesTo,
         HasEvidence, Implements, Imports, MaterializedAs, MeasuredBy, Mentions, MentionsSymbol,
         MergedAs, Observes, OwnedByTask, ParentOf, ProducedEvidence, ProducedPatch, PromptedFor,
@@ -367,6 +425,7 @@ const fn is_evidence_edge(label: EdgeLabel) -> bool {
         | ClosesAcceptanceCriterion
         | OwnedByTask
         | ExternalHandle
+        | DependsOn
         | TouchesFile
         | MergedAs
         | ReviewsCommit
@@ -1052,6 +1111,82 @@ mod tests {
         );
         // Distinct from the target's own ID and stably namespaced in-domain.
         assert_ne!(eviction_tombstone_id(&target).0, target);
+    }
+
+    #[test]
+    fn active_eviction_tombstoned_ids_suppresses_only_eviction_tombstones() {
+        // An eviction tombstone suppresses its target; an ordinary `forget`
+        // tombstone (non-matching ID) does not — issue #472 vs #231.
+        let target = stable_id(&["node", "symbol", "evicted"]);
+        let ordinary_target = stable_id(&["node", "symbol", "forgotten"]);
+        let (eviction_id, version) = eviction_tombstone_id(&target);
+        let node = GraphRecord::node(
+            target.clone(),
+            crate::ir::NodeKind::Symbol,
+            None,
+            None,
+            Some("evicted".to_owned()),
+            "symbol evicted".to_owned(),
+        );
+        let ordinary_node = GraphRecord::node(
+            ordinary_target.clone(),
+            crate::ir::NodeKind::Symbol,
+            None,
+            None,
+            Some("forgotten".to_owned()),
+            "symbol forgotten".to_owned(),
+        );
+        let eviction_tombstone = GraphRecord::Tombstone {
+            id: eviction_id,
+            schema_version: version,
+            deleted_id: target.clone(),
+            summary: "evicted".to_owned(),
+            producer: None,
+        };
+        let ordinary_tombstone = GraphRecord::Tombstone {
+            id: format!("codegraph:v9:ordinary_{ordinary_target}"),
+            schema_version: 9,
+            deleted_id: ordinary_target.clone(),
+            summary: "forgotten".to_owned(),
+            producer: None,
+        };
+        let records = vec![node, ordinary_node, eviction_tombstone, ordinary_tombstone];
+        let suppressed = active_eviction_tombstoned_ids(&records);
+        assert!(suppressed.contains(&target));
+        assert!(!suppressed.contains(&ordinary_target));
+    }
+
+    #[test]
+    fn active_eviction_tombstoned_ids_reingest_revives_target() {
+        // Latest-write-wins: a node re-ingested AFTER its eviction tombstone
+        // revives the ID — it is no longer suppressed.
+        let target = stable_id(&["node", "symbol", "revived"]);
+        let (eviction_id, version) = eviction_tombstone_id(&target);
+        let node = GraphRecord::node(
+            target.clone(),
+            crate::ir::NodeKind::Symbol,
+            None,
+            None,
+            Some("revived".to_owned()),
+            "symbol revived".to_owned(),
+        );
+        let eviction_tombstone = GraphRecord::Tombstone {
+            id: eviction_id,
+            schema_version: version,
+            deleted_id: target.clone(),
+            summary: "evicted".to_owned(),
+            producer: None,
+        };
+        let reingested = GraphRecord::node(
+            target,
+            crate::ir::NodeKind::Symbol,
+            None,
+            None,
+            Some("revived".to_owned()),
+            "symbol revived".to_owned(),
+        );
+        let records = vec![node, eviction_tombstone, reingested];
+        assert!(active_eviction_tombstoned_ids(&records).is_empty());
     }
 
     #[test]

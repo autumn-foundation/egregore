@@ -14,8 +14,8 @@ use anyhow::Result;
 // leading `::` disambiguates from `crate::scip`.
 use ::scip::symbol::format_symbol;
 use ::scip::types::{
-    Descriptor, Document, Index, Metadata, Occurrence, Package, Signature, Symbol,
-    SymbolInformation, SymbolRole, TextEncoding, ToolInfo, descriptor, symbol_information,
+    Descriptor, Document, Index, Metadata, Occurrence, Package, PositionEncoding, Signature,
+    Symbol, SymbolInformation, SymbolRole, TextEncoding, ToolInfo, descriptor, symbol_information,
 };
 use protobuf::MessageField;
 use std::collections::BTreeMap;
@@ -184,6 +184,10 @@ pub fn build_index(records: &[GraphRecord], project_root: &str, tool_version: &s
             relative_path: path,
             occurrences,
             symbols,
+            // Tree-sitter columns are UTF-8 byte offsets from line start
+            // (issue #463); declare it so consumers interpret `character`
+            // values correctly.
+            position_encoding: PositionEncoding::UTF8CodeUnitOffsetFromLineStart.into(),
             ..Default::default()
         });
     }
@@ -383,15 +387,29 @@ fn build_symbol_information(
     }
 }
 
-/// Builds a whole-line definition `Occurrence` from a 1-based `SourceSpan`.
+/// Builds a definition `Occurrence` from a 1-based `SourceSpan` (issue #463).
 ///
-/// SCIP ranges are 0-based; the range is `[start_line-1, 0, end_line, 0]`
-/// (column 0, no source re-read — column precision is a follow-up).
+/// SCIP ranges are 0-based and half-open. When the extractor recorded columns
+/// (`SourceSpan.start_column` / `end_column`), the range is column-precise:
+/// `[start_line-1, start_col, end_line-1, end_col]`, interpreted under the
+/// document's `UTF8CodeUnitOffsetFromLineStart` position encoding. Legacy or
+/// non-tree-sitter spans carry no columns and degrade honestly to the
+/// whole-line fallback `[start_line-1, 0, end_line, 0]`. No source is
+/// re-read either way.
 fn build_occurrence(moniker: &str, span: &SourceSpan) -> Occurrence {
+    fn col(value: usize) -> i32 {
+        i32::try_from(value).unwrap_or(i32::MAX)
+    }
     let start_line = i32::try_from(span.start_line.saturating_sub(1)).unwrap_or(i32::MAX);
-    let end_line = i32::try_from(span.end_line).unwrap_or(i32::MAX);
+    let range = if let (Some(start_col), Some(end_col)) = (span.start_column, span.end_column) {
+        let end_line = i32::try_from(span.end_line.saturating_sub(1)).unwrap_or(i32::MAX);
+        vec![start_line, col(start_col), end_line, col(end_col)]
+    } else {
+        let end_line = i32::try_from(span.end_line).unwrap_or(i32::MAX);
+        vec![start_line, 0, end_line, 0]
+    };
     Occurrence {
-        range: vec![start_line, 0, end_line, 0],
+        range,
         symbol: moniker.to_string(),
         symbol_roles: SymbolRole::Definition as i32,
         ..Default::default()
@@ -454,6 +472,25 @@ mod tests {
             end_byte: 1,
             start_line,
             end_line,
+            // No columns recorded: legacy / non-tree-sitter provenance.
+            start_column: None,
+            end_column: None,
+        }
+    }
+
+    fn span_with_columns(
+        start_line: usize,
+        start_column: usize,
+        end_line: usize,
+        end_column: usize,
+    ) -> SourceSpan {
+        SourceSpan {
+            start_byte: 0,
+            end_byte: 1,
+            start_line,
+            end_line,
+            start_column: Some(start_column),
+            end_column: Some(end_column),
         }
     }
 
@@ -582,13 +619,69 @@ mod tests {
     fn definition_ranges_are_line_span_zero_based() {
         let export = build_index(&fixture(), "widget", "0.0.0");
         let doc = &export.index.documents[0];
-        // Widget: lines 3..=10 → [2, 0, 10, 0].
+        // Widget: lines 3..=10, no columns recorded → whole-line fallback
+        // [2, 0, 10, 0] (issue #463: legacy spans degrade honestly).
         let widget = doc
             .occurrences
             .iter()
             .find(|o| o.symbol.contains("Widget#"))
             .expect("Widget occurrence");
         assert_eq!(widget.range, vec![2, 0, 10, 0]);
+    }
+
+    #[test]
+    fn definition_ranges_are_column_precise_when_columns_recorded() {
+        // A definition whose extractor recorded columns emits the exact
+        // identifier span, half-open and 0-based (issue #463).
+        let records = vec![
+            GraphRecord::node(
+                "file-1".to_string(),
+                NodeKind::File,
+                Some("src/lib.rs".to_string()),
+                None,
+                Some("src/lib.rs".to_string()),
+                "File src/lib.rs".to_string(),
+            ),
+            sym(
+                "s-f",
+                "function",
+                "indented_fn",
+                span_with_columns(3, 4, 3, 15),
+            ),
+            // Multi-line definition: end position is the 0-based end line and
+            // the exclusive end column on that line.
+            sym("s-g", "function", "block_fn", span_with_columns(5, 0, 7, 1)),
+        ];
+        let export = build_index(&records, "widget", "0.0.0");
+        let doc = &export.index.documents[0];
+        let by_symbol: std::collections::HashMap<&str, &Occurrence> = doc
+            .occurrences
+            .iter()
+            .map(|o| {
+                let name = doc
+                    .symbols
+                    .iter()
+                    .find(|s| s.symbol == o.symbol)
+                    .map(|s| s.display_name.as_str())
+                    .expect("symbol for occurrence");
+                (name, o)
+            })
+            .collect();
+        assert_eq!(by_symbol["indented_fn"].range, vec![2, 4, 2, 15]);
+        assert_eq!(by_symbol["block_fn"].range, vec![4, 0, 6, 1]);
+    }
+
+    #[test]
+    fn documents_declare_utf8_position_encoding() {
+        // Tree-sitter columns are UTF-8 byte offsets from line start; the
+        // document must say so for consumers (issue #463).
+        let export = build_index(&fixture(), "widget", "0.0.0");
+        for doc in &export.index.documents {
+            assert_eq!(
+                doc.position_encoding.enum_value_or_default(),
+                ::scip::types::PositionEncoding::UTF8CodeUnitOffsetFromLineStart
+            );
+        }
     }
 
     #[test]

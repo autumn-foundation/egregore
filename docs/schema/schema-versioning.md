@@ -79,7 +79,7 @@ regenerates every codegraph record under the current version deterministically.
 It was then bumped 8 → 9 by issue #117: the optional `crate_attribution` field
 on every path-bearing code-graph node (`File`, `Module`, `Symbol`, `Import`,
 `Diagnostic`, `PanicRiskSite`, `DebtMarker`, `UnsafeSite`,
-`DependencyDeclaration`, `Change`), carrying the owning Cargo package's name and the
+`DependencyDeclaration`, `LintSuppression`, `Change`), carrying the owning Cargo package's name and the
 repo-relative path of the owning `Cargo.toml`, or a closed-set reason no package
 owns the node. The addition is `additive`: the field is
 `#[serde(default, skip_serializing_if = "Option::is_none")]`, so a legacy v8 node
@@ -94,6 +94,60 @@ itself is deliberately NOT cached — it is recomputed on every refresh, so a
 source file byte-identical to its cached version whose owning `Cargo.toml` was
 renamed, added, or deleted is still re-attributed. Re-extraction from source
 regenerates every codegraph record under the current version deterministically.
+
+It was then bumped 9 → 10 by issue #256: the `HistoryReplayWindow` node kind
+plus the optional `history_replay_window` field on `Node` records, carrying
+the resolved commit window (`window`, `selected_commit_count`, `max_commits`,
+`since_instant`, `from_rev`/`to_rev`, `from_sha`/`to_sha`,
+`oldest_commit_sha`, `newest_commit_sha`) a windowed `eg scan-history` emits
+so a bounded store is never mistaken for full history. The addition is
+`additive`: the field is `#[serde(default, skip_serializing_if =
+"Option::is_none")]`, so a legacy v9 node record with no
+`history_replay_window` key still deserializes, and it is **never an identity
+input**, so `stable_id`'s preimage is unchanged. The paired incremental
+`CACHE_SCHEMA_VERSION` bumped 27 → 28: the `SCHEMA_VERSION` bump changes every
+`codegraph:v<N>:` record-ID prefix, so a cache holding v9 IDs would replay
+records whose endpoints no longer match freshly-minted v10 ones.
+Re-extraction from source regenerates every codegraph record under the current
+version deterministically.
+
+It was then bumped 10 → 11 by issue #224: the `HistoryReplayTip` node kind
+plus the optional `history_replay_tip` field on `Node` records, carrying the
+resume frontier (`repository_id`, `tip_sha`, `covered_commit_count`,
+`tip_committed_at`) a full `eg scan-history` emits so the next replay can
+resume from new commits instead of replaying all history. The field addition
+is `additive`: the field is `#[serde(default, skip_serializing_if =
+"Option::is_none")]`, so a legacy v10 node record with no `history_replay_tip`
+key still deserializes, and it is **never an identity input**, so `stable_id`'s
+preimage is unchanged. The new `NodeKind` variant is what forces the bump:
+`NodeKind` has no `#[serde(other)]` fallback (the `ALL` inventory test pins it
+exhaustive via serde's unknown-variant error), so a v10 reader meeting a
+`HistoryReplayTip` kind would fail deserialization rather than ignoring it —
+the `additive` reader rule ("old readers MUST accept by ignoring reserved
+variants") cannot hold without the version gate. The paired incremental
+`CACHE_SCHEMA_VERSION` bumped 28 → 29: the `SCHEMA_VERSION` bump changes every
+`codegraph:v<N>:` record-ID prefix, so a cache holding v10 IDs would replay
+records whose endpoints no longer match freshly-minted v11 ones.
+Re-extraction from source regenerates every codegraph record under the current
+version deterministically.
+
+Issue #238 added the optional `role` field (`"test"` | `"production"`) on
+`Symbol` and `File` node records WITHOUT a version bump: the addition is
+`additive` — `#[serde(default, skip_serializing_if = "Option::is_none")]`, so
+a legacy node record with no `role` key still deserializes (as unknown), and
+it is **never an identity input**, so `stable_id`'s preimage is unchanged.
+Re-extraction from source stamps every record deterministically.
+
+Issue #162 added the optional `complexity` field (`u32`) on Rust callable
+`Symbol` node records (`function` / `method` / `test` symbol kinds) WITHOUT a
+version bump: the addition is `additive` —
+`#[serde(default, skip_serializing_if = "Option::is_none")]`, so a legacy
+node record with no `complexity` key still deserializes (as unknown), and it
+is **never an identity input**, so `stable_id`'s preimage is unchanged. The
+embedded `AletheiaDB` adapter stores it as a non-interned integer property
+and reads it back symmetrically. Re-extraction from source re-derives every
+score deterministically from the Tree-sitter parse. See
+[`complexity.md`](complexity.md).
 
 Rationale: per-domain and per-kind scoping lets #6, #11, #13, #14, and #15 land
 independently. A new project `Task` shape must not force a version bump for

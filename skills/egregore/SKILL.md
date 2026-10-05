@@ -6,7 +6,7 @@ version: 0.1.0
 
 # Egregore: Code Graph + Semantic Search
 
-Egregore extracts a deterministic knowledge graph from a Rust codebase, stores it in an embedded AletheiaDB store, and exposes structural and semantic queries. It replaces grepping with typed graph edges (DEFINES, CALLS, IMPORTS, MENTIONS) and natural-language vector search — reducing agent context cost by 10–15× versus raw text search.
+Egregore extracts a deterministic knowledge graph from a Rust codebase, stores it in an embedded AletheiaDB store, and exposes structural and semantic queries. It replaces grepping with typed graph edges (DEFINES, CALLS, IMPORTS, REFERENCES) and natural-language vector search — reducing agent context cost by 10–15× versus raw text search. (`MENTIONS` is a reserved edge label that no current language extractor emits; resolved usage is recorded as `REFERENCES`. See issue #442.)
 
 The primary binary is `egregore`; `eg` is the short alias.
 

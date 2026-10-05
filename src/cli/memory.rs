@@ -1,10 +1,13 @@
 use super::*;
 
+use super::record_budget::RecordBudget;
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn query_memory_cmd(
     records: &[GraphRecord],
     id_or_handle: &str,
     verified_only: bool,
+    max_records: Option<usize>,
 ) -> Result<()> {
     let resolved = match query::resolve_memory_ids(records, id_or_handle) {
         Ok(res) => res,
@@ -205,13 +208,31 @@ pub(crate) fn query_memory_cmd(
         })
         .collect();
 
-    let returned = memory_claim.len()
-        + supporting_evidence.len()
-        + contradicting_evidence.len()
-        + superseding_records.len()
-        + related_code_handles.len()
-        + related_project_handles.len()
-        + verification_evidence.len();
+    // Record budget (issue #211): sections fill sequentially in envelope
+    // order; each keeps its top-ranked prefix and the remainder flows on.
+    let mut budget = RecordBudget::new(max_records);
+    let memory_claim = budget.section(memory_claim);
+    let supporting_evidence = budget.section(supporting_evidence);
+    let contradicting_evidence = budget.section(contradicting_evidence);
+    let superseding_records = budget.section(superseding_records);
+    let related_code_handles = budget.section(related_code_handles);
+    let related_project_handles = budget.section(related_project_handles);
+    let verification_evidence = budget.section(verification_evidence);
+
+    let returned = memory_claim.returned()
+        + supporting_evidence.returned()
+        + contradicting_evidence.returned()
+        + superseding_records.returned()
+        + related_code_handles.returned()
+        + related_project_handles.returned()
+        + verification_evidence.returned();
+    let has_more = memory_claim.was_truncated()
+        || supporting_evidence.was_truncated()
+        || contradicting_evidence.was_truncated()
+        || superseding_records.was_truncated()
+        || related_code_handles.was_truncated()
+        || related_project_handles.was_truncated()
+        || verification_evidence.was_truncated();
 
     let response = MemoryAuditResponse {
         ok: true,
@@ -229,7 +250,7 @@ pub(crate) fn query_memory_cmd(
         excluded,
         page: AuditPage {
             cursor: None,
-            has_more: false,
+            has_more,
             returned,
         },
     };

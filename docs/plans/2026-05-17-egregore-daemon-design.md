@@ -5,6 +5,13 @@
 enforcement implemented 2026-06-08 (issue #56); remaining security and workflow
 hardening planned.
 
+> **Update (2026-09-15, issue #260):** the "Future MCP server" in the
+> architecture diagram below has shipped — `eg mcp` is a read-only stdio
+> server (issue #53, `src/mcp.rs`) exposing `inspect_store`,
+> `symbol_context`, and `task_evidence` against the running daemon; operator
+> docs in [docs/cli/mcp.md](../cli/mcp.md). The design's daemon-first
+> decision is unchanged.
+
 **Goal:** Provide a safe local multi-agent access path to one AletheiaDB-backed
 Egregore store without letting every agent open the embedded data directory as
 its own process-local database owner.
@@ -54,7 +61,7 @@ metadata are specified in [docs/schema/redaction.md](../schema/redaction.md).
 flowchart TB
     AgentA[Agent A] --> CLI[eg CLI]
     AgentB[Agent B] --> SDK[Future SDK]
-    AgentC[Agent C] --> MCP[Future MCP server]
+    AgentC[Agent C] --> MCP[MCP server — shipped as read-only stdio, issue #53]
 
     CLI --> Client[Daemon client]
     SDK --> Client

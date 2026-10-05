@@ -1,0 +1,6 @@
+[package]
+name = "five-domain-join-fixture"
+version = "0.1.0"
+edition = "2021"
+
+# No dependencies: the gate must run offline (issue #252).

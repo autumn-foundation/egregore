@@ -122,7 +122,7 @@ All error codes are snake\_case identifiers. String literals at call sites in
 | `ambiguous_commit_prefix` | 400 | no     | no               | query (symbol_at_commit) |
 | `invalid_limit`       | 400  | no        | no               | query (agent_sessions_for_repo) |
 | `runtime_permissions_unsafe` | 500 | no | no               | daemon startup |
-| `token_rotated`       | 401  | yes       | no               | reserved |
+| `token_rotated`       | 401  | yes (once) | no              | all (issue #70) |
 | `shutdown_in_progress`| 503  | yes       | yes              | all    |
 | `redaction_required`  | 422  | no        | no               | ingest (future) |
 | `unresolved_evidence_target` | 422 | no  | no               | ingest, jobs/ingest |
@@ -152,6 +152,30 @@ version compatibility. See [`docs/schema/schema-versioning.md`](schema-versionin
 Coordination: issue #18 reserves `runtime_permissions_unsafe` and
 `token_rotated`. Runtime-dir discovery, stale-file detection, and the
 `egregored.json` schema live in [`daemon-runtime.md`](daemon-runtime.md).
+Coordination: issue #70 implements `token_rotated` for daemon access-token
+rotation — see the retry contract below and
+[`daemon-runtime.md`](daemon-runtime.md) § 8.
+
+### 5.1 — `token_rotated` retry contract
+
+`token_rotated` (HTTP 401) means the bearer the client sent was superseded by
+a rotation past the documented cutover window (`ttl / 2`). The request was
+rejected before executing any read or write, and the envelope carries no
+token material — only the stable code, a retry-guidance message, and the
+standard envelope fields.
+
+Clients MUST handle it as exactly one re-read + one retry:
+
+1. Re-read `egregored.json` through the normal discovery flow (staleness and
+   liveness checks first — rotation never weakens them).
+2. Retry the identical request once with the fresh token: same `request_id`,
+   same idempotency key, same body.
+3. Surface whatever the retry returns. Never attempt a third request.
+
+`DaemonClient` implements this for its data-plane calls; the documented `eg`
+workflow is `eg ingest --adapter daemon`. A second `token_rotated` means the
+on-disk metadata does not belong to the live daemon generation — re-run
+discovery or restart the daemon instead of looping.
 
 Coordination: issue #19 reserves `insufficient_promotion_evidence` and
 `unapproved_durable_user_context` for authorization-derived user-context writes.
@@ -327,7 +351,42 @@ Verb set: `get_records`, `symbol_by_name`, `symbol_at_commit`, `file_defines`,
 `drift_top_n`, `semantic_search`, `observations_for_symbol`,
 `criteria_for_task`, `agent_sessions_for_repo` (issue #112; see
 [`daemon-query.md`](daemon-query.md) for the full verb table); reserved:
-`drift`.
+`drift`. Clients should derive the verb set at runtime from
+`GET /v1/capabilities` rather than hard-coding this list.
+
+### `GET /v1/capabilities` — auth required
+
+Discovery endpoint (issue #166). Reports the daemon's live query surface and
+the record schema versions it accepts, so integration bridges (MCP/SDK) can
+negotiate features at startup with zero `not_implemented` round-trips. Flat
+JSON, no `ok`/`result` envelope (same shape as the observability endpoints):
+
+```json
+{
+  "api_version": "v1",
+  "daemon_query_schema_version": 1,
+  "verbs": [
+    { "name": "agent_sessions_for_repo", "status": "implemented" },
+    { "name": "drift", "status": "reserved" }
+  ],
+  "accepted_record_tuples": [
+    { "domain": "codegraph", "kind": "*", "schema_version": 11 }
+  ]
+}
+```
+
+- `verbs` lists every verb in the dispatch registry, sorted by name, each
+  with an explicit `implemented` or `reserved` status. The set reported
+  `implemented` is exactly the set of verbs that do not return
+  `not_implemented` under live dispatch (proven by the manifest-vs-dispatch
+  cross-check test).
+- `accepted_record_tuples` lists every `(domain, kind, schema_version)`
+  tuple the daemon accepts on ingest/read. `kind` is the `"*"` wildcard: the
+  gate checks domain + schema_version only, never the record kind. A client
+  whose tuple's domain + schema_version is absent from this list would get
+  `unknown_schema_version`, and can detect that before sending records.
+
+Full field contract: [`docs/schema/daemon-query.md`](daemon-query.md) §10.
 
 ### `POST /v1/agents/register`
 

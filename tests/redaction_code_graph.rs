@@ -87,6 +87,8 @@ fn test_redact_code_graph_appends_diagnostic() {
             end_byte: 10,
             start_line: 1,
             end_line: 1,
+            start_column: None,
+            end_column: None,
         },
         "MY_KEY".to_owned(),
         "rust",

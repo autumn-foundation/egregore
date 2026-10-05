@@ -10,6 +10,86 @@ pub(crate) fn write_evidence_error(e: &crate::evidence::ProvenanceError) -> ! {
     process::exit(1);
 }
 
+/// Prints a machine-readable JSON supersession/contradiction diagnostic to
+/// stderr (issue #184) and exits with the error's stable exit code.
+///
+/// The envelope never echoes observation text or payload values — only the
+/// stable handles the caller supplied (`field` names the CLI flag,
+/// `target` the record handle).
+pub(crate) fn write_supersession_error(
+    e: &crate::supersede_write::SupersessionError,
+    field: &str,
+) -> ! {
+    eprintln!("{}", e.to_json(field));
+    process::exit(e.exit_code());
+}
+
+/// Resolves `--supersedes` / `--contradicts` into a validated
+/// [`SupersessionTarget`] (issue #184).
+///
+/// Returns `None` when neither flag was given. When a flag is present the
+/// target handle is validated against the local store (`--graph` JSONL or
+/// embedded `--data-dir`) before any write happens: the handle must name a
+/// live observation-class record, never a deterministic code-graph fact.
+#[allow(clippy::too_many_arguments)]
+fn resolve_supersession_target(
+    supersedes: Option<String>,
+    contradicts: Option<String>,
+    graph: Option<&Path>,
+    data_dir: Option<&Path>,
+) -> Option<crate::supersede_write::SupersessionTarget> {
+    use crate::ir::EdgeLabel;
+    use crate::supersede_write::{
+        SupersessionError, SupersessionTarget, validate_supersession_target,
+    };
+
+    let (target_id, label, field) = match (supersedes, contradicts) {
+        (None, None) => return None,
+        (Some(id), None) => (id, EdgeLabel::Supersedes, "supersedes"),
+        (None, Some(id)) => (id, EdgeLabel::Contradicts, "contradicts"),
+        // Clap `conflicts_with` rejects this combination before we get here.
+        (Some(_), Some(_)) => {
+            eprintln!(r#"{{"code":"invalid_field", "field":"supersedes"}}"#);
+            process::exit(1);
+        }
+    };
+    if target_id.is_empty() {
+        write_supersession_error(&SupersessionError::UnknownTarget { target_id }, field);
+    }
+    // A supersession/contradiction write is completely local, but the target
+    // must be validated against a store the user points at — never inferred.
+    let store_records: Vec<crate::ir::GraphRecord> = match (graph, data_dir) {
+        // Clap `conflicts_with` rejects `--graph` + `--data-dir` together
+        // before we get here; both arms below are the "no usable store"
+        // case.
+        (None, None) | (Some(_), Some(_)) => {
+            write_supersession_error(&SupersessionError::StoreRequired, field)
+        }
+        (Some(path), None) => load_records_from_jsonl(path).unwrap_or_else(|_| {
+            write_supersession_error(
+                &SupersessionError::StoreUnreadable {
+                    input: "graph".to_owned(),
+                },
+                field,
+            )
+        }),
+        (None, Some(dir)) => load_records_from_db(dir).unwrap_or_else(|_| {
+            write_supersession_error(
+                &SupersessionError::StoreUnreadable {
+                    input: "data_dir".to_owned(),
+                },
+                field,
+            )
+        }),
+    };
+    validate_supersession_target(&store_records, &target_id)
+        .unwrap_or_else(|e| write_supersession_error(&e, field));
+    Some(SupersessionTarget {
+        target_record_id: target_id,
+        label,
+    })
+}
+
 /// Handles `eg write <kind>` subcommands.
 ///
 /// On provenance failure the function writes a JSON error to stderr
@@ -27,6 +107,10 @@ pub(crate) fn write_evidence(kind: WriteKind) -> Result<()> {
             confidence,
             evidence_target,
             evidence_domain,
+            supersedes,
+            contradicts,
+            graph,
+            data_dir,
             out,
         } => {
             // Only codegraph (OBSERVES) and verification (VALIDATED_BY) are supported.
@@ -66,10 +150,94 @@ pub(crate) fn write_evidence(kind: WriteKind) -> Result<()> {
                 text,
                 confidence,
                 evidence_links,
+                // Write-time supersession/contradiction (issue #184): validated
+                // against the local store before any record is built.
+                supersession: resolve_supersession_target(
+                    supersedes,
+                    contradicts,
+                    graph.as_deref(),
+                    data_dir.as_deref(),
+                ),
             };
-            let outcome =
-                build_observation_records(&req).unwrap_or_else(|e| write_evidence_error(&e));
-            write_evidence_outcome(&outcome.records, &out, &outcome.record_id)
+            let outcome = build_observation_records(&req).unwrap_or_else(|e| {
+                // In the CLI path the builder only ever receives a valid
+                // SUPERSEDES/CONTRADICTS label and a non-empty target, so a
+                // builder rejection on the `supersession` field is
+                // unambiguously the self-target cycle guard firing.
+                if e.field == "supersession" {
+                    let sup = req.supersession.as_ref();
+                    let target_id = sup.map(|s| s.target_record_id.clone()).unwrap_or_default();
+                    let field = match sup.map(|s| s.label) {
+                        Some(EdgeLabel::Contradicts) => "contradicts",
+                        _ => "supersedes",
+                    };
+                    write_supersession_error(
+                        &crate::supersede_write::SupersessionError::SelfTarget { target_id },
+                        field,
+                    );
+                }
+                write_evidence_error(&e)
+            });
+            // Idempotency-conflict check (issue #184): the same observation
+            // identity (content-addressed, i.e. the idempotency key) already
+            // carrying a live edge of the same relation to a *different*
+            // target conflicts instead of duplicating. An identical re-run
+            // builds byte-identical records and is a no-op, not a conflict.
+            if let Some(sup) = &req.supersession {
+                // The builder only ever receives SUPERSEDES or CONTRADICTS
+                // here (validated at flag-parse time and by the builder).
+                let field = if sup.label == EdgeLabel::Contradicts {
+                    "contradicts"
+                } else {
+                    "supersedes"
+                };
+                let store_records: Vec<GraphRecord> = match (graph.as_deref(), data_dir.as_deref())
+                {
+                    (Some(path), None) => load_records_from_jsonl(path).unwrap_or_else(|_| {
+                        write_supersession_error(
+                            &crate::supersede_write::SupersessionError::StoreUnreadable {
+                                input: "graph".to_owned(),
+                            },
+                            field,
+                        )
+                    }),
+                    (None, Some(dir)) => load_records_from_db(dir).unwrap_or_else(|_| {
+                        write_supersession_error(
+                            &crate::supersede_write::SupersessionError::StoreUnreadable {
+                                input: "data_dir".to_owned(),
+                            },
+                            field,
+                        )
+                    }),
+                    _ => write_supersession_error(
+                        &crate::supersede_write::SupersessionError::StoreRequired,
+                        field,
+                    ),
+                };
+                crate::supersede_write::check_supersession_conflict(
+                    &store_records,
+                    &outcome.record_id,
+                    sup.label,
+                    &sup.target_record_id,
+                )
+                .unwrap_or_else(|e| write_supersession_error(&e, field));
+            }
+            // Surface the authored edge's handle so the caller can cite the
+            // forward handle the read side reports for the prior record.
+            let supersession_edge = outcome.records.iter().find_map(|record| match record {
+                GraphRecord::Edge {
+                    id,
+                    label: EdgeLabel::Supersedes | EdgeLabel::Contradicts,
+                    ..
+                } => Some(id.as_str()),
+                _ => None,
+            });
+            write_evidence_outcome(
+                &outcome.records,
+                &out,
+                &outcome.record_id,
+                supersession_edge,
+            )
         }
         WriteKind::CommandEvidence {
             agent_id,
@@ -107,7 +275,7 @@ pub(crate) fn write_evidence(kind: WriteKind) -> Result<()> {
             };
             let outcome =
                 build_command_evidence_records(&req).unwrap_or_else(|e| write_evidence_error(&e));
-            write_evidence_outcome(&outcome.records, &out, &outcome.record_id)
+            write_evidence_outcome(&outcome.records, &out, &outcome.record_id, None)
         }
         WriteKind::Artifact {
             agent_id,
@@ -143,7 +311,7 @@ pub(crate) fn write_evidence(kind: WriteKind) -> Result<()> {
                 validation_summary,
             };
             let outcome = build_artifact_records(&req).unwrap_or_else(|e| write_evidence_error(&e));
-            write_evidence_outcome(&outcome.records, &out, &outcome.record_id)
+            write_evidence_outcome(&outcome.records, &out, &outcome.record_id, None)
         }
         WriteKind::Verification {
             agent_id,
@@ -180,7 +348,37 @@ pub(crate) fn write_evidence(kind: WriteKind) -> Result<()> {
             };
             let outcome =
                 build_verification_records(&req).unwrap_or_else(|e| write_evidence_error(&e));
-            write_evidence_outcome(&outcome.records, &out, &outcome.record_id)
+            write_evidence_outcome(&outcome.records, &out, &outcome.record_id, None)
+        }
+        WriteKind::Failure {
+            agent_id,
+            agent_kind,
+            session_id,
+            observed_at,
+            source_handle,
+            failure_kind,
+            text,
+            exit_code,
+            failed_on,
+            references_task,
+            out,
+        } => {
+            let req = FailureRequest {
+                provenance: EvidenceProvenance {
+                    agent_id,
+                    agent_kind,
+                    session_id,
+                    observed_at,
+                    source_handle: Some(source_handle),
+                },
+                failure_kind,
+                text,
+                exit_code,
+                failed_on,
+                references_task,
+            };
+            let outcome = build_failure_records(&req).unwrap_or_else(|e| write_evidence_error(&e));
+            write_evidence_outcome(&outcome.records, &out, &outcome.record_id, None)
         }
     }
 }
@@ -190,6 +388,7 @@ pub(crate) fn write_evidence_outcome(
     records: &[GraphRecord],
     out: &Path,
     evidence_handle: &str,
+    supersession_edge: Option<&str>,
 ) -> Result<()> {
     let mut graph = Graph::new();
     for record in records {
@@ -200,10 +399,16 @@ pub(crate) fn write_evidence_outcome(
         .context("failed to serialize evidence JSONL")?;
     fs::write(out, jsonl)
         .with_context(|| format!("failed to write evidence JSONL to {}", out.display()))?;
+    // The supersession/contradiction edge handle (issue #184) is the forward
+    // handle the read side reports when recall/audit flags the prior record.
+    let edge_field = supersession_edge
+        .map(|id| format!(r#","supersession_edge":"{id}""#))
+        .unwrap_or_default();
     println!(
-        r#"{{"ok":true,"evidence_handle":"{}","records":{}}}"#,
+        r#"{{"ok":true,"evidence_handle":"{}","records":{}{}}}"#,
         evidence_handle,
-        records.len()
+        records.len(),
+        edge_field
     );
     Ok(())
 }

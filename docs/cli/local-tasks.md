@@ -68,6 +68,8 @@ summaries include a `[code]` prefix:
 | `invalid_json` | A line is not valid JSON |
 | `unresolved_parent_task` | AC references a task not found in the same file |
 | `unresolved_parent_local_id` | ExternalLink references an unknown parent |
+| `unresolved_dependency` | `depends_on` entry names a task not found in the same file; the declaring task is still imported, and `eg query task-ready` reports it blocked with `resolution: "unresolved"` |
+| `invalid_dependency` | `depends_on` entry is empty or not a string; the entry is ignored |
 | `duplicate_local_id_kind_mismatch` | Same `local_id` used for different record kinds |
 | `unknown_kind` | A line has an unrecognized `kind` value |
 | `non_monotonic_updated_at` | A revision's `updated_at` is earlier than the previous revision's; record is still imported |

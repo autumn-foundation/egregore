@@ -125,6 +125,57 @@ this feature.
 
 ---
 
+## Freshness on the MCP tools (issue #220)
+
+The MCP tools stamp the same verdict onto their successful JSON responses as a
+non-fatal, machine-readable `freshness` **object** — a trust signal, never
+suppression: a non-`fresh` verdict still returns the full answer payload.
+
+- `inspect_store`, `symbol_context`, and `task_evidence` each accept an optional
+  `repo_path` (default: the MCP server's current directory, mirroring
+  `eg freshness`'s default `.`) and carry the `freshness` object on every
+  `ok: true` response. Error responses (`ok: false`) are untouched.
+- `store_freshness` returns the same verdict for the whole store without
+  requiring a symbol or task argument.
+
+The object reuses the #186 contract — no new vocabulary:
+
+```json
+{
+  "verdict": "fresh",
+  "fresh": true,
+  "repository_id": "codegraph:v3:repo:…",
+  "repo_path": "/path/to/working/tree",
+  "stored_snapshot": {
+    "head": {"state": "commit", "sha": "abc…"},
+    "dirty": false,
+    "repository_id": "codegraph:v3:repo:…",
+    "scanned_at": "2026-05-19T00:00:00Z"
+  },
+  "current_head": {"state": "commit", "sha": "abc…"},
+  "current_dirty": false,
+  "message": "store matches the current working tree (HEAD unchanged, tree clean)"
+}
+```
+
+- `verdict` / `fresh`: the stable code (`fresh` / `stale_head` / `stale_dirty` /
+  `unknown`), computed by the exact code path `eg freshness` uses, so the MCP
+  verdict always agrees with the CLI verdict for the same store and tree.
+- `stored_snapshot`: the source-snapshot identity the answer was derived from.
+  A store that predates snapshot stamping carries the explicit
+  `{"state": "pre_stamping"}` marker (never a silent absence, never a false
+  `fresh`); `no_git` / `unborn_head` reuse the on-disk head serialization.
+- `current_head` / `current_dirty`: the working-tree state at `repo_path` the
+  stored snapshot was compared against.
+
+The freshness path is strictly read-only and offline: the working-tree probe
+runs `git rev-parse` / `git status` with `GIT_OPTIONAL_LOCKS=0` and the stamp is
+a pure function of the loaded records plus that probe — no graph records,
+indexes, or runtime files are created, modified, or deleted. For a fixed store +
+working-tree state the object is byte-identical across calls.
+
+---
+
 ## Out of scope
 
 Auto-rescanning, file watching, incremental refresh (owned by `eg refresh`),

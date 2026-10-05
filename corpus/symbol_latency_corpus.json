@@ -1,0 +1,20 @@
+{
+  "at_commit_index": 12,
+  "budget_p95_ms": 2000.0,
+  "corpus_name": "symbol-latency-reference",
+  "corpus_version": "1",
+  "description": "Pinned reference corpus for the time-to-first-citable-answer product gate (issue #57): reuses the issue #255/#120 fixture source (a snapshot of Egregore's own src/query/ subsystem, 52 Rust files, 41,919 Rust LOC measured with wc -l, plus a minimal Cargo.toml), scanned with a pinned transaction time and repository identity. Documented fixture scale: 41,919 Rust LOC, >= 500 symbols (see fixture_symbol_count), 25 deterministic synthetic git commits for the history-replay phase and the symbol-at-commit lookup. Deterministic synthetic SemanticDrift nodes are appended so `eg query drift` has a stable answer on the fixture. Fully local: no hosted indexing, crawling, or remote embeddings.",
+  "drift_limit": 10,
+  "fixture_rust_loc": 41919,
+  "fixture_symbol_count": 1164,
+  "history_commits": 25,
+  "query_file": "symbols.rs",
+  "query_symbol": "RepositoryIndex",
+  "reference_machine_class": "GitHub Actions ubuntu-latest runner (the CI gate). The warm-p95 budget is a hard product gate, not advisory: hardware variance is handled by the named reference machine class, not by softening the gate.",
+  "reference_record_count": 10466,
+  "repository_id_override": "symbol-latency-fixture",
+  "scan_time": "2026-01-01T00:00:00Z",
+  "source_dir": "query_latency_corpus",
+  "synthetic_drift_nodes_per_repo": 25,
+  "warm_samples": 5
+}

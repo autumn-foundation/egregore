@@ -111,3 +111,131 @@ fn cargo_run_defaults_to_egregore_binary() {
         "Cargo.toml must set default-run so documented `cargo run -- ...` commands select the primary binary"
     );
 }
+
+// ── Conditional-compilation gates (issue #190) ────────────────────────────
+
+/// Seeds a scratch repo exercising the acceptance shapes: a directly-gated
+/// fn, a symbol inheriting its enclosing module's gate, and an ungated fn.
+fn seed_cfg_repo() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let src = temp.path().join("src");
+    fs::create_dir(&src).expect("src dir should be created");
+    fs::write(
+        src.join("lib.rs"),
+        r#"#[cfg(feature = "gated-fn")]
+pub fn gated_fn() {}
+
+#[cfg(feature = "outer")]
+pub mod gated_mod {
+    pub fn nested_fn() {}
+}
+
+pub fn plain_fn() {}
+"#,
+    )
+    .expect("fixture source should be written");
+    let graph_path = temp.path().join("graph.jsonl");
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan")
+        .arg(temp.path())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+    (temp, graph_path)
+}
+
+#[test]
+fn query_symbol_json_and_text_expose_cfg() {
+    let (_temp, graph_path) = seed_cfg_repo();
+    let graph = graph_path.to_str().expect("graph path should be UTF-8");
+
+    // JSON: the gated fn carries its verbatim predicate; the ungated fn
+    // carries no `cfg` key at all.
+    let out = Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .args(["query", "symbol", "gated_fn", "--graph", graph])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value =
+        serde_json::from_slice(&out).expect("query symbol should emit JSON");
+    assert_eq!(
+        json["cfg"],
+        serde_json::json!(["feature = \"gated-fn\""]),
+        "directly gated fn carries its verbatim predicate"
+    );
+
+    let out = Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .args(["query", "symbol", "plain_fn", "--graph", graph])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value =
+        serde_json::from_slice(&out).expect("query symbol should emit JSON");
+    assert!(
+        json.get("cfg").is_none(),
+        "ungated fn carries no cfg key: {json}"
+    );
+
+    // Text: the gate renders on its own line; absence prints nothing.
+    let out = Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .args([
+            "query", "symbol", "gated_fn", "--graph", graph, "--format", "text",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).expect("text output should be UTF-8");
+    assert!(
+        text.contains("cfg: feature = \"gated-fn\""),
+        "text render exposes the gate: {text}"
+    );
+}
+
+#[test]
+fn query_file_rows_carry_inherited_cfg() {
+    let (_temp, graph_path) = seed_cfg_repo();
+    let graph = graph_path.to_str().expect("graph path should be UTF-8");
+
+    let out = Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .args(["query", "file", "src/lib.rs", "--graph", graph])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).expect("output should be UTF-8");
+    let rows: Vec<serde_json::Value> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("each row should be JSON"))
+        .collect();
+    let nested = rows
+        .iter()
+        .find(|row| row["name"] == "gated_mod::nested_fn")
+        .expect("nested fn should be listed");
+    assert_eq!(
+        nested["cfg"],
+        serde_json::json!(["feature = \"outer\""]),
+        "file rows inherit the enclosing module gate"
+    );
+    let plain = rows
+        .iter()
+        .find(|row| row["name"] == "plain_fn")
+        .expect("plain fn should be listed");
+    assert!(
+        plain.get("cfg").is_none(),
+        "ungated file rows carry no cfg key"
+    );
+}

@@ -109,6 +109,14 @@ pub(crate) fn query_task_cmd(records: &[GraphRecord], id_or_handle: &str) -> Res
         .filter_map(|r| context_observation(r, &trust))
         .collect();
 
+    // Section contract (issue #191): decisions surface in their own
+    // section and never in `observations`.
+    let decisions: Vec<ContextDecision<'_>> = ctx
+        .decisions
+        .iter()
+        .filter_map(|r| context_decision(r, records, &trust))
+        .collect();
+
     let artifacts: Vec<ContextLinkedItem<'_>> = ctx
         .artifacts
         .iter()
@@ -152,12 +160,16 @@ pub(crate) fn query_task_cmd(records: &[GraphRecord], id_or_handle: &str) -> Res
         acceptance_criteria,
         source_facts,
         observations,
+        decisions,
         artifacts,
         verification_evidence,
         reviews,
         external_links,
         unresolved,
         excluded: Vec::new(),
+        // Issue #196: `query task` loads the whole store (`load_query_records`,
+        // never the #447 selected closure), so coverage reads the full corpus.
+        store_coverage: query::StoreCoverage::from_records(records),
     };
 
     let output =

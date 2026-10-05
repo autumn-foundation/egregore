@@ -103,6 +103,41 @@ Relevant fields for this domain:
   `"error"` (prover error / timeout).
 - `stdout_handle` SHOULD carry the prover transcript.
 
+### 2c — BenchmarkRun capture contract (issue #237)
+
+`eg capture-bench` produces `BenchmarkRun` nodes from criterion's
+machine-readable `estimates.json` output (it never runs benchmarks). The
+following fields are part of the capture contract:
+
+- **Stable ID** — `verification_stable_id(["benchmark_run", session_id,
+  commit_sha, suite_name, benchmark_id])`: the §3 recommended 4-tuple
+  extended with the benchmark id, because one record is emitted per benchmark
+  and the 4-tuple alone cannot address them.
+- **`status`** — `"pass"`: the run was captured. The numeric outcome is the
+  **verdict**, not a boolean.
+- **Normalized summary** (`stdout_handle.inline`, `format:
+  "criterion-estimates-v1"`) — the re-parseable record: `benchmark_id`,
+  `suite`, `measurement_of_record: "mean"`, `unit: "ns"` (nanoseconds,
+  criterion's native unit), `mean_ns`, optional `median_ns` and
+  `confidence_interval`, the `baseline` (`mean_ns` + artifact path, or
+  `null`), `delta_pct`, and `verdict`.
+- **Verdict** — `regression` (new mean slower than the baseline mean),
+  `improvement` (faster), `unchanged` (`|delta_pct|` at or under the ±1%
+  noise floor), or `no_baseline` (no saved baseline was captured — never a
+  silent `unchanged`). `delta_pct` is `(new − base) / base × 100` on the mean
+  point estimates, rounded to four decimals, or `null` when no delta is
+  definable.
+- **Evidence** — `source_artifact_path` points at the raw
+  `<benchmark-id>/new/estimates.json`; `source_artifact_hash` is its BLAKE3.
+  `temporal.git_commit` carries the captured commit SHA and `valid_time` /
+  `observed_at` carry the caller-supplied run timestamp
+  (`valid_time_source: "author_provided"`).
+- **Anchoring** — with a code graph, a benchmark whose final `/`-segment
+  resolves to exactly one `Symbol` mints `MENTIONS_SYMBOL` (+ `TOUCHED_FILE`
+  when the symbol's `File` is present); zero or two-plus matches mint a
+  `Diagnostic` (`bench_symbol_unresolved` / `bench_symbol_ambiguous`) and join
+  the capture envelope's `unresolved` section instead of a wrong edge.
+
 ---
 
 ## 3 — Stable ID composition

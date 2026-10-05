@@ -39,6 +39,8 @@ fn test_bfs_traversal_and_selectors() {
         end_line: 10,
         start_byte: 0,
         end_byte: 0,
+        start_column: None,
+        end_column: None,
     };
     let sym_node = GraphRecord::node(
         "sym-1".to_owned(),

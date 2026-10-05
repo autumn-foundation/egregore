@@ -1,0 +1,12 @@
+{
+  "mean": {
+    "confidence_interval": {"confidence_level": 0.95, "lower_bound": 890.0, "upper_bound": 912.3},
+    "point_estimate": 900.0,
+    "standard_error": 5.5
+  },
+  "median": {
+    "confidence_interval": {"confidence_level": 0.95, "lower_bound": 888.1, "upper_bound": 910.0},
+    "point_estimate": 898.5,
+    "standard_error": 5.4
+  }
+}
