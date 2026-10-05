@@ -13,15 +13,28 @@ pub(crate) fn query_drift_via_daemon(
     if let Some(repo) = repo {
         params["repo"] = serde_json::json!(repo);
     }
-    let records = client
-        .query_verb("drift_top_n", &params, None)
+    let result = client
+        .query_verb_raw("drift_top_n", &params, None)
         .map_err(|e| surface_daemon_selector_rejection(e, repo))?;
+    let records: Vec<serde_json::Value> =
+        serde_json::from_value(result.get("records").cloned().unwrap_or_default())
+            .context("daemon drift_top_n result has no records array")?;
     if records.is_empty() {
         eprintln!("error: no match found — no SemanticDrift nodes in graph");
         std::process::exit(2);
     }
+    // Issue #121: the daemon reports the pre-truncate pool in the page
+    // envelope; stamp every row so the --daemon answer carries the same
+    // completeness signal as the local lane. A daemon predating the signal
+    // reports nothing — then the rows carry no stamp rather than a guess.
+    let completeness =
+        RowCompleteness::from_daemon_page(result.get("page").unwrap_or(&serde_json::Value::Null));
     for rec in &records {
-        print_daemon_drift_record(rec, format)?;
+        let mut stamped = rec.clone();
+        if let Some(completeness) = completeness {
+            stamp_json_row(&mut stamped, completeness);
+        }
+        print_daemon_drift_record(&stamped, format)?;
     }
     Ok(())
 }
@@ -70,7 +83,11 @@ pub(crate) fn query_drift(
     if let Some(repo) = selected_repo {
         drifts.retain(|r| index.owner_of(r.id()) == Some(repo));
     }
+    // Issue #121: bind the pre-truncate pool size before the cap narrows it —
+    // every printed row carries the completeness stamp.
+    let total_matches = drifts.len();
     drifts.truncate(limit);
+    let completeness = RowCompleteness::capped(total_matches, limit);
 
     if drifts.is_empty() {
         eprintln!("error: no match found — no SemanticDrift nodes in graph");
@@ -123,6 +140,7 @@ pub(crate) fn query_drift(
             repository_id,
             repository: repository_id.and_then(|repo| index.display_of(repo)),
             status: "drift is a lead, not proof",
+            completeness,
         };
         print_result(&result, format)?;
     }

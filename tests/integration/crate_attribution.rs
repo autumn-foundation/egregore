@@ -2592,9 +2592,9 @@ fn legacy_node_line_roundtrips_with_absent_attribution() {
         "an absent key must read back as None (attribution UNKNOWN)"
     );
 
-    // And a v8-era line that never had the key still parses.
-    let legacy = line.replace("\"schema_version\":9", "\"schema_version\":8");
-    let parsed: GraphRecord = serde_json::from_str(&legacy).expect("v8 line must deserialize");
+    // And a v9-era line that never had the key still parses.
+    let legacy = line.replace("\"schema_version\":10", "\"schema_version\":9");
+    let parsed: GraphRecord = serde_json::from_str(&legacy).expect("v9 line must deserialize");
     assert!(parsed.crate_attribution().is_none());
 }
 

@@ -1,6 +1,6 @@
 use super::*;
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(crate) fn query_subsystem_cmd(
     records: &[GraphRecord],
     prefix: &str,
@@ -8,6 +8,8 @@ pub(crate) fn query_subsystem_cmd(
     all_history: bool,
     _format: OutputFormat,
     supersession: crate::temporal_status::SupersessionMode,
+    agent: Option<&str>,
+    not_agent: Option<&str>,
 ) -> Result<()> {
     // Corpus-mode selection (issue #456): head-anchor by default over a
     // scan-history store; `--all-history` opts into the union. Pre-filter drops
@@ -48,6 +50,13 @@ pub(crate) fn query_subsystem_cmd(
 
     let trust = query::TrustIndex::build(records);
 
+    // Author selector for the observations section (issue #195). Inactive by
+    // default: recall without `--agent` / `--not-agent` is unchanged.
+    let author_scope = query::AuthorScope {
+        include: agent.map(str::to_owned),
+        exclude: not_agent.map(str::to_owned),
+    };
+
     let source_facts: Vec<ContextSourceFact<'_>> = ctx
         .source_facts
         .iter()
@@ -57,6 +66,13 @@ pub(crate) fn query_subsystem_cmd(
     let raw_observations: Vec<ContextObservation<'_>> = ctx
         .observations
         .iter()
+        // Author scoping (issue #195): an active selector keeps only
+        // observations carrying a resolvable authoring `agent_id`.
+        // Deterministic code-graph facts carry no `agent_id` and are
+        // structurally excluded from author-scoped recall (see
+        // `query::AuthorScope::matches`). The selector applies to the
+        // agent-authored observations section only — never to `source_facts`.
+        .filter(|r| author_scope.matches(query::record_agent_id(r)))
         .filter_map(|r| context_observation(r, &trust))
         .collect();
 
@@ -64,6 +80,31 @@ pub(crate) fn query_subsystem_cmd(
     // `temporal_status` cannot be computed from different corpora.
     let (observations, excluded) =
         apply_supersession(raw_observations, trust.resolver(), supersession);
+
+    // Section contract (issue #191): decisions surface in their own
+    // section and never in `observations`. The author selector (issue
+    // #195) is documented as observations-only, so it does not scope
+    // this section.
+    let raw_decisions: Vec<ContextDecision<'_>> = ctx
+        .decisions
+        .iter()
+        .filter_map(|r| context_decision(r, records, &trust))
+        .collect();
+    let (decisions, decision_excluded) =
+        apply_supersession(raw_decisions, trust.resolver(), supersession);
+    let mut excluded_all = excluded;
+    excluded_all.extend(decision_excluded);
+
+    // Report the active author selector on the envelope (issue #195) so an
+    // empty `observations` array under an active scope is an explicit empty
+    // result — not an error and not a silent fallback to unscoped recall.
+    let author_scope_report = author_scope.is_active().then_some(AuthorScopeReport {
+        agent: author_scope.include.as_deref(),
+        not_agent: author_scope.exclude.as_deref(),
+        author_field: "agent_id",
+        observations_matched: observations.len(),
+        observations_total: ctx.observations.len(),
+    });
 
     let project_state: Vec<ContextLinkedItem<'_>> = ctx
         .project_state
@@ -186,13 +227,15 @@ pub(crate) fn query_subsystem_cmd(
         source_facts,
         topology_edges,
         observations,
+        decisions,
+        author_scope: author_scope_report,
         project_state,
         artifacts,
         verification_evidence,
         semantic_drift,
         log_signatures,
         unresolved,
-        excluded,
+        excluded: excluded_all,
         corpus_mode: corpus_mode.as_str(),
         corpus_mode_source: corpus_mode_source.as_str(),
         corpus_disclaimer,

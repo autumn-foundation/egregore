@@ -65,8 +65,10 @@ pub(crate) struct LocationResponse<'a> {
     line: usize,
     /// The smallest enclosing `Symbol` node (the innermost).
     symbol: LocationNodeJson<'a>,
-    /// Containing `Module`/`Symbol` nodes, outermost → innermost; the last
-    /// entry is always the primary `symbol`.
+    /// Containing `Module`/`Symbol` nodes, outermost → innermost. The innermost
+    /// chain entry is the primary `symbol` whenever the innermost containing
+    /// node is a `Symbol`; a `Module` nested inside a function body can be the
+    /// innermost entry while the primary answer is its enclosing `Symbol`.
     enclosing_chain: Vec<LocationNodeJson<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     repository_id: Option<&'a str>,

@@ -418,6 +418,12 @@ struct TaskLine {
     priority: String,
     assignees: Vec<String>,
     labels: Vec<String>,
+    /// Optional prerequisite task `local_id`s (issue #161). Resolved file-wide
+    /// after the second pass into `DEPENDS_ON` edges from the latest revision.
+    /// Kept as raw JSON values so a non-string entry can be diagnosed per
+    /// entry (`[invalid_dependency]`) instead of rejecting the whole task row.
+    #[serde(default)]
+    depends_on: Vec<serde_json::Value>,
     #[allow(dead_code)]
     created_at: String,
     updated_at: String,
@@ -1870,6 +1876,131 @@ fn import_file(
         }
     }
 
+    // ── Third pass: resolve task dependencies (issue #161) ────────────────────
+    // `depends_on` entries are resolved file-wide against `task_ids` (forward
+    // references included), AFTER all task revisions are known. Only the latest
+    // revision of each task declares edges; duplicates collapse; empty and
+    // non-string entries are `[invalid_dependency]` validation diagnostics;
+    // unknown targets become `[unresolved_dependency]`
+    // diagnostics (JSON payload per the query lane's contract) and emit no edge.
+    // Self-dependencies are structural input and emit an edge so the query
+    // surfaces them as cycle diagnostics.
+    {
+        let mut latest_deps: BTreeMap<&str, (&Vec<serde_json::Value>, usize)> = BTreeMap::new();
+        for record in &parsed {
+            if let (line_idx, ParsedRecord::Task { line: task, .. }) = record {
+                latest_deps.insert(task.local_id.as_str(), (&task.depends_on, line_idx + 1));
+            }
+        }
+        for (local_id, (deps, line_no)) in &latest_deps {
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let dependent_id = task_ids
+                .get(*local_id)
+                .expect("task registered in first pass");
+            for (entry_idx, dep) in deps.iter().enumerate() {
+                let entry_no = entry_idx.to_string();
+                let Some(dep_str) = dep.as_str() else {
+                    let diag_id = project_stable_id(&[
+                        "project",
+                        "Diagnostic",
+                        SOURCE_KIND,
+                        &file_rel,
+                        "invalid_dependency",
+                        local_id,
+                        &entry_no,
+                    ]);
+                    push_diagnostic(
+                        graph,
+                        &diag_id,
+                        Some(&file_rel),
+                        &format!(
+                            "[invalid_dependency] task '{local_id}' declares a non-string depends_on entry; ignoring"
+                        ),
+                        transaction_time,
+                    );
+                    diag_count += 1;
+                    continue;
+                };
+                let target = dep_str.trim();
+                if target.is_empty() {
+                    let diag_id = project_stable_id(&[
+                        "project",
+                        "Diagnostic",
+                        SOURCE_KIND,
+                        &file_rel,
+                        "invalid_dependency",
+                        local_id,
+                        &entry_no,
+                    ]);
+                    push_diagnostic(
+                        graph,
+                        &diag_id,
+                        Some(&file_rel),
+                        &format!(
+                            "[invalid_dependency] task '{local_id}' declares an empty depends_on entry; ignoring"
+                        ),
+                        transaction_time,
+                    );
+                    diag_count += 1;
+                    continue;
+                }
+                if !seen.insert(target) {
+                    continue;
+                }
+                let Some(prereq_id) = task_ids.get(target) else {
+                    let diag_id = project_stable_id(&[
+                        "project",
+                        "Diagnostic",
+                        SOURCE_KIND,
+                        &file_rel,
+                        "unresolved_dependency",
+                        local_id,
+                        target,
+                    ]);
+                    let payload = serde_json::json!({
+                        "task_local_id": local_id,
+                        "file": file_rel,
+                        "line": line_no,
+                        "unknown_dep": target,
+                    });
+                    push_diagnostic(
+                        graph,
+                        &diag_id,
+                        Some(&file_rel),
+                        &format!("[unresolved_dependency] {payload}"),
+                        transaction_time,
+                    );
+                    diag_count += 1;
+                    continue;
+                };
+                let edge_id = project_stable_id(&[
+                    "project",
+                    "edge",
+                    EdgeLabel::DependsOn.as_str(),
+                    dependent_id,
+                    prereq_id,
+                ]);
+                graph.push(GraphRecord::Edge {
+                    id: edge_id,
+                    schema_version: PROJECT_SCHEMA_VERSION,
+                    label: EdgeLabel::DependsOn,
+                    source: dependent_id.clone(),
+                    target: prereq_id.clone(),
+                    confidence: None,
+                    resolution: None,
+                    frame_resolution: None,
+                    frame_index: None,
+                    basis: None,
+                    call_site_spans: None,
+                    is_exhaustive: None,
+                    temporal: None,
+                    summary: format!("Task '{local_id}' depends on task '{target}'"),
+                    producer: None,
+                });
+            }
+        }
+    }
+
     Ok(diag_count)
 }
 
@@ -2054,6 +2185,7 @@ fn emit_task_records(
             frame_resolution: None,
             frame_index: None,
             basis: None,
+            call_site_spans: None,
             is_exhaustive: None,
             temporal: None,
             summary: format!(
@@ -2146,6 +2278,7 @@ fn emit_ac_record(
         frame_resolution: None,
         frame_index: None,
         basis: None,
+        call_site_spans: None,
         is_exhaustive: None,
         temporal: None,
         summary: format!("AcceptanceCriterion '{}' owned by task", ac.local_id),
@@ -2237,6 +2370,7 @@ fn emit_external_link_record(
         frame_resolution: None,
         frame_index: None,
         basis: None,
+        call_site_spans: None,
         is_exhaustive: None,
         temporal: None,
         summary: format!("'{}' has ExternalLink", link.parent_local_id),

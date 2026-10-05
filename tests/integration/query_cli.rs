@@ -398,6 +398,8 @@ const fn span(start_line: usize, end_line: usize) -> SourceSpan {
         end_byte: 100,
         start_line,
         end_line,
+        start_column: None,
+        end_column: None,
     }
 }
 
@@ -1305,6 +1307,8 @@ fn fixture_context_seeded() -> (tempfile::TempDir, PathBuf) {
             end_byte: 80,
             start_line: 10,
             end_line: 20,
+            start_column: None,
+            end_column: None,
         },
         "my_function".to_owned(),
         "Rust fn my_function at src/lib.rs:10".to_owned(),
@@ -1444,6 +1448,8 @@ fn fixture_context_seeded_with_drift() -> (tempfile::TempDir, PathBuf, String, S
             end_byte: 80,
             start_line: 10,
             end_line: 20,
+            start_column: None,
+            end_column: None,
         },
         "my_function".to_owned(),
         "Rust fn my_function at src/lib.rs:10".to_owned(),
@@ -1536,6 +1542,8 @@ fn fixture_context_seeded_with_drift() -> (tempfile::TempDir, PathBuf, String, S
             end_byte: 150,
             start_line: 30,
             end_line: 40,
+            start_column: None,
+            end_column: None,
         },
         "unrelated_function".to_owned(),
         "Rust fn unrelated_function at src/lib.rs:30".to_owned(),
@@ -1992,6 +2000,8 @@ fn query_context_task_body_handle_in_project_state() {
             end_byte: 100,
             start_line: 5,
             end_line: 15,
+            start_column: None,
+            end_column: None,
         },
         "body_handle_fn".to_owned(),
         "fn body_handle_fn".to_owned(),
@@ -2210,6 +2220,8 @@ fn query_context_failure_record_carries_failure_kind_and_exit_code() {
             end_byte: 80,
             start_line: 1,
             end_line: 5,
+            start_column: None,
+            end_column: None,
         },
         "failing_ctx_fn".to_owned(),
         "fn failing_ctx_fn".to_owned(),
@@ -2314,6 +2326,8 @@ fn query_context_command_run_carries_execution_metadata() {
             end_byte: 80,
             start_line: 1,
             end_line: 5,
+            start_column: None,
+            end_column: None,
         },
         "cmd_run_ctx_fn".to_owned(),
         "fn cmd_run_ctx_fn".to_owned(),
@@ -2418,6 +2432,8 @@ fn query_context_patch_artifact_carries_patch_metadata() {
             end_byte: 80,
             start_line: 1,
             end_line: 5,
+            start_column: None,
+            end_column: None,
         },
         "patch_ctx_fn".to_owned(),
         "fn patch_ctx_fn".to_owned(),
@@ -2523,6 +2539,8 @@ fn query_context_linked_item_carries_summary() {
             end_byte: 80,
             start_line: 1,
             end_line: 5,
+            start_column: None,
+            end_column: None,
         },
         "summary_ctx_fn".to_owned(),
         "fn summary_ctx_fn".to_owned(),
@@ -2588,13 +2606,13 @@ fn query_context_linked_item_carries_summary() {
 }
 
 // ---------------------------------------------------------------------------
-// query context — Decision observation carries summary field
+// query context — Decision row carries summary field (issue #191)
 // ---------------------------------------------------------------------------
 //
-// Finding (line 1710): Decision records are classified into observations but do
-// not populate the Observation-only `text` field. Their human-readable content
-// is in GraphRecord::summary. Without a summary field in ContextObservation,
-// consumers cannot understand the Decision item without reloading the raw graph.
+// Decision records surface in their own `decisions` section — never in
+// `observations` — and the row carries the record's `summary` field (Decision
+// records use summary, not text, for their human-readable content) so
+// consumers can understand the decision without reloading the raw graph.
 
 #[test]
 fn query_context_decision_carries_summary() {
@@ -2611,6 +2629,8 @@ fn query_context_decision_carries_summary() {
             end_byte: 80,
             start_line: 1,
             end_line: 5,
+            start_column: None,
+            end_column: None,
         },
         "decision_ctx_fn".to_owned(),
         "fn decision_ctx_fn".to_owned(),
@@ -2669,17 +2689,26 @@ fn query_context_decision_carries_summary() {
     let json: serde_json::Value =
         serde_json::from_slice(&output).expect("valid JSON from query context");
 
-    let dec_item = json["observations"]
+    // Section contract (issue #191): decisions never appear in observations.
+    let observations = json["observations"].as_array().expect("observations array");
+    assert!(
+        observations
+            .iter()
+            .all(|o| o["record_id"].as_str() != Some(dec_id.as_str())),
+        "Decision must not appear in observations"
+    );
+
+    let dec_item = json["decisions"]
         .as_array()
-        .expect("observations array")
+        .expect("decisions array")
         .iter()
-        .find(|o| o["record_id"].as_str() == Some(&dec_id))
-        .expect("Decision must appear in observations");
+        .find(|o| o["record_id"].as_str() == Some(dec_id.as_str()))
+        .expect("Decision must appear in the dedicated decisions section");
 
     assert_eq!(
         dec_item["summary"].as_str(),
         Some("approved approach: use streaming parser for decision_ctx_fn"),
-        "Decision must carry summary field in observation output (Decision records \
+        "Decision must carry summary field in decision output (Decision records \
          use summary, not text, for their human-readable content)"
     );
 }
@@ -2708,6 +2737,8 @@ fn query_context_file_edit_carries_fileedit_metadata() {
             end_byte: 80,
             start_line: 1,
             end_line: 5,
+            start_column: None,
+            end_column: None,
         },
         "file_edit_ctx_fn".to_owned(),
         "fn file_edit_ctx_fn".to_owned(),
@@ -2970,6 +3001,8 @@ fn fixture_context_with_supersession() -> (tempfile::TempDir, PathBuf) {
             end_byte: 80,
             start_line: 10,
             end_line: 20,
+            start_column: None,
+            end_column: None,
         },
         "my_function".to_owned(),
         "Rust fn my_function at src/lib.rs:10".to_owned(),
@@ -3142,4 +3175,83 @@ fn test_query_context_supersession_include_but_flag() {
 
     let obs_u = get_obs("U");
     assert_eq!(obs_u["temporal_status"], "current");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #199 — deterministic, stable ordering of query results
+// ---------------------------------------------------------------------------
+
+/// Builds a fixture graph whose `scan_*` symbols are inserted in an order
+/// that differs from the documented output order (path, span start line,
+/// record ID), so the test actually exercises the sort.
+fn fixture_graph_with_unordered_scan_symbols() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("graph.jsonl");
+
+    let mut graph = Graph::new();
+    // Insertion order: gamma, alpha, beta. Canonical output order must be
+    // alpha (line 10), beta (line 20), gamma (line 30).
+    for (name, start_line) in [("scan_gamma", 30), ("scan_alpha", 10), ("scan_beta", 20)] {
+        let sym_id = stable_id(&["node", "Symbol", "src/lib.rs", name]);
+        graph.push(GraphRecord::symbol(
+            sym_id,
+            "fn",
+            "src/lib.rs".to_owned(),
+            span(start_line, start_line + 5),
+            name.to_owned(),
+            format!("Rust function {name}"),
+        ));
+    }
+    let jsonl = graph.to_jsonl().expect("serialize graph");
+    fs::write(&path, jsonl).expect("write fixture");
+
+    (temp, path)
+}
+
+#[test]
+fn query_symbol_output_is_byte_stable_across_repeated_runs() {
+    // Issue #199: the same structural query against an unchanged store must
+    // yield byte-identical ordered `record_id` lists on every run — here
+    // asserted end to end through the CLI (`query symbols` glob lane),
+    // 20 consecutive invocations.
+    let (_temp, graph) = fixture_graph_with_unordered_scan_symbols();
+
+    let run_once = || {
+        egregore()
+            .args(["query", "symbols", "scan_*", "--graph"])
+            .arg(&graph)
+            .args(["--format", "json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone()
+    };
+
+    let reference = run_once();
+    let reference_text = String::from_utf8(reference.clone()).expect("stdout is UTF-8");
+    let start_lines: Vec<u64> = reference_text
+        .lines()
+        .map(|line| {
+            let row: serde_json::Value =
+                serde_json::from_str(line).expect("each row is a JSON object");
+            assert!(row["record_id"].is_string(), "row has record_id");
+            row["span"]["start_line"]
+                .as_u64()
+                .expect("row has span.start_line")
+        })
+        .collect();
+    assert_eq!(
+        start_lines,
+        vec![10, 20, 30],
+        "rows must be in canonical (path, span start line, record ID) order"
+    );
+
+    for run in 0..20 {
+        let stdout = run_once();
+        assert_eq!(
+            stdout, reference,
+            "run {run}: `eg query symbols` output must be byte-identical across runs"
+        );
+    }
 }

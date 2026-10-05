@@ -1,15 +1,37 @@
-//! MCP server for Egregore read-only tools — issue #53.
+//! MCP server for Egregore tools — issue #53.
 //!
 //! Implements the Model Context Protocol using the [`rmcp`] crate and exposes
-//! three read-only tools backed by the existing daemon query, symbol-context,
-//! and task-evidence contracts:
+//! seven read-only tools backed by the existing daemon query, symbol-context,
+//! task-evidence, failure-history, and semantic-search contracts, plus one
+//! write tool:
 //!
 //! - **`inspect_store`** — store-inspection summary (record counts, domain breakdown).
 //! - **`symbol_context`** — evidence-backed symbol context, trust-separated by domain.
+//! - **`symbol_at`** — temporal symbol lookup: the symbol's state at a Git
+//!   commit or as of a valid-time instant (issue #181).
 //! - **`task_evidence`** — evidence-backed task context, trust-separated by domain.
+//! - **`store_freshness`** — store-freshness verdict for the whole store (issue #220).
+//! - **`failure_history`** — prior failed attempts for a symbol, file, or task
+//!   handle, trust-separated into runtime failures, agent failures, and
+//!   superseding successes (issue #188).
+//! - **`search_code`** — natural-language semantic code search over the embedded
+//!   vector index (issue #182). Reuses the daemon's `semantic_search` verb and
+//!   the issue #104 embedding-compatibility gate, so per-match fields and the
+//!   ranked order are identical to `eg query semantic`.
+//! - **`record_observation`** — records an evidence-backed agent observation
+//!   into the `agent_memory` domain (issue #183). The first write tool on this
+//!   transport: it enforces the same provenance contract as
+//!   `eg write observation` (session id, body, confidence, at least one
+//!   evidence target with its domain), stamps an MCP-origin producer envelope,
+//!   and can never write into the deterministic `codegraph` domain.
 //!
 //! All tool responses carry machine-readable structured output with record IDs and
-//! citation handles. No write tools ship in this slice.
+//! citation handles. Successful *read* responses additionally carry a `freshness`
+//! object (issue #220): the store-freshness verdict from the #186 contract
+//! (`fresh` / `stale_head` / `stale_dirty` / `unknown`), the stored
+//! source-snapshot identity the answer was derived from, and the working-tree
+//! state it was compared against — a trust signal, never suppression. The
+//! write tool's success response carries the new `record_id` instead.
 //!
 //! ## Transport
 //!
@@ -50,10 +72,19 @@ use serde_json::{Value, json};
 
 use crate::{
     GraphRecord, NodeKind,
-    daemon::DaemonClient,
-    ir::EdgeLabel,
+    adapters::DanglingCitationPolicy,
+    cli::semantic,
+    daemon::{DaemonClient, DaemonQueryRejection},
+    evidence::{
+        EvidenceProvenance, ObservationRequest, ProvenanceError,
+        build_observation_records_with_producer, mcp_observation_producer, now_rfc3339,
+        validate_observation_request,
+    },
+    ir::{EdgeLabel, EvidenceLink},
+    mcp_contract::MCP_CONTRACT_VERSION,
     query,
     schema_version::{UnknownSchemaVersion, record_version, validate_record_version},
+    semantic_confidence::{ConfidenceBand, SEMANTIC_CONFIDENT_THRESHOLD, SEMANTIC_SELECTION_BASIS},
 };
 
 // ── Tool parameter types ──────────────────────────────────────────────────────
@@ -63,6 +94,10 @@ use crate::{
 pub struct InspectStoreArgs {
     /// `AletheiaDB` data directory (default: `.egregore`).
     pub data_dir: Option<String>,
+    /// Working-tree path the store freshness verdict is computed against
+    /// (default: the MCP server's current directory, mirroring
+    /// `eg freshness`'s default `.`).
+    pub repo_path: Option<String>,
 }
 
 /// Parameters for the `symbol_context` tool.
@@ -70,8 +105,17 @@ pub struct InspectStoreArgs {
 pub struct SymbolContextArgs {
     /// Exact symbol name to look up.
     pub symbol_name: String,
+    /// Disambiguation selector (issue #192): pass one candidate's `record_id`
+    /// or `file:span` handle from an `ambiguous_symbol` response to get
+    /// context scoped to exactly that symbol. When present, `symbol_name`
+    /// may be empty — the candidate alone identifies the symbol.
+    pub candidate: Option<String>,
     /// `AletheiaDB` data directory (default: `.egregore`).
     pub data_dir: Option<String>,
+    /// Working-tree path the store freshness verdict is computed against
+    /// (default: the MCP server's current directory, mirroring
+    /// `eg freshness`'s default `.`).
+    pub repo_path: Option<String>,
 }
 
 /// Parameters for the `task_evidence` tool.
@@ -81,11 +125,140 @@ pub struct TaskEvidenceArgs {
     pub id_or_handle: String,
     /// `AletheiaDB` data directory (default: `.egregore`).
     pub data_dir: Option<String>,
+    /// Working-tree path the store freshness verdict is computed against
+    /// (default: the MCP server's current directory, mirroring
+    /// `eg freshness`'s default `.`).
+    pub repo_path: Option<String>,
+}
+
+/// Parameters for the `store_freshness` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct StoreFreshnessArgs {
+    /// Working-tree path the store freshness verdict is computed against
+    /// (default: the MCP server's current directory, mirroring
+    /// `eg freshness`'s default `.`).
+    pub repo_path: Option<String>,
+    /// `AletheiaDB` data directory (default: `.egregore`).
+    pub data_dir: Option<String>,
+}
+
+/// Parameters for the `failure_history` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FailureHistoryArgs {
+    /// Handle resolving to the failure-history target, in `eg query failures`
+    /// order: canonical code record ID, task/task-source handle, repo-relative
+    /// file path, exact symbol name, or source/provenance handle.
+    pub handle: String,
+    /// `AletheiaDB` data directory (default: `.egregore`).
+    pub data_dir: Option<String>,
+    /// Working-tree path the store freshness verdict is computed against
+    /// (default: the MCP server's current directory, mirroring
+    /// `eg freshness`'s default `.`).
+    pub repo_path: Option<String>,
+}
+
+/// One evidence target cited by a `record_observation` call.
+///
+/// Mirrors the CLI's `--evidence-target` / `--evidence-domain` pair
+/// (`eg write observation`): only `codegraph` (cited via `OBSERVES`) and
+/// `verification` (cited via `VALIDATED_BY`) targets are accepted — the same
+/// restriction the CLI enforces, because the daemon rejects any other
+/// relation/domain combination.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RecordObservationEvidenceTarget {
+    /// Stable record ID of the cited graph record (must be non-empty).
+    pub target_record_id: Option<String>,
+    /// Domain of the cited record: `codegraph` or `verification`
+    /// (must be non-empty).
+    pub target_domain: Option<String>,
+}
+
+/// Parameters for the `record_observation` write tool (issue #183).
+///
+/// Every required provenance field is `Option`-typed so that an *absent* field
+/// and an *empty* field are rejected identically with the structured
+/// `{"ok": false, "error": ...}` envelope — the tool never writes a partial
+/// or unprovenanced record. Fields the CLI defaults (`agent_kind`,
+/// `observed_at`) stay optional here too and default the same way.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RecordObservationArgs {
+    /// Stable agent identity; required, must be non-empty.
+    pub agent_id: Option<String>,
+    /// Agent kind from the published enum (`other`, `claude-code`,
+    /// `vantage`, `codex`, `rust-swe-agent`, `human`); defaults to `other`.
+    pub agent_kind: Option<String>,
+    /// Active session identifier; required, must be non-empty.
+    pub session_id: Option<String>,
+    /// RFC 3339 observation timestamp; defaults to now when absent.
+    pub observed_at: Option<String>,
+    /// Citable source artifact path or hash; required, must be non-empty.
+    pub source_handle: Option<String>,
+    /// Observation body text; required, must be non-empty.
+    pub text: Option<String>,
+    /// Extraction confidence in `[0.0, 1.0]`; required.
+    pub confidence: Option<f64>,
+    /// Evidence targets anchoring the claim; at least one is required, each
+    /// with a non-empty record ID and a `codegraph`/`verification` domain.
+    pub evidence: Option<Vec<RecordObservationEvidenceTarget>>,
+    /// `AletheiaDB` data directory (default: `.egregore`).
+    pub data_dir: Option<String>,
+}
+
+/// Parameters for the `search_code` semantic code search tool (issue #182).
+///
+/// The natural-language entry point for agents: a query string is embedded
+/// with the default local model and ranked against the embedded vector index
+/// through the daemon's `semantic_search` verb, so the returned matches carry
+/// the same per-match fields and ranked order as `eg query semantic`.
+///
+/// Every field is `Option`-typed so the rmcp `Parameters` wrapper can carry a
+/// partially-filled argument object: an absent or whitespace-only `query` is
+/// rejected with the stable `missing_argument` envelope, and an absent
+/// `limit` falls back to the documented default.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchCodeArgs {
+    /// Natural-language query (symbol name, description, or code snippet);
+    /// required, must be non-empty.
+    pub query: Option<String>,
+    /// `AletheiaDB` data directory (default: the server's configured store).
+    pub data_dir: Option<String>,
+    /// Maximum number of matches to return; defaults to 10 (the
+    /// `eg query semantic` default) and is clamped to 100, the daemon verb's
+    /// ceiling.
+    pub limit: Option<u64>,
+    /// Working-tree path the store freshness verdict is computed against
+    /// (default: the MCP server's current directory, mirroring
+    /// `eg freshness`'s default `.`).
+    pub repo_path: Option<String>,
+}
+
+/// Arguments for the `symbol_at` tool: temporal symbol lookup (issue #181).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SymbolAtArgs {
+    /// Symbol name to look up (exact match against the symbol record's name);
+    /// required, must be non-empty.
+    pub symbol_name: String,
+    /// Git commit: full SHA or unique prefix, mirroring
+    /// `eg query symbol --at`. Exactly one of `commit` / `as_of` is required.
+    pub commit: Option<String>,
+    /// RFC 3339 valid-time instant, mirroring `eg query symbol --as-of`.
+    /// Exactly one of `commit` / `as_of` is required.
+    pub as_of: Option<String>,
+    /// Transaction-time selector. NOT IMPLEMENTED for `symbol_at`: the
+    /// transaction-time axis currently covers `eg query symbol` only.
+    pub tx_as_of: Option<String>,
+    /// `AletheiaDB` data directory (default: the server's configured store).
+    pub data_dir: Option<String>,
+    /// Working-tree path the store freshness verdict is computed against
+    /// (default: the MCP server's current directory, mirroring
+    /// `eg freshness`'s default `.`).
+    pub repo_path: Option<String>,
 }
 
 // ── MCP server ────────────────────────────────────────────────────────────────
 
-/// MCP server that exposes the three Egregore read-only evidence-query tools.
+/// MCP server that exposes the Egregore evidence-query and semantic-search
+/// tools plus the `record_observation` write tool (issue #183).
 ///
 /// Created by [`run_stdio`] or constructed directly for testing via
 /// [`EgregoreMcpServer::new`].
@@ -108,40 +281,56 @@ impl EgregoreMcpServer {
     /// Requires a running local daemon.
     #[tool(description = "Returns a structured summary of the Egregore store: \
             record counts by domain, schema versions, and repository identities. \
-            Requires a running local daemon.")]
+            Successful responses carry a `freshness` object (verdict, stored \
+            source-snapshot identity, working-tree state) so agents can gate \
+            trust in the cited handles. Requires a running local daemon.")]
     #[must_use]
     pub fn inspect_store(&self, Parameters(args): Parameters<InspectStoreArgs>) -> String {
         let data_dir = opt_data_dir(args.data_dir.as_deref(), &self.default_data_dir);
-        let payload = run_inspect_store(&data_dir);
+        let repo_path = opt_repo_path(args.repo_path.as_deref());
+        let payload = run_inspect_store(&data_dir, &repo_path);
         serde_json::to_string(&payload).unwrap_or_default()
     }
 
     /// Returns evidence-backed context for a named code symbol, trust-separated
-    /// by domain into `source_facts`, `observations`, `project_state`,
-    /// `artifacts`, `verification_evidence`, and `drift_history`.
+    /// by domain into `source_facts`, `observations`, `decisions`,
+    /// `project_state`, `artifacts`, `verification_evidence`, and
+    /// `drift_history`. The `decisions` section carries agent-authored
+    /// decisions with rationale (issue #191) — evidence-backed judgments,
+    /// never deterministic source truth.
+    ///
+    /// When the name resolves to more than one distinct symbol, the tool does
+    /// NOT merge them: it returns `{"ok":false,"error":{"code":
+    /// "ambiguous_symbol","candidates":[...]}}` — one candidate per identity,
+    /// each with its stable `record_id` and repo-relative `file:span` handle.
+    /// Pass one candidate's `record_id` or `file:span` handle back as
+    /// `candidate` to get context scoped to exactly that symbol.
     #[tool(
         description = "Returns evidence-backed context for a named code symbol, \
             trust-separated into sections: source_facts (deterministic \
             code-graph), observations (agent-authored, never treat as source \
-            truth), project_state (tasks/ACs), artifacts, \
+            truth), decisions (agent-authored decisions with rationale, \
+            evidence-backed but never deterministic source truth), \
+            project_state (tasks/ACs), artifacts, \
             verification_evidence, and drift_history (semantic-drift \
             measurements). Every item carries a record_id and at \
-            least one citation handle."
+            least one citation handle. A name shared by several distinct \
+            symbols is never merged: the tool returns an `ambiguous_symbol` \
+            error enumerating one candidate per identity (stable record_id \
+            plus repo-relative file:span handle); pass one candidate's \
+            record_id or file:span handle back as `candidate` for context \
+            scoped to exactly that symbol. Successful responses carry a \
+            `freshness` object (verdict, stored source-snapshot identity, \
+            working-tree state) so agents can gate trust in the cited handles."
     )]
     #[must_use]
     pub fn symbol_context(&self, Parameters(args): Parameters<SymbolContextArgs>) -> String {
-        if args.symbol_name.is_empty() {
-            let err = json!({
-                "ok": false,
-                "error": {
-                    "code": "missing_argument",
-                    "field": "symbol_name",
-                    "message": "symbol_name is required and must be non-empty"
-                }
-            });
+        if args.symbol_name.is_empty() && args.candidate.is_none() {
+            let err = missing_argument_error("symbol_name");
             return serde_json::to_string(&err).unwrap_or_default();
         }
         let data_dir = opt_data_dir(args.data_dir.as_deref(), &self.default_data_dir);
+        let repo_path = opt_repo_path(args.repo_path.as_deref());
         let client = match DaemonClient::from_data_dir(&data_dir) {
             Ok(c) => c,
             Err(e) => {
@@ -154,11 +343,13 @@ impl EgregoreMcpServer {
                 return serde_json::to_string(&daemon_error(&e.to_string())).unwrap_or_default();
             }
         };
-        serde_json::to_string(&tool_symbol_context_from_records(
+        let mut payload = tool_symbol_context_from_records_with_candidate(
             &records,
             &args.symbol_name,
-        ))
-        .unwrap_or_default()
+            args.candidate.as_deref(),
+        );
+        stamp_freshness_on_payload(&mut payload, &records, &repo_path, Some(&data_dir));
+        serde_json::to_string(&payload).unwrap_or_default()
     }
 
     /// Returns evidence-backed context for a task, accepting a canonical
@@ -166,11 +357,16 @@ impl EgregoreMcpServer {
     #[tool(description = "Returns evidence-backed context for a task identified \
             by its canonical record ID, GitHub URL, GitHub short handle, or \
             local JSONL handle. Sections: tasks, acceptance_criteria, \
-            source_facts, observations, artifacts, verification_evidence, \
-            reviews, external_links, unresolved.")]
+            source_facts, observations, decisions (agent-authored decisions \
+            with rationale, evidence-backed but never deterministic source \
+            truth), artifacts, verification_evidence, \
+            reviews, external_links, unresolved. Successful responses carry a \
+            `freshness` object (verdict, stored source-snapshot identity, \
+            working-tree state) so agents can gate trust in the cited handles.")]
     #[must_use]
     pub fn task_evidence(&self, Parameters(args): Parameters<TaskEvidenceArgs>) -> String {
         let data_dir = opt_data_dir(args.data_dir.as_deref(), &self.default_data_dir);
+        let repo_path = opt_repo_path(args.repo_path.as_deref());
         let client = match DaemonClient::from_data_dir(&data_dir) {
             Ok(c) => c,
             Err(e) => {
@@ -183,11 +379,323 @@ impl EgregoreMcpServer {
                 return serde_json::to_string(&daemon_error(&e.to_string())).unwrap_or_default();
             }
         };
-        serde_json::to_string(&tool_task_evidence_from_records(
-            &records,
-            &args.id_or_handle,
-        ))
-        .unwrap_or_default()
+        let mut payload = tool_task_evidence_from_records(&records, &args.id_or_handle);
+        stamp_freshness_on_payload(&mut payload, &records, &repo_path, Some(&data_dir));
+        serde_json::to_string(&payload).unwrap_or_default()
+    }
+
+    /// Returns the store-freshness verdict for the whole store — the same
+    /// verdict the per-tool `freshness` objects carry — without requiring a
+    /// symbol or task argument. Requires a running local daemon.
+    #[tool(description = "Returns the store-freshness verdict for the whole \
+            store: verdict (fresh / stale_head / stale_dirty / unknown), the \
+            stored source-snapshot identity, and the working-tree state it was \
+            compared against. Same verdict the inspect_store / symbol_context / \
+            task_evidence `freshness` objects carry. Requires a running local \
+            daemon.")]
+    #[must_use]
+    pub fn store_freshness(&self, Parameters(args): Parameters<StoreFreshnessArgs>) -> String {
+        let data_dir = opt_data_dir(args.data_dir.as_deref(), &self.default_data_dir);
+        let repo_path = opt_repo_path(args.repo_path.as_deref());
+        let client = match DaemonClient::from_data_dir(&data_dir) {
+            Ok(c) => c,
+            Err(e) => {
+                return serde_json::to_string(&daemon_error(&e.to_string())).unwrap_or_default();
+            }
+        };
+        let (records, _unknown, _ts) = match client.get_all_records() {
+            Ok(r) => r,
+            Err(e) => {
+                return serde_json::to_string(&daemon_error(&e.to_string())).unwrap_or_default();
+            }
+        };
+        let payload = json!({
+            "ok": true,
+            "freshness": tool_freshness_stamp(&records, &repo_path, Some(&data_dir)),
+        });
+        serde_json::to_string(&payload).unwrap_or_default()
+    }
+
+    /// Returns prior failed attempts for a symbol, file, or task handle —
+    /// trust-separated into `runtime_failures` (trust `verification_evidence`),
+    /// `agent_failures` (trust `agent_authored`), and `superseding_successes`
+    /// (later passing verifications, which never hide the older failures).
+    /// Every failure carries a stable `record_id`/evidence handle and a
+    /// read-time `resolution_status` (`still_failing` | `since_resolved`);
+    /// sections are canonically ordered oldest-first. Handles resolve in the
+    /// same order as `eg query failures`: canonical code record ID,
+    /// task/task-source handle, repo-relative file path, exact symbol name,
+    /// source/provenance handle. Unresolvable handles surface structured
+    /// `no_match` / `stale_handle` / `ambiguous_handle` / `unsupported_handle`
+    /// errors — never a silent empty success. A resolved target with no
+    /// recorded failures returns a successful explicitly-empty answer with a
+    /// `safety_note`: absence of recorded failure is not evidence of safety,
+    /// and no failure cause is ever inferred. Successful responses carry a
+    /// `freshness` object (verdict, stored source-snapshot identity,
+    /// working-tree state) so agents can gate trust in the cited handles.
+    #[tool(description = "Returns prior failed attempts for a symbol, file, \
+            or task handle, trust-separated into runtime_failures (trust \
+            verification_evidence), agent_failures (trust agent_authored), \
+            and superseding_successes (later passing verifications, which \
+            never hide the older failures). Every failure carries a stable \
+            record_id/evidence handle and a read-time resolution_status \
+            (still_failing | since_resolved); sections are canonically \
+            ordered oldest-first. Handles resolve in the same order as `eg \
+            query failures`: canonical code record ID, task/task-source \
+            handle, repo-relative file path, exact symbol name, \
+            source/provenance handle. Unresolvable handles surface structured \
+            no_match / stale_handle / ambiguous_handle / unsupported_handle \
+            errors. A resolved target with no recorded failures returns a \
+            successful explicitly-empty answer with a safety_note: absence \
+            of recorded failure is not evidence of safety. Successful \
+            responses carry a `freshness` object (verdict, stored \
+            source-snapshot identity, working-tree state) so agents can gate \
+            trust in the cited handles.")]
+    #[must_use]
+    pub fn failure_history(&self, Parameters(args): Parameters<FailureHistoryArgs>) -> String {
+        if args.handle.is_empty() {
+            let err = missing_argument_error("handle");
+            return serde_json::to_string(&err).unwrap_or_default();
+        }
+        let data_dir = opt_data_dir(args.data_dir.as_deref(), &self.default_data_dir);
+        let repo_path = opt_repo_path(args.repo_path.as_deref());
+        let client = match DaemonClient::from_data_dir(&data_dir) {
+            Ok(c) => c,
+            Err(e) => {
+                return serde_json::to_string(&daemon_error(&e.to_string())).unwrap_or_default();
+            }
+        };
+        let (records, _unknown, _ts) = match client.get_all_records() {
+            Ok(r) => r,
+            Err(e) => {
+                return serde_json::to_string(&daemon_error(&e.to_string())).unwrap_or_default();
+            }
+        };
+        let mut payload = tool_failure_history_from_records(&records, &args.handle);
+        stamp_freshness_on_payload(&mut payload, &records, &repo_path, Some(&data_dir));
+        serde_json::to_string(&payload).unwrap_or_default()
+    }
+
+    /// Records an evidence-backed agent observation into the `agent_memory`
+    /// domain of the store named by `data_dir` (issue #183).
+    ///
+    /// This is the first write tool on the MCP transport, closing the agent
+    /// learning loop (query → learn → persist with provenance) without leaving
+    /// the transport. It enforces the same provenance contract as
+    /// `eg write observation`: `agent_id`, `session_id`, `text`, `confidence`
+    /// in `[0.0, 1.0]`, `source_handle`, and at least one evidence target with
+    /// a `codegraph`/`verification` domain. Any missing or invalid field — or
+    /// zero evidence targets — is rejected with the structured
+    /// `{"ok": false, "error": ...}` envelope and nothing is written.
+    ///
+    /// The persisted records carry an MCP-origin producer envelope
+    /// (`producer_kind: observation_writer`, `producer_components.transport:
+    /// "mcp"`), distinct from CLI-originated writes. The write is ingested
+    /// under the `agent_memory` domain only — the tool has no domain parameter
+    /// and the daemon validates record IDs against the ingest domain, so
+    /// agent-authored observations can never land in the deterministic
+    /// `codegraph` domain. A dangling evidence target rejects the whole batch
+    /// atomically (`RejectBatch`): no partial record is ever persisted.
+    /// Requires a running local daemon.
+    #[tool(description = "Records an evidence-backed agent observation into \
+            the agent_memory domain of the Egregore store. Required: \
+            agent_id, session_id, text (observation body), confidence in \
+            [0.0, 1.0], source_handle (citable source artifact path or hash), \
+            and at least one evidence target, each with a target_record_id \
+            and a target_domain of codegraph (cited via OBSERVES) or \
+            verification (cited via VALIDATED_BY). Optional: agent_kind \
+            (defaults to other), observed_at in RFC 3339 (defaults to now). \
+            A call missing any required field or citing zero evidence targets \
+            is rejected with a structured ok:false error and writes nothing. \
+            The write can never target the deterministic codegraph domain, \
+            and a dangling evidence target rejects the whole batch \
+            atomically. On success the response carries the new record_id — \
+            the citable handle for the observation. Requires a running local \
+            daemon.")]
+    #[must_use]
+    pub fn record_observation(
+        &self,
+        Parameters(args): Parameters<RecordObservationArgs>,
+    ) -> String {
+        let req = match record_observation_request_from_args(&args) {
+            Ok(req) => req,
+            Err(error) => {
+                return serde_json::to_string(&provenance_error_payload(&error))
+                    .unwrap_or_default();
+            }
+        };
+        let data_dir = opt_data_dir(args.data_dir.as_deref(), &self.default_data_dir);
+        let client = match DaemonClient::from_data_dir(&data_dir) {
+            Ok(c) => c,
+            Err(e) => {
+                return serde_json::to_string(&daemon_error(&e.to_string())).unwrap_or_default();
+            }
+        };
+        // The builder re-validates every provenance field: the CLI and the
+        // MCP tool share one enforcement point, so the contract cannot drift.
+        let outcome = match build_observation_records_with_producer(
+            &req,
+            &mcp_observation_producer(&req.provenance.observed_at),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return serde_json::to_string(&provenance_error_payload(&error))
+                    .unwrap_or_default();
+            }
+        };
+        // The observation's content-addressed record ID is the idempotency
+        // key: an identical retry replays the daemon's cached response
+        // instead of duplicating records.
+        let idempotency_key = outcome.record_id.clone();
+        // The ingest domain is hardcoded to `agent_memory` inside
+        // `ingest_agent_memory_records` — the tool has no domain parameter,
+        // so observations can never land in the deterministic `codegraph`
+        // domain.
+        match client.ingest_agent_memory_records(
+            &outcome.records,
+            &req.provenance.agent_id,
+            &req.provenance.session_id,
+            &idempotency_key,
+            DanglingCitationPolicy::RejectBatch,
+        ) {
+            Ok(response) if response.failed == 0 => {
+                let payload = json!({
+                    "ok": true,
+                    "record_id": outcome.record_id,
+                    "records_written": response.succeeded,
+                });
+                serde_json::to_string(&payload).unwrap_or_default()
+            }
+            Ok(response) => {
+                let detail = response
+                    .failures
+                    .first()
+                    .map(|failure| failure.message.clone())
+                    .unwrap_or_default();
+                serde_json::to_string(&write_rejected_error(&detail)).unwrap_or_default()
+            }
+            Err(error) => {
+                serde_json::to_string(&write_failed_error(&error.to_string())).unwrap_or_default()
+            }
+        }
+    }
+
+    /// Semantic code search over the embedded vector index (issue #182).
+    #[tool(description = "Semantic code search: embeds a natural-language \
+            query with the default local model and ranks it against the \
+            embedded vector index, returning the same ranked matches as \
+            `eg query semantic` (record_id, score, name, repo_relative_path, \
+            span, plus the embedding-provenance envelope and the confidence \
+            verdict). Arguments: query (required, non-empty), data_dir \
+            (optional store path), limit (optional, default 10, max 100). \
+            Requires a running daemon (`eg daemon`) and a store ingested \
+            with --embed. Read-only and deterministic.")]
+    #[must_use]
+    pub fn search_code(&self, Parameters(args): Parameters<SearchCodeArgs>) -> String {
+        let trimmed = args.query.as_deref().map(str::trim).unwrap_or_default();
+        if trimmed.is_empty() {
+            let err = missing_argument_error("query");
+            return serde_json::to_string(&err).unwrap_or_default();
+        }
+        #[cfg(feature = "embeddings")]
+        {
+            let data_dir = opt_data_dir(args.data_dir.as_deref(), &self.default_data_dir);
+            let repo_path = opt_repo_path(args.repo_path.as_deref());
+            let limit = search_code_effective_limit(args.limit);
+            // Discover the daemon BEFORE loading the embedding model, so a
+            // missing or stale daemon surfaces `daemon_not_running` /
+            // `daemon_stale` exactly like the other read tools (issue #182).
+            // The helper below re-discovers for the verb call; this probe
+            // only orders the failure modes.
+            if let Err(error) = DaemonClient::from_data_dir(&data_dir) {
+                let err = daemon_error(&error.to_string());
+                return serde_json::to_string(&err).unwrap_or_default();
+            }
+            let query_vector = match semantic::embed_query_text(trimmed) {
+                Ok(vector) => vector,
+                Err(error) => {
+                    return serde_json::to_string(&json!({
+                        "ok": false,
+                        "error": {
+                            "code": "embeddings_unavailable",
+                            "message": format!("failed to embed query: {error:#}"),
+                        }
+                    }))
+                    .unwrap_or_default();
+                }
+            };
+            let payload =
+                tool_search_code_with_vector(&data_dir, &repo_path, trimmed, limit, &query_vector);
+            serde_json::to_string(&payload).unwrap_or_default()
+        }
+        #[cfg(not(feature = "embeddings"))]
+        {
+            serde_json::to_string(&json!({
+                "ok": false,
+                "error": {
+                    "code": "embeddings_unavailable",
+                    "message": "semantic search requires the `embeddings` build feature",
+                }
+            }))
+            .unwrap_or_default()
+        }
+    }
+
+    /// Looks up a symbol's state at a Git commit or as of a valid-time
+    /// instant (issue #181): the temporal counterpart to `symbol_context`.
+    ///
+    /// Accepts exactly one temporal selector — `commit` (a full SHA or unique
+    /// prefix, mirroring `eg query symbol --at`) or `as_of` (an RFC 3339
+    /// instant, mirroring `eg query symbol --as-of`) — and returns the
+    /// citable row for that version: `record_id`, `name`, `kind`,
+    /// `repo_relative_path`, `span`, `git_commit`, `valid_time`. Supplying
+    /// both selectors is a parameter error; `tx_as_of` is rejected with
+    /// `not_implemented` (the transaction-time axis currently covers
+    /// `eg query symbol` only). An ambiguous commit prefix yields
+    /// `ambiguous_commit_prefix`; a miss yields `no_match`. Like every read
+    /// tool, a successful response carries the `freshness` stamp.
+    #[tool(
+        description = "Looks up a symbol's state at a Git commit (full SHA or \
+            unique prefix) or as of an RFC 3339 valid-time instant — the temporal \
+            counterpart to `symbol_context`, mirroring `eg query symbol --at` / \
+            `--as-of`. Exactly one of `commit` or `as_of` is required (both is a \
+            parameter error); `tx_as_of` is not implemented. Returns the citable \
+            row for that version: `record_id`, `name`, `kind`, \
+            `repo_relative_path`, `span`, `git_commit`, `valid_time`. An \
+            ambiguous commit prefix yields `ambiguous_commit_prefix`; a miss \
+            yields `no_match`. Successful responses carry a `freshness` object."
+    )]
+    #[must_use]
+    pub fn symbol_at(&self, Parameters(args): Parameters<SymbolAtArgs>) -> String {
+        if args.symbol_name.is_empty() {
+            return serde_json::to_string(&missing_argument_error("symbol_name"))
+                .unwrap_or_default();
+        }
+        let selector = match resolve_symbol_at_selector(
+            args.commit.as_deref(),
+            args.as_of.as_deref(),
+            args.tx_as_of.as_deref(),
+        ) {
+            Ok(selector) => selector,
+            Err(payload) => return serde_json::to_string(&payload).unwrap_or_default(),
+        };
+        let data_dir = opt_data_dir(args.data_dir.as_deref(), &self.default_data_dir);
+        let repo_path = opt_repo_path(args.repo_path.as_deref());
+        let client = match DaemonClient::from_data_dir(&data_dir) {
+            Ok(client) => client,
+            Err(e) => {
+                return serde_json::to_string(&daemon_error(&e.to_string())).unwrap_or_default();
+            }
+        };
+        let (records, _unknown, _ts) = match client.get_all_records() {
+            Ok(records) => records,
+            Err(e) => {
+                return serde_json::to_string(&daemon_error(&e.to_string())).unwrap_or_default();
+            }
+        };
+        let mut payload = tool_symbol_at_from_records(&records, &args.symbol_name, selector);
+        stamp_freshness_on_payload(&mut payload, &records, &repo_path, Some(&data_dir));
+        serde_json::to_string(&payload).unwrap_or_default()
     }
 }
 
@@ -196,13 +704,28 @@ impl ServerHandler for EgregoreMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("egregore", env!("CARGO_PKG_VERSION")))
-            .with_instructions(
-                "Read-only Egregore knowledge graph tools. \
+            .with_instructions(format!(
+                "Egregore knowledge graph tools: seven read-only evidence-query, \
+                temporal-lookup, and semantic-search tools plus `record_observation`, \
+                which records an evidence-backed agent observation into the `agent_memory` \
+                domain (it enforces the same provenance contract as \
+                `eg write observation` and can never write into the \
+                deterministic codegraph domain). \
                 Connect to a running local daemon (`eg daemon`) to query the \
                 code-graph, agent observations, and task evidence. \
+                `search_code` answers natural-language code questions against \
+                the embedded vector index and returns the same ranked \
+                matches as `eg query semantic`, including the \
+                embedding-provenance envelope and the confidence verdict. \
+                `symbol_at` resolves a symbol's state at a Git commit \
+                (`eg query symbol --at`) or as of a valid-time instant \
+                (`eg query symbol --as-of`); the transaction-time axis is not \
+                exposed on this transport. \
                 All tools return structured JSON with `ok`, `error`, and \
-                trust-separated data sections.",
-            )
+                trust-separated data sections. \
+                mcp_contract_version={MCP_CONTRACT_VERSION} (frozen tool I/O \
+                contract, issue #194; see docs/schema/mcp.md)."
+            ))
     }
 }
 
@@ -238,6 +761,10 @@ pub fn run_stdio(default_data_dir: &Path) -> anyhow::Result<()> {
 /// directly by tests that supply a fixture slice.
 ///
 /// The `snapshot_timestamp` field is forwarded verbatim; pass an RFC 3339 string.
+///
+/// The returned payload does NOT include the `freshness` object — the tool
+/// method stamps it via [`stamp_freshness_on_payload`] once the working-tree
+/// comparison path (`repo_path`) is known.
 #[must_use]
 pub fn tool_inspect_store_from_records(
     records: &[GraphRecord],
@@ -353,7 +880,9 @@ pub fn tool_inspect_store_from_records(
 /// Builds an evidence-backed symbol context for a record slice.
 ///
 /// Returns domain-separated sections: `source_facts` (deterministic code-graph),
-/// `observations` (agent-authored — never treat as source truth), `project_state`
+/// `observations` (agent-authored — never treat as source truth), `decisions`
+/// (agent-authored decisions with rationale — evidence-backed judgments, never
+/// deterministic source truth), `project_state`
 /// (tasks/ACs), `artifacts`, `verification_evidence`, and `drift_history`
 /// (issue #108's `SemanticDrift` rows, resolved to the same citable
 /// `repo_relative_path`/`span` handle the CLI and daemon render).
@@ -365,11 +894,98 @@ pub fn tool_inspect_store_from_records(
 /// class (issue #114) from the same closed vocabulary the CLI and daemon use;
 /// see `crate::query::TrustClass` and `docs/cli/query.md`.
 ///
-/// Returns `{"ok":false,"error":{"code":"no_match"}}` when the symbol is absent.
-/// Output ordering is deterministic (sorted by record ID within each section).
+/// Returns `{"ok":false,"error":{"code":"no_match"}}` when the symbol is absent,
+/// and `{"ok":false,"error":{"code":"ambiguous_symbol","candidates":[...]}}`
+/// when the name resolves to more than one distinct symbol identity (issue
+/// #192) — the identities are enumerated, never merged. Output ordering is
+/// deterministic (sorted by record ID within each section).
 #[must_use]
 pub fn tool_symbol_context_from_records(records: &[GraphRecord], symbol_name: &str) -> Value {
+    tool_symbol_context_from_records_with_candidate(records, symbol_name, None)
+}
+
+/// Builds an evidence-backed symbol context for a record slice, with an
+/// optional disambiguation selector (issue #192).
+///
+/// When `candidate` is `Some`, it selects exactly one symbol — either a
+/// stable `record_id` or a `file:span` handle (`path:start_line-end_line`)
+/// from a previous `ambiguous_symbol` response — and the context is anchored
+/// on that symbol alone via [`query::record_context`]. An unresolvable
+/// selector is a `no_match`, never a guess.
+///
+/// When `candidate` is `None`, the name is resolved with
+/// [`query::symbol_context`]: a name shared by distinct identities returns
+/// the `ambiguous_symbol` disambiguation error instead of a blended answer.
+#[must_use]
+pub fn tool_symbol_context_from_records_with_candidate(
+    records: &[GraphRecord],
+    symbol_name: &str,
+    candidate: Option<&str>,
+) -> Value {
+    // Disambiguated re-query: anchor on exactly one symbol identity.
+    if let Some(selector) = candidate {
+        let anchor = records
+            .iter()
+            .find(|r| {
+                r.id() == selector
+                    && matches!(
+                        r,
+                        GraphRecord::Node {
+                            kind: NodeKind::Symbol,
+                            ..
+                        }
+                    )
+            })
+            .or_else(|| query::resolve_symbol_file_span_handle(records, selector));
+        let Some(anchor) = anchor else {
+            return json!({
+                "ok": false,
+                "error": { "code": "no_match", "candidate": selector }
+            });
+        };
+        let ctx = query::record_context(records, anchor.id());
+        if ctx.is_no_match() {
+            return json!({
+                "ok": false,
+                "error": { "code": "no_match", "candidate": selector }
+            });
+        }
+        let name = match anchor {
+            GraphRecord::Node { name: Some(n), .. } => n.as_str(),
+            _ => selector,
+        };
+        return symbol_context_payload(records, &ctx, name);
+    }
+
     let ctx = query::symbol_context(records, symbol_name);
+
+    // Issue #192: a name shared by distinct symbols is reported, never merged.
+    // The error code is the symbol-domain analogue of `task_evidence`'s
+    // `ambiguous_handle`.
+    if ctx.is_ambiguous() {
+        let candidates: Vec<Value> = ctx
+            .candidates
+            .iter()
+            .map(|c| {
+                json!({
+                    "record_id": c.record_id,
+                    "symbol_name": c.symbol_name,
+                    "repo_relative_path": c.repo_relative_path,
+                    "span": c.span,
+                    "file_span_handle": c.file_span_handle(),
+                })
+            })
+            .collect();
+        return json!({
+            "ok": false,
+            "error": {
+                "code": "ambiguous_symbol",
+                "symbol_name": symbol_name,
+                "message": "the name matches more than one distinct symbol; pass one candidate's record_id or file:span handle as `candidate`",
+                "candidates": candidates,
+            }
+        });
+    }
 
     if ctx.is_no_match() {
         return json!({
@@ -378,6 +994,17 @@ pub fn tool_symbol_context_from_records(records: &[GraphRecord], symbol_name: &s
         });
     }
 
+    symbol_context_payload(records, &ctx, symbol_name)
+}
+
+/// Renders the `ok:true` symbol-context payload from a resolved
+/// [`query::SymbolContext`], shared by the name-recall and the disambiguated
+/// re-query paths so both lanes emit the identical envelope shape.
+fn symbol_context_payload(
+    records: &[GraphRecord],
+    ctx: &query::SymbolContext<'_>,
+    symbol_name: &str,
+) -> Value {
     let trust = query::TrustIndex::build(records);
 
     let source_facts: Vec<Value> = ctx
@@ -389,6 +1016,13 @@ pub fn tool_symbol_context_from_records(records: &[GraphRecord], symbol_name: &s
         .observations
         .iter()
         .filter_map(|r| record_to_observation(r, &trust))
+        .collect();
+    // Section contract (issue #191): decisions surface in their own
+    // section and never in `observations`.
+    let decisions: Vec<Value> = ctx
+        .decisions
+        .iter()
+        .filter_map(|r| record_to_decision(r, records, &trust))
         .collect();
     let project_state: Vec<Value> = ctx
         .project_state
@@ -418,6 +1052,30 @@ pub fn tool_symbol_context_from_records(records: &[GraphRecord], symbol_name: &s
         .filter_map(|(r, resolved)| record_to_drift(r, resolved, &trust))
         .collect();
     let unresolved: Vec<Value> = ctx.unresolved.iter().map(unresolved_to_json).collect();
+    // Issue #169: fold active approved policy into the twin MCP surface, same
+    // contract as the CLI — always present (possibly empty), authorization
+    // cited via the approval-decision handle.
+    let policy: Vec<Value> = ctx
+        .policy
+        .iter()
+        .map(|p| {
+            json!({
+                "record_id": p.record_id(),
+                "kind": p.kind.as_str(),
+                "body": p.body,
+                "approval_decision_id": p.approval_decision_id,
+                "active_from": p.active_from,
+                "status": p.status.as_str(),
+                "trust": trust.classify(p.record).as_str(),
+                "scope": {
+                    "repo": p.scope.repo,
+                    "path_glob": p.scope.path_glob,
+                    "language": p.scope.language,
+                    "lifecycle_phase": p.scope.lifecycle_phase,
+                },
+            })
+        })
+        .collect();
 
     json!({
         "ok": true,
@@ -425,11 +1083,17 @@ pub fn tool_symbol_context_from_records(records: &[GraphRecord], symbol_name: &s
         "source_facts": source_facts,
         "topology_edges": topology_edges,
         "observations": observations,
+        "decisions": decisions,
         "project_state": project_state,
         "artifacts": artifacts,
         "verification_evidence": verification_evidence,
         "drift_history": drift_history,
         "unresolved": unresolved,
+        "policy": policy,
+        // Issue #196: store-level domain presence. The twins always receive
+        // the full record slice (`get_all_records`), so `from_records` reads
+        // the whole store.
+        "store_coverage": crate::query::StoreCoverage::from_records(records),
     })
 }
 
@@ -547,6 +1211,13 @@ pub fn tool_task_evidence_from_records(records: &[GraphRecord], id_or_handle: &s
         .iter()
         .filter_map(|r| record_to_observation(r, &trust))
         .collect();
+    // Section contract (issue #191): decisions surface in their own
+    // section and never in `observations`.
+    let decisions: Vec<Value> = ctx
+        .decisions
+        .iter()
+        .filter_map(|r| record_to_decision(r, records, &trust))
+        .collect();
     let artifacts: Vec<Value> = ctx
         .artifacts
         .iter()
@@ -576,17 +1247,502 @@ pub fn tool_task_evidence_from_records(records: &[GraphRecord], id_or_handle: &s
         "acceptance_criteria": acceptance_criteria,
         "source_facts": source_facts,
         "observations": observations,
+        "decisions": decisions,
         "artifacts": artifacts,
         "verification_evidence": verification_evidence,
         "reviews": reviews,
         "external_links": external_links,
         "unresolved": unresolved,
+        // Issue #196: store-level domain presence; see the symbol twin.
+        "store_coverage": crate::query::StoreCoverage::from_records(records),
     })
+}
+
+/// Builds a prior-failed-attempt history for a record slice (issue #188).
+///
+/// Resolves `handle` through the same documented order as `eg query failures`
+/// (canonical code record ID → task/task-source handle → repo-relative file
+/// path → exact symbol name → source/provenance handle) and returns the same
+/// trust-separated sections: `runtime_failures` (trust
+/// `verification_evidence`), `agent_failures` (trust `agent_authored`), and
+/// `superseding_successes` (later passing verifications, which never hide the
+/// older failures), plus the reached `patch_artifacts` and stable
+/// `diagnostics`.
+///
+/// Every failure row carries a stable `record_id`/evidence handle and a
+/// read-time `resolution_status` (`still_failing` | `since_resolved`).
+/// Sections are canonically ordered oldest-first, so identical stores yield
+/// byte-identical output.
+///
+/// Error codes (the same distinctions as the CLI exit codes, never a silent
+/// empty success):
+/// - `unsupported_handle` — malformed handle, same inputs the CLI rejects at exit 1
+/// - `ambiguous_handle` — cross-repository collision, with a `candidates` list
+/// - `no_match` — handle resolved to nothing live, same inputs the CLI rejects at exit 2
+/// - `stale_handle` — handle named only tombstoned records
+///
+/// A resolved target with no recorded failures is NOT an error: it returns
+/// `ok: true` with empty sections and a `safety_note`, because absence of
+/// recorded failure is not evidence of safety and no failure cause is ever
+/// inferred from the answer.
+///
+/// Rows reuse the CLI's redaction-safe serializers — no raw transcript text,
+/// command stdout/stderr, or patch hunks appear anywhere; only hashes,
+/// handles, bounded summaries, and redaction markers.
+#[must_use]
+pub fn tool_failure_history_from_records(records: &[GraphRecord], handle: &str) -> Value {
+    let repo_index = query::RepositoryIndex::build(records);
+    let target = match query::resolve_failure_handle(records, handle, &repo_index, None) {
+        Ok(target) => target,
+        Err(query::FailureHandleError::Ambiguous { handle, candidates }) => {
+            return json!({
+                "ok": false,
+                "error": {
+                    "code": "ambiguous_handle",
+                    "handle": handle,
+                    "candidates": candidates,
+                }
+            });
+        }
+        Err(query::FailureHandleError::Unsupported { handle, message }) => {
+            return json!({
+                "ok": false,
+                "error": {
+                    "code": "unsupported_handle",
+                    "handle": handle,
+                    "message": message,
+                }
+            });
+        }
+    };
+
+    // A handle that resolved to nothing live in the store is a structured
+    // no-match (or a stale handle when it named a tombstoned record). This is
+    // distinct from a resolved target that simply has no recorded failures,
+    // which is a genuine ok:true empty answer below (AC4).
+    if target.is_empty() {
+        let code = if target.stale {
+            "stale_handle"
+        } else {
+            "no_match"
+        };
+        return json!({
+            "ok": false,
+            "error": { "code": code, "handle": handle },
+        });
+    }
+
+    let ctx = query::failure_history_context(records, &target);
+
+    // The CLI's redaction-safe serializers (issue #188, AC6): every row
+    // carries only record IDs, hashes, handles, spans, and redaction
+    // markers — never raw payloads.
+    let runtime_failures: Vec<Value> = ctx
+        .runtime_failures
+        .iter()
+        .map(|attempt| {
+            serde_json::to_value(crate::cli::failure_attempt_json(attempt)).unwrap_or(Value::Null)
+        })
+        .collect();
+    let agent_failures: Vec<Value> = ctx
+        .agent_failures
+        .iter()
+        .map(|attempt| {
+            serde_json::to_value(crate::cli::failure_attempt_json(attempt)).unwrap_or(Value::Null)
+        })
+        .collect();
+    let superseding_successes: Vec<Value> = ctx
+        .superseding_successes
+        .iter()
+        .map(|item| serde_json::to_value(crate::cli::audit_item(item)).unwrap_or(Value::Null))
+        .collect();
+    let patch_artifacts: Vec<Value> = ctx
+        .patch_artifacts
+        .iter()
+        .map(|item| serde_json::to_value(crate::cli::audit_item(item)).unwrap_or(Value::Null))
+        .collect();
+    let diagnostics: Vec<Value> = ctx
+        .diagnostics
+        .iter()
+        .map(|diag| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("code".to_owned(), json!(diag.code));
+            obj.insert("source_record_id".to_owned(), json!(diag.source_record_id));
+            obj.insert("target_handle".to_owned(), json!(diag.target_handle));
+            if !diag.relation.is_empty() {
+                obj.insert("relation".to_owned(), json!(diag.relation));
+            }
+            if !diag.target_domain.is_empty() {
+                obj.insert("target_domain".to_owned(), json!(diag.target_domain));
+            }
+            Value::Object(obj)
+        })
+        .collect();
+
+    json!({
+        "ok": true,
+        "handle": handle,
+        "target_type": ctx.target_kind,
+        "target_ids": ctx.target_ids,
+        "runtime_failures": runtime_failures,
+        "agent_failures": agent_failures,
+        "superseding_successes": superseding_successes,
+        "patch_artifacts": patch_artifacts,
+        "diagnostics": diagnostics,
+        // AC4: absence of recorded failure is not evidence of safety, and no
+        // failure cause is ever inferred — the answer states the limit.
+        "safety_note": "No failure cause is inferred from this answer. A target with no recorded failures may still be unsafe: absence of recorded failure is not evidence of safety.",
+    })
+}
+
+// ── Temporal symbol lookup (issue #181) ──────────────────────────────────────
+
+/// The validated temporal selector for [`tool_symbol_at_from_records`].
+///
+/// Built by [`resolve_symbol_at_selector`], which enforces the
+/// exactly-one-selector rule before any daemon contact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolAtSelector<'a> {
+    /// A Git commit: full SHA or unique prefix, as supplied by the caller.
+    Commit(&'a str),
+    /// An RFC 3339 valid-time instant, as supplied by the caller.
+    AsOf(&'a str),
+}
+
+/// Validates the temporal selector triple for `symbol_at`.
+///
+/// Exactly one of `commit` / `as_of` must be present (blank strings count as
+/// absent); supplying both — or neither — is a `bad_request` parameter
+/// error. `tx_as_of` is rejected with `not_implemented`: the
+/// transaction-time axis currently covers `eg query symbol` only. A
+/// malformed `as_of` is rejected with `invalid_timestamp`, using the same
+/// message text as the CLI diagnostic.
+///
+/// Pure: performs no I/O, so the tool method validates arguments before
+/// discovering the daemon.
+///
+/// # Errors
+///
+/// Returns the `not_implemented` envelope when `tx_as_of` is supplied, the
+/// `bad_request` envelope when both or neither of `commit` / `as_of` is
+/// supplied, and the `invalid_timestamp` envelope when `as_of` is not valid
+/// RFC 3339.
+pub fn resolve_symbol_at_selector<'a>(
+    commit: Option<&'a str>,
+    as_of: Option<&'a str>,
+    tx_as_of: Option<&str>,
+) -> Result<SymbolAtSelector<'a>, Value> {
+    if let Some(tx) = tx_as_of.map(str::trim).filter(|s| !s.is_empty()) {
+        return Err(symbol_at_error(
+            "not_implemented",
+            &format!(
+                "--tx-as-of is not implemented for symbol_at; the transaction-time axis \
+                 currently covers `eg query symbol` only (got `{tx}`)"
+            ),
+        ));
+    }
+    let commit = commit.map(str::trim).filter(|s| !s.is_empty());
+    let as_of = as_of.map(str::trim).filter(|s| !s.is_empty());
+    match (commit, as_of) {
+        (Some(prefix), None) => Ok(SymbolAtSelector::Commit(prefix)),
+        (None, Some(instant)) => match chrono::DateTime::parse_from_rfc3339(instant) {
+            Ok(_) => Ok(SymbolAtSelector::AsOf(instant)),
+            Err(e) => Err(symbol_at_error(
+                "invalid_timestamp",
+                &format!("invalid --as-of timestamp '{instant}': {e}"),
+            )),
+        },
+        (Some(_), Some(_)) => Err(symbol_at_error(
+            "bad_request",
+            "exactly one temporal selector is required: pass `commit` or `as_of`, not both",
+        )),
+        (None, None) => Err(symbol_at_error(
+            "bad_request",
+            "exactly one temporal selector is required: pass `commit` (full SHA or unique \
+             prefix) or `as_of` (RFC 3339 instant)",
+        )),
+    }
+}
+
+/// Builds a `symbol_at` error envelope sharing the frozen error shape.
+#[must_use]
+fn symbol_at_error(code: &str, message: &str) -> Value {
+    json!({
+        "ok": false,
+        "error": { "code": code, "message": message }
+    })
+}
+
+/// Runs the `symbol_at` temporal lookup over a record slice.
+///
+/// Mirrors the `eg query symbol --at/--as-of` lanes: the commit path reuses
+/// the CLI's distinct-prefix ambiguity scan
+/// ([`crate::cli::temporal_commit_if_prefix`]) plus
+/// [`query::symbols_at_commit`]; the as-of path reuses
+/// [`query::symbol_as_of_valid_time_by_repo`]. A same-name collision across
+/// repositories yields `ambiguous_repository` instead of an implicit pick
+/// (issue #67); an ambiguous commit prefix yields `ambiguous_commit_prefix`;
+/// a miss yields `no_match`.
+///
+/// The success payload carries the citable row — `record_id`, `name`,
+/// `kind`, `repo_relative_path`, `span`, `git_commit`, `valid_time` — whose
+/// CLI-emitted fields are byte-equal to `eg query symbol --at/--as-of` for
+/// the same store and inputs. Only bounded citation handles are returned;
+/// no raw source text (redaction-safe).
+///
+/// Pure: performs no I/O.
+#[must_use]
+pub fn tool_symbol_at_from_records(
+    records: &[GraphRecord],
+    symbol_name: &str,
+    selector: SymbolAtSelector<'_>,
+) -> Value {
+    let index = query::RepositoryIndex::build(records);
+    let record = match selector {
+        SymbolAtSelector::Commit(prefix) => {
+            match commit_version_at(records, &index, symbol_name, prefix) {
+                Ok(record) => record,
+                Err(payload) => return payload,
+            }
+        }
+        SymbolAtSelector::AsOf(instant) => {
+            match as_of_version_at(records, &index, symbol_name, instant) {
+                Ok(record) => record,
+                Err(payload) => return payload,
+            }
+        }
+    };
+    let Some(row) = symbol_at_row(record) else {
+        return symbol_at_no_match(
+            symbol_name,
+            &format!("no match found for symbol `{symbol_name}`"),
+        );
+    };
+    let (kind, value) = match selector {
+        SymbolAtSelector::Commit(prefix) => ("commit", prefix),
+        SymbolAtSelector::AsOf(instant) => ("as_of", instant),
+    };
+    json!({
+        "ok": true,
+        "symbol_name": symbol_name,
+        "selector": { "kind": kind, "value": value },
+        "symbol": row,
+    })
+}
+
+/// Resolves the symbol version the CLI `--at` lane would print.
+///
+/// Scans the distinct commits matching the prefix exactly like
+/// `query_symbol_at` does: zero → `no_match`, two or more →
+/// `ambiguous_commit_prefix`, exactly one → the version at that commit, with
+/// a cross-repository collision reported as `ambiguous_repository` (never an
+/// implicit pick).
+fn commit_version_at<'records>(
+    records: &'records [GraphRecord],
+    index: &query::RepositoryIndex,
+    symbol_name: &str,
+    prefix: &str,
+) -> Result<&'records GraphRecord, Value> {
+    let matching_commits: std::collections::BTreeSet<&str> = records
+        .iter()
+        .filter_map(|record| crate::cli::temporal_commit_if_prefix(record, prefix))
+        .collect();
+    if matching_commits.len() > 1 {
+        return Err(json!({
+            "ok": false,
+            "error": {
+                "code": "ambiguous_commit_prefix",
+                "commit_prefix": prefix,
+                "matching_commits": matching_commits.len(),
+                "message": format!(
+                    "ambiguous commit prefix `{prefix}` matches {} commits",
+                    matching_commits.len()
+                ),
+            }
+        }));
+    }
+    let matches = query::symbols_at_commit(records, symbol_name, prefix);
+    check_repository_collision(index, &matches)?.ok_or_else(|| {
+        symbol_at_no_match(
+            symbol_name,
+            &format!("no match found for symbol `{symbol_name}` at commit `{prefix}`"),
+        )
+    })
+}
+
+/// Resolves the symbol version the CLI `--as-of` lane would print: the best
+/// record per repository at or before the instant, failing closed on a
+/// cross-repository collision (issue #67).
+fn as_of_version_at<'records>(
+    records: &'records [GraphRecord],
+    index: &query::RepositoryIndex,
+    symbol_name: &str,
+    instant: &str,
+) -> Result<&'records GraphRecord, Value> {
+    let results =
+        match query::symbol_as_of_valid_time_by_repo(records, symbol_name, instant, index, None) {
+            Ok(results) => results,
+            Err(message) => return Err(symbol_at_error("invalid_timestamp", &message)),
+        };
+    check_repository_collision(index, &results)?.ok_or_else(|| {
+        symbol_at_no_match(
+            symbol_name,
+            &format!("no match found for symbol `{symbol_name}` at or before `{instant}`"),
+        )
+    })
+}
+
+/// Fails closed when candidate records span more than one repository group
+/// (issue #67): returns the single record when every candidate is owned by
+/// one group, `None` when there are no candidates, and the
+/// `ambiguous_repository` envelope on a collision. Mirrors the CLI's
+/// `exit_ambiguous_repository` diagnostic, including the unattributed
+/// legacy-rows flag.
+fn check_repository_collision<'records>(
+    index: &query::RepositoryIndex,
+    matches: &[&'records GraphRecord],
+) -> Result<Option<&'records GraphRecord>, Value> {
+    let groups: std::collections::BTreeSet<Option<&str>> = matches
+        .iter()
+        .map(|record| index.owner_of(record.id()))
+        .collect();
+    if groups.len() > 1 {
+        let repositories: Vec<&str> = groups.iter().filter_map(|group| *group).collect();
+        let mut error = json!({
+            "ok": false,
+            "error": {
+                "code": "ambiguous_repository",
+                "message": "multiple repositories match; the tool cannot pick one implicitly — \
+                            query a single-repository store",
+                "repositories": repositories,
+            }
+        });
+        if groups.contains(&None) {
+            error["error"]["includes_unattributed_rows"] = Value::Bool(true);
+        }
+        return Err(error);
+    }
+    Ok(matches.first().copied())
+}
+
+/// The `no_match` envelope for `symbol_at`, sharing the frozen error shape.
+#[must_use]
+fn symbol_at_no_match(symbol_name: &str, message: &str) -> Value {
+    json!({
+        "ok": false,
+        "error": {
+            "code": "no_match",
+            "symbol_name": symbol_name,
+            "message": message,
+        }
+    })
+}
+
+/// Projects a temporal symbol version to the citable row.
+///
+/// The CLI-emitted fields (`record_id`, `name`, `kind`,
+/// `repo_relative_path`, `span`, `git_commit`) are byte-equal to
+/// `eg query symbol --at/--as-of` for the same record; `valid_time` is the
+/// temporal field the CLI temporal row carries (issue #181). Only bounded
+/// handles — never raw source text.
+#[must_use]
+fn symbol_at_row(record: &GraphRecord) -> Option<Value> {
+    let GraphRecord::Node {
+        id,
+        name,
+        repo_relative_path,
+        span,
+        temporal,
+        valid_time,
+        ..
+    } = record
+    else {
+        return None;
+    };
+    Some(json!({
+        "record_id": id,
+        "name": name.as_deref().unwrap_or(""),
+        "kind": "Symbol",
+        "repo_relative_path": repo_relative_path,
+        "span": span,
+        "git_commit": temporal.as_ref().map(|temporal| temporal.git_commit.as_str()),
+        "valid_time": temporal.as_ref().map(|temporal| temporal.valid_time.as_str())
+            .or(valid_time.as_deref()),
+    }))
 }
 
 // ── Tool runners (daemon I/O) ─────────────────────────────────────────────────
 
-fn run_inspect_store(data_dir: &Path) -> Value {
+/// Builds the machine-readable `freshness` object stamped onto MCP tool
+/// responses (issue #220).
+///
+/// Reuses the store-freshness contract from #186 — no new vocabulary:
+/// - `verdict` / `fresh`: the stable code from
+///   [`freshness::Freshness::code`](crate::freshness::Freshness) (`fresh` /
+///   `stale_head` / `stale_dirty` / `unknown`), computed by the exact code path
+///   `eg freshness` uses, so the verdict always agrees with the CLI for the
+///   same store and working-tree state.
+/// - `stored_snapshot`: the source-snapshot identity the answer was derived
+///   from, reusing the on-disk [`SourceSnapshotPayload`](crate::ir::SourceSnapshotPayload)
+///   serialization (`head.state`: `commit` + `sha`, `no_git`, or `unborn_head`);
+///   a store that predates snapshot stamping carries the explicit
+///   `{"state": "pre_stamping"}` marker instead of a silent absence — never a
+///   false `fresh`.
+/// - `current_head` / `current_dirty`: the working-tree state the stored
+///   snapshot was compared against, probed read-only at `repo_path`.
+/// - `repository_id` / `repo_path` / `message`: which repository the verdict
+///   was computed for, which tree it was compared against, and the
+///   human-readable explanation from the #186 contract.
+///
+/// The probe is strictly read-only and offline: `git rev-parse` / `git status`
+/// with `GIT_OPTIONAL_LOCKS=0` (the index is never refreshed), no network, and
+/// no store writes. For a fixed store + working-tree state the object is
+/// byte-identical across calls (the stored `scanned_at` is record data, fixed
+/// for a fixed store).
+#[must_use]
+pub fn tool_freshness_stamp(
+    records: &[GraphRecord],
+    repo_path: &Path,
+    data_dir: Option<&Path>,
+) -> Value {
+    let report = crate::cli::assess_freshness(repo_path, records, None, data_dir, None);
+    // Explicit marker — a pre-stamping store must never read as a silent
+    // absence, and must never classify `fresh`.
+    let stored_snapshot = report.stored_snapshot.as_ref().map_or_else(
+        || json!({"state": "pre_stamping"}),
+        |snapshot| serde_json::to_value(snapshot).unwrap_or(Value::Null),
+    );
+    json!({
+        "verdict": report.freshness,
+        "fresh": report.fresh,
+        "repository_id": report.repository_id,
+        "repo_path": repo_path.display().to_string(),
+        "stored_snapshot": stored_snapshot,
+        "current_head": report.current_head,
+        "current_dirty": report.current_dirty,
+        "message": report.message,
+    })
+}
+
+/// Stamps the [`tool_freshness_stamp`] object onto a successful tool payload
+/// (issue #220).
+///
+/// Freshness is a trust signal, never suppression: the stamp is purely additive
+/// and the full answer payload is preserved. Error payloads (`ok: false`) are
+/// left untouched — freshness annotates answers, not failures.
+pub fn stamp_freshness_on_payload(
+    payload: &mut Value,
+    records: &[GraphRecord],
+    repo_path: &Path,
+    data_dir: Option<&Path>,
+) {
+    if payload.get("ok").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    payload["freshness"] = tool_freshness_stamp(records, repo_path, data_dir);
+}
+
+fn run_inspect_store(data_dir: &Path, repo_path: &Path) -> Value {
     let client = match DaemonClient::from_data_dir(data_dir) {
         Ok(c) => c,
         Err(e) => return daemon_error(&e.to_string()),
@@ -595,7 +1751,63 @@ fn run_inspect_store(data_dir: &Path) -> Value {
         Ok(r) => r,
         Err(e) => return daemon_error(&e.to_string()),
     };
-    tool_inspect_store_from_records(&records, &unknown_versions, &snapshot_timestamp)
+    let mut payload =
+        tool_inspect_store_from_records(&records, &unknown_versions, &snapshot_timestamp);
+    stamp_freshness_on_payload(&mut payload, &records, repo_path, Some(data_dir));
+    payload
+}
+
+/// Runs the `search_code` semantic query against a live daemon with a
+/// caller-supplied query vector (issue #182).
+///
+/// The test seam behind the rmcp method: production callers embed the
+/// natural-language query first (the rmcp method does this via
+/// [`semantic::embed_query_text`]); tests inject deterministic synthetic
+/// vectors so no embedding model is needed. `limit` is the already-resolved
+/// effective limit (see [`search_code_effective_limit`]).
+///
+/// Flow:
+/// 1. Connect to the daemon for `data_dir` — a missing or stale daemon
+///    surfaces the existing `daemon_not_running` / `daemon_stale` envelope
+///    before any model loads.
+/// 2. Ask the daemon's `semantic_search` verb for `limit` matches with the
+///    given vector.
+/// 3. A [`DaemonQueryRejection`] maps through [`search_code_rejection_error`]
+///    (missing index, unreadable index, dimension mismatch); any other daemon
+///    failure keeps the existing `daemon_not_running` envelope.
+/// 4. A verb result shapes through [`tool_search_code_from_verb_result`] and,
+///    like every read tool, is stamped with the store-freshness verdict.
+///
+/// Performs daemon I/O.
+#[must_use]
+pub fn tool_search_code_with_vector(
+    data_dir: &Path,
+    repo_path: &Path,
+    query: &str,
+    limit: usize,
+    query_vector: &[f32],
+) -> Value {
+    let client = match DaemonClient::from_data_dir(data_dir) {
+        Ok(c) => c,
+        Err(e) => return daemon_error(&e.to_string()),
+    };
+    let params = json!({ "query_vector": query_vector, "limit": limit });
+    let result = match client.query_verb_raw("semantic_search", &params, None) {
+        Ok(result) => result,
+        Err(e) => {
+            if let Some(rejection) = e.downcast_ref::<DaemonQueryRejection>() {
+                return search_code_rejection_error(rejection);
+            }
+            return daemon_error(&e.to_string());
+        }
+    };
+    let mut payload = tool_search_code_from_verb_result(query, limit, &result);
+    let (records, _unknown, _ts) = match client.get_all_records() {
+        Ok(r) => r,
+        Err(e) => return daemon_error(&e.to_string()),
+    };
+    stamp_freshness_on_payload(&mut payload, &records, repo_path, Some(data_dir));
+    payload
 }
 
 // ── Record → JSON helpers ─────────────────────────────────────────────────────
@@ -687,6 +1899,19 @@ fn record_to_observation(record: &GraphRecord, trust: &query::TrustIndex<'_>) ->
 /// Returns only citation metadata from an `OutputHandle`, stripping any inlined payload.
 fn output_handle_citation(h: &crate::ir::OutputHandle) -> Value {
     json!({ "hash": h.hash, "bytes": h.bytes })
+}
+
+/// Builds the MCP JSON row for one agent-authored `Decision` record
+/// (issue #191): `decision_text` plus the non-empty `rationale_summary`,
+/// provenance, confidence, and resolved evidence handles. Reuses the
+/// shared [`query::context_decision`] builder so the MCP lane emits the
+/// same row shape as the CLI.
+fn record_to_decision(
+    record: &GraphRecord,
+    records: &[GraphRecord],
+    trust: &query::TrustIndex<'_>,
+) -> Option<Value> {
+    query::context_decision(record, records, trust).and_then(|row| serde_json::to_value(row).ok())
 }
 
 /// Returns only citation metadata from a `PatchHandle`, stripping any inlined bytes.
@@ -869,6 +2094,20 @@ fn unresolved_to_json(u: &query::UnresolvedRef) -> Value {
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
 
+/// Builds the stable `missing_argument` error payload for an empty required
+/// tool argument (issue #194: the shape is part of the frozen contract).
+#[must_use]
+pub fn missing_argument_error(field: &str) -> Value {
+    json!({
+        "ok": false,
+        "error": {
+            "code": "missing_argument",
+            "field": field,
+            "message": format!("{field} is required and must be non-empty")
+        }
+    })
+}
+
 fn daemon_error(msg: &str) -> Value {
     let code = if msg.to_lowercase().contains("stale") || msg.to_lowercase().contains("metadata") {
         "daemon_stale"
@@ -881,10 +2120,314 @@ fn daemon_error(msg: &str) -> Value {
     })
 }
 
+/// The documented safe default for `search_code`'s `limit`: the same default
+/// `eg query semantic` uses.
+pub const SEARCH_CODE_DEFAULT_LIMIT: usize = 10;
+
+/// The ceiling for `search_code`'s `limit`: the daemon `semantic_search`
+/// verb's maximum.
+pub const SEARCH_CODE_MAX_LIMIT: usize = 100;
+
+/// Resolves the effective match limit for `search_code`.
+///
+/// Absent → the documented default (10); an over-ceiling value → clamped to
+/// 100. The clamp is computed in `u64` and narrowed with a checked
+/// conversion, so extreme `u64` inputs can never truncate or panic.
+///
+/// Pure: performs no I/O.
+#[must_use]
+pub fn search_code_effective_limit(limit: Option<u64>) -> usize {
+    limit.map_or(SEARCH_CODE_DEFAULT_LIMIT, |l| {
+        usize::try_from(l.min(SEARCH_CODE_MAX_LIMIT as u64)).unwrap_or(SEARCH_CODE_MAX_LIMIT)
+    })
+}
+
+/// Maps a daemon `semantic_search` rejection to the tool's stable error
+/// envelope (issue #182).
+///
+/// - `missing_semantic_index` (structural-only store, never `--embed`ed) and
+///   `semantic_index_unreadable` (damaged index, issue #489) keep the
+///   daemon's stable codes; the former carries the re-ingest remedy.
+/// - `incompatible_embedding_dimension` (a vector width the index cannot
+///   share) is refused under the issue #104 refusal-contract code
+///   `embedding_dimension_mismatch` — the same stable code the embedded CLI
+///   path emits — so agents see one vocabulary for one condition.
+/// - Any other rejection keeps the daemon's code and message verbatim; the
+///   tool invents no new vocabulary for conditions it does not classify.
+///
+/// Pure: performs no I/O.
+#[must_use]
+pub fn search_code_rejection_error(rejection: &DaemonQueryRejection) -> Value {
+    match rejection.code.as_str() {
+        "missing_semantic_index" => json!({
+            "ok": false,
+            "error": {
+                "code": "missing_semantic_index",
+                "message": "the store has no semantic vector index; re-ingest with --embed to enable semantic search",
+            }
+        }),
+        "semantic_index_unreadable" => json!({
+            "ok": false,
+            "error": {
+                "code": "semantic_index_unreadable",
+                "message": "the semantic vector index is present but unreadable; it must be rebuilt before semantic search can run",
+            }
+        }),
+        "incompatible_embedding_dimension" => json!({
+            "ok": false,
+            "error": {
+                "code": "embedding_dimension_mismatch",
+                "message": "the query embedding's dimension does not match the index; re-ingest with the current embedding model",
+            }
+        }),
+        code => json!({
+            "ok": false,
+            "error": { "code": code, "message": rejection.message }
+        }),
+    }
+}
+
+/// Classifies a single semantic match's relevance band from its score, using
+/// the same calibrated threshold the CLI's `--daemon` row rendering uses
+/// ([`semantic_confidence`]).
+const fn search_code_confidence_band(score: f32) -> ConfidenceBand {
+    ConfidenceBand::of_score(score)
+}
+
+/// Shapes a daemon `semantic_search` verb result into the `search_code`
+/// success payload (issue #182).
+///
+/// The verb's `records` array is forwarded row-for-row in the daemon's ranked
+/// order — the rows already carry the stable per-match fields
+/// (`record_id`, `score`, `name`, `repo_relative_path`, `span`, plus the
+/// optional repository handles), so no score is recomputed and the ranking
+/// is byte-identical to `eg query semantic`. Each row is enriched with the
+/// per-row confidence rendering the CLI's `--daemon` path emits
+/// (`confidence_band`, `selection_threshold`, `selection_basis`). The issue
+/// #243 `embedding_provenance` envelope and the issue #221 `confidence`
+/// verdict ride along verbatim, so agents can audit model/index identity and
+/// the relevance-floor decision.
+///
+/// An empty `records` array is a successful, explicitly-empty answer with the
+/// stable `no_semantic_matches` marker — never a fabricated or back-filled
+/// record, never an error.
+///
+/// Pure: performs no I/O and contacts no daemon.
+#[must_use]
+pub fn tool_search_code_from_verb_result(query: &str, limit: usize, result: &Value) -> Value {
+    let empty = result
+        .get("records")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty);
+    let records: &[Value] = result
+        .get("records")
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice);
+    let matches: Vec<Value> = records
+        .iter()
+        .map(|row| {
+            let mut enriched = row.clone();
+            if let Some(obj) = enriched.as_object_mut() {
+                // The CLI's `--daemon` row rendering (src/cli/semantic.rs);
+                // the precision loss is negligible for a threshold comparison.
+                #[allow(clippy::cast_possible_truncation)]
+                let band = search_code_confidence_band(
+                    row.get("score").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                );
+                obj.insert("confidence_band".to_owned(), Value::from(band.as_str()));
+                obj.insert(
+                    "selection_threshold".to_owned(),
+                    json!(SEMANTIC_CONFIDENT_THRESHOLD),
+                );
+                obj.insert(
+                    "selection_basis".to_owned(),
+                    Value::from(SEMANTIC_SELECTION_BASIS),
+                );
+            }
+            enriched
+        })
+        .collect();
+    let mut payload = json!({
+        "ok": true,
+        "query": query,
+        "limit": limit,
+        "matches": matches,
+        "embedding_provenance": result.get("embedding_provenance").unwrap_or(&Value::Null),
+        "confidence": result.get("confidence").unwrap_or(&Value::Null),
+        "compatibility_note": "daemon-path embeddings are embedded with the daemon build's model; for the local-CLI compatibility gate (identity + dimension checks, issue #104), use `eg query semantic` against the same store",
+    });
+    if empty {
+        payload["message"] = Value::from(
+            "no_semantic_matches: no records in the semantic index cleared the relevance floor",
+        );
+    }
+    payload
+}
+
+/// Builds the [`ObservationRequest`] for the `record_observation` tool.
+///
+/// Pure: performs no I/O and contacts no daemon. An absent or empty required
+/// field is a [`ProvenanceError::missing`]; a target domain outside
+/// `codegraph`/`verification` is [`ProvenanceError::invalid`] (mirroring the
+/// CLI's `--evidence-domain` pre-check in `eg write observation`). The built
+/// request then validates through [`validate_observation_request`] — the same
+/// function the record builder uses — so malformed timestamps, unknown agent
+/// kinds, out-of-range confidence, and inconsistent evidence links are
+/// rejected here, before any daemon contact. The CLI and the MCP tool share
+/// one provenance contract, enforced by one function, so the two transports
+/// cannot drift apart.
+///
+/// The evidence relation is derived from the target domain exactly as the CLI
+/// derives it: `codegraph` → `OBSERVES`, `verification` → `VALIDATED_BY`.
+/// Each link carries the observation's confidence, also matching the CLI.
+///
+/// # Errors
+///
+/// Returns a [`ProvenanceError`] naming the first missing or invalid field:
+/// an absent or empty required field is `missing`, a target domain outside
+/// `codegraph`/`verification` is `invalid`, and anything the shared
+/// [`validate_observation_request`] contract rejects (malformed
+/// `observed_at`, unknown `agent_kind`, out-of-range confidence, inconsistent
+/// evidence links) is returned unchanged.
+pub fn record_observation_request_from_args(
+    args: &RecordObservationArgs,
+) -> Result<ObservationRequest, ProvenanceError> {
+    fn required(field: &str, value: Option<&str>) -> Result<String, ProvenanceError> {
+        match value {
+            Some(text) if !text.is_empty() => Ok(text.to_owned()),
+            _ => Err(ProvenanceError::missing(field)),
+        }
+    }
+    let confidence = args
+        .confidence
+        .ok_or_else(|| ProvenanceError::missing("confidence"))?;
+    let targets = args.evidence.as_deref().unwrap_or_default();
+    if targets.is_empty() {
+        return Err(ProvenanceError::missing("evidence"));
+    }
+    let evidence_links = targets
+        .iter()
+        .map(|target| record_observation_evidence_link(target, confidence))
+        .collect::<Result<Vec<_>, _>>()?;
+    let req = ObservationRequest {
+        provenance: EvidenceProvenance {
+            agent_id: required("agent_id", args.agent_id.as_deref())?,
+            agent_kind: args.agent_kind.clone().unwrap_or_default(),
+            session_id: required("session_id", args.session_id.as_deref())?,
+            observed_at: args.observed_at.clone().unwrap_or_else(now_rfc3339),
+            source_handle: Some(required("source_handle", args.source_handle.as_deref())?),
+        },
+        text: required("text", args.text.as_deref())?,
+        confidence,
+        evidence_links,
+        supersession: None,
+    };
+    // One shared provenance contract: the CLI's record builder validates
+    // through this same function.
+    validate_observation_request(&req)?;
+    Ok(req)
+}
+
+/// Builds one [`EvidenceLink`] for a `record_observation` evidence target.
+///
+/// Only `codegraph` and `verification` domains are accepted — the CLI rejects
+/// anything else before building, because the daemon rejects `OBSERVES` on
+/// non-codegraph targets and `VALIDATED_BY` on non-verification targets.
+fn record_observation_evidence_link(
+    target: &RecordObservationEvidenceTarget,
+    confidence: f64,
+) -> Result<EvidenceLink, ProvenanceError> {
+    let target_record_id = match target.target_record_id.as_deref() {
+        Some(id) if !id.is_empty() => id.to_owned(),
+        _ => return Err(ProvenanceError::missing("evidence.target_record_id")),
+    };
+    let target_domain = match target.target_domain.as_deref() {
+        Some(domain) if !domain.is_empty() => domain,
+        _ => return Err(ProvenanceError::missing("evidence.target_domain")),
+    };
+    let relation = match target_domain {
+        "codegraph" => EdgeLabel::Observes.as_str(),
+        "verification" => EdgeLabel::ValidatedBy.as_str(),
+        _ => return Err(ProvenanceError::invalid("evidence.target_domain")),
+    };
+    Ok(EvidenceLink {
+        target_record_id: Some(target_record_id),
+        target_domain: target_domain.to_owned(),
+        relation: relation.to_owned(),
+        confidence: confidence.to_string(),
+        as_of_commit: None,
+        target_repo_relative_path: None,
+        target_span: None,
+        target_git_commit: None,
+    })
+}
+
+/// Maps a [`ProvenanceError`] to the frozen structured error envelope.
+///
+/// The envelope names the offending field but never echoes payload text: the
+/// message carries only the stable code and the field path.
+#[must_use]
+pub fn provenance_error_payload(error: &ProvenanceError) -> Value {
+    let message = match error.code {
+        "missing_field" => format!("{} is required", error.field),
+        _ => format!("{} is invalid", error.field),
+    };
+    json!({
+        "ok": false,
+        "error": {
+            "code": error.code,
+            "field": error.field,
+            "message": message,
+        }
+    })
+}
+
+/// Structured error for a write the daemon refused after accepting the
+/// request (e.g. a dangling evidence target under `RejectBatch`).
+///
+/// The batch is atomic: when this error fires, nothing was persisted. `detail`
+/// carries the daemon's first per-record diagnostic (stable handles only —
+/// never payload text).
+fn write_rejected_error(detail: &str) -> Value {
+    json!({
+        "ok": false,
+        "error": {
+            "code": "write_rejected",
+            "message": "the store rejected the write; nothing was persisted",
+            "detail": detail,
+        }
+    })
+}
+
+/// Structured error for a write that failed in transport (daemon unreachable
+/// mid-call, ingest HTTP failure, unparseable response).
+///
+/// `message` is the daemon client's own error text, which never contains
+/// payload values.
+fn write_failed_error(message: &str) -> Value {
+    json!({
+        "ok": false,
+        "error": { "code": "write_failed", "message": message }
+    })
+}
+
 // ── Argument helpers ──────────────────────────────────────────────────────────
 
 fn opt_data_dir(data_dir: Option<&str>, default: &Path) -> PathBuf {
     data_dir.map_or_else(|| default.to_path_buf(), PathBuf::from)
+}
+
+/// Resolves the working-tree path a freshness verdict is computed against.
+///
+/// Defaults to the MCP server process's current directory, mirroring
+/// `eg freshness`'s default `repo_path` of `.`. A missing/unresolvable default
+/// degrades to an empty path, whose working-tree probe yields `no_git` and
+/// therefore an `unknown` verdict — never a false `fresh`.
+fn opt_repo_path(repo_path: Option<&str>) -> PathBuf {
+    repo_path.map_or_else(
+        || std::env::current_dir().unwrap_or_default(),
+        PathBuf::from,
+    )
 }
 
 // ── Domain category mapping (matches the existing CLI inspect output) ─────────

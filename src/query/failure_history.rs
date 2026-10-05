@@ -18,6 +18,12 @@ pub enum FailureTargetKind {
     Task,
     /// A source/provenance handle naming failures directly.
     Source,
+    /// A working set of file/symbol anchors (issue #214 briefing). Traversed
+    /// like `File`/`Symbol` anchors — inbound from each anchor ID — without
+    /// the `Source` seed-only restriction, since anchor-linked failures from
+    /// other sessions are exactly the prior failures the briefing wants.
+    /// Never produced by [`resolve_failure_target`]; constructed directly.
+    WorkingSet,
 }
 
 impl FailureTargetKind {
@@ -29,6 +35,7 @@ impl FailureTargetKind {
             Self::File => "file",
             Self::Task => "task",
             Self::Source => "source",
+            Self::WorkingSet => "working_set",
         }
     }
 }
@@ -41,6 +48,8 @@ pub struct ResolvedFailureTarget {
     /// Which handle type matched.
     pub kind: FailureTargetKind,
     /// Live code/task record IDs to traverse inbound from. Empty for `Source`.
+    /// For [`FailureTargetKind::WorkingSet`] this carries the mixed file and
+    /// symbol anchor IDs of the working set.
     pub anchor_ids: BTreeSet<String>,
     /// Failure/verification record IDs matched directly by a source handle.
     pub seed_failures: BTreeSet<String>,
@@ -292,13 +301,6 @@ pub fn resolve_failure_handle(
         });
     }
 
-    let tombstoned: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
-            _ => None,
-        })
-        .collect();
     // Latest-write-wins tombstone / temporal liveness (issue #421): over an
     // append-only `--graph`, a record re-ingested AFTER its own tombstone is live
     // again, and a record/edge that still has a temporal (history) version is not
@@ -307,6 +309,14 @@ pub fn resolve_failure_handle(
     // current-state read so `--graph` and `--data-dir` agree. See
     // `super::liveness`.
     let liveness = Liveness::new(records);
+    let tombstoned: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
+            _ => None,
+        })
+        .filter(|&id| liveness.deleted(id))
+        .collect();
     let deleted = |id: &str| liveness.deleted(id);
     let in_scope = |id: &str| -> bool {
         repo_scope.is_none_or(|scope| repo_index.owner_of(id) == Some(scope))
@@ -339,6 +349,11 @@ pub fn resolve_failure_handle(
             });
         }
         if deleted(handle) {
+            return Ok(empty_target(FailureTargetKind::Symbol, true));
+        }
+        // Issue #472: an ID with an ACTIVE repository-eviction tombstone is not
+        // a live record. Resolve to nothing so the caller emits no_match.
+        if crate::repo_evict::active_eviction_tombstoned_ids(records).contains(handle) {
             return Ok(empty_target(FailureTargetKind::Symbol, true));
         }
         for r in records {
@@ -668,13 +683,6 @@ pub fn failure_history_context<'a>(
     target: &ResolvedFailureTarget,
 ) -> FailureHistoryContext<'a> {
     let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
-    let tombstoned: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
-            _ => None,
-        })
-        .collect();
     // Latest-write-wins tombstone / temporal liveness (issue #421): over an
     // append-only `--graph`, a record re-ingested AFTER its own tombstone is live
     // again, and history-bearing reads keep records/edges that carry a temporal
@@ -683,6 +691,14 @@ pub fn failure_history_context<'a>(
     // matching the embedded current-state read so `--graph` and `--data-dir`
     // agree. See `super::liveness`.
     let liveness = Liveness::new(records);
+    let tombstoned: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
+            _ => None,
+        })
+        .filter(|&id| liveness.deleted(id))
+        .collect();
     let deleted = |id: &str| liveness.deleted(id);
     let present = |id: &str| -> Option<&'a GraphRecord> {
         if deleted(id) {
@@ -1175,7 +1191,14 @@ fn push_attempt_link_diagnostics(
 
 /// Returns the live code/task record IDs a node links to outbound, via graph
 /// edges or denormalized evidence links with a target-linking relation.
-fn outbound_code_task_targets<'a>(
+///
+/// Shared with the store-wide failure-hotspots lane (issue #254) so it
+/// resolves each `Failure` to its code targets with the same edge +
+/// evidence-link semantics.
+// Kept `pub(crate)`: the `pub use` glob in mod.rs re-exports this at its
+// original crate-internal visibility; `pub` would widen it to the public API.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn outbound_code_task_targets<'a>(
     node: &'a GraphRecord,
     edges_from: &BTreeMap<&'a str, Vec<(&'a EdgeLabel, &'a str)>>,
     present: &impl Fn(&str) -> Option<&'a GraphRecord>,
@@ -1392,6 +1415,8 @@ mod liveness_parity_tests {
                 end_byte: 10,
                 start_line: 1,
                 end_line: 2,
+                start_column: None,
+                end_column: None,
             }),
             Some("foo".to_owned()),
             "symbol foo".to_owned(),
@@ -1468,6 +1493,130 @@ mod liveness_parity_tests {
         assert!(
             target.stale && target.is_empty(),
             "a tombstone with no later re-ingest keeps the handle stale"
+        );
+    }
+
+    fn task(id: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Task,
+            None,
+            None,
+            None,
+            "task".to_owned(),
+        )
+    }
+
+    fn canonical_task_id() -> String {
+        format!("project:v1:{}", "a".repeat(64))
+    }
+
+    #[test]
+    fn task_handle_reingested_after_tombstone_resolves_live() {
+        // The task-handle branch of `resolve_failure_handle` filtered on raw
+        // tombstone membership: a task re-ingested AFTER its own tombstone was
+        // reported stale over `--graph` while `--data-dir` resolved it live.
+        let id = canonical_task_id();
+        let records = vec![task(&id), tomb(&id), task(&id)];
+        let repo_index = RepositoryIndex::build(&records);
+        let target = resolve_failure_handle(&records, &id, &repo_index, None).expect("resolves");
+        assert_eq!(
+            target.kind,
+            FailureTargetKind::Task,
+            "a revived task handle must still resolve to its task"
+        );
+        assert!(
+            !target.stale,
+            "a task revived after its tombstone must resolve non-stale"
+        );
+        assert!(target.anchor_ids.contains(&id));
+    }
+
+    #[test]
+    fn task_handle_tombstone_without_reingest_is_stale() {
+        let id = canonical_task_id();
+        let records = vec![task(&id), tomb(&id)];
+        let repo_index = RepositoryIndex::build(&records);
+        let target = resolve_failure_handle(&records, &id, &repo_index, None).expect("resolves");
+        assert!(
+            target.stale && target.is_empty(),
+            "a task tombstone with no later re-ingest keeps the handle stale"
+        );
+    }
+
+    fn evidence_link_to(target: &str) -> crate::ir::EvidenceLink {
+        crate::ir::EvidenceLink {
+            target_record_id: Some(target.to_owned()),
+            target_domain: "codegraph".to_owned(),
+            relation: "OBSERVES".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }
+    }
+
+    fn failed_verification_with_link(id: &str, link: crate::ir::EvidenceLink) -> GraphRecord {
+        let mut rec = failed_verification(id);
+        if let GraphRecord::Node { evidence_links, .. } = &mut rec {
+            *evidence_links = Some(vec![link]);
+        }
+        rec
+    }
+
+    #[test]
+    fn revived_evidence_target_yields_no_stale_diagnostic() {
+        // `push_attempt_link_diagnostics` classified link targets on raw
+        // tombstone membership: an evidence target re-ingested AFTER its own
+        // tombstone was misreported `stale_evidence_target` over `--graph`
+        // while `--data-dir` saw it live.
+        let anchor = "codegraph:v5:anchor";
+        let target = "codegraph:v5:target";
+        let v = "verification:v1:run";
+        let records = vec![
+            sym(anchor),
+            sym(target),
+            tomb(target),
+            sym(target),
+            failed_verification_with_link(v, evidence_link_to(target)),
+            failed_on(v, anchor),
+        ];
+        let ctx = failure_history_context(&records, &symbol_target(anchor));
+        assert!(
+            ctx.diagnostics
+                .iter()
+                .all(|d| !(d.code == "stale_evidence_target" && d.target_handle == target)),
+            "a revived evidence target must not be diagnosed stale: {:?}",
+            ctx.diagnostics
+                .iter()
+                .map(|d| (&d.code, &d.target_handle))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn tombstoned_evidence_target_without_reingest_is_stale_diagnostic() {
+        let anchor = "codegraph:v5:anchor";
+        let target = "codegraph:v5:target";
+        let v = "verification:v1:run";
+        let records = vec![
+            sym(anchor),
+            sym(target),
+            tomb(target),
+            failed_verification_with_link(v, evidence_link_to(target)),
+            failed_on(v, anchor),
+        ];
+        let ctx = failure_history_context(&records, &symbol_target(anchor));
+        assert!(
+            ctx.diagnostics
+                .iter()
+                .any(|d| d.code == "stale_evidence_target" && d.target_handle == target),
+            "a tombstoned-without-reingest evidence target stays stale: {:?}",
+            ctx.diagnostics
+                .iter()
+                .map(|d| (&d.code, &d.target_handle))
+                .collect::<Vec<_>>(),
         );
     }
 

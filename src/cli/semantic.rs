@@ -30,6 +30,145 @@ pub(crate) fn embed_query_text(query: &str) -> Result<Vec<f32>> {
         .map(|dense| dense.embedding)
 }
 
+/// Embeds a query with an already-loaded custom model (issue #167): the same
+/// `embed_query` + dense-conversion shape as [`embed_query_text`], minus the
+/// built-in-model builder — the caller resolved and loaded `--embed-model`.
+#[cfg(feature = "embeddings")]
+fn embed_query_text_with(
+    embedder: &crate::embeddings::aletheia_embeddings::Embedder,
+    query: &str,
+) -> Result<Vec<f32>> {
+    use crate::embeddings::aletheia_embeddings;
+
+    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+    let embed_data = rt
+        .block_on(aletheia_embeddings::embed_query(&[query], embedder, None))
+        .context("failed to embed query")?;
+
+    aletheia_embeddings::embed_data_to_dense_iter(embed_data, Some(1))
+        .next()
+        .context("no embedding returned for query")?
+        .context("embedding result was not dense")
+        .map(|dense| dense.embedding)
+}
+
+/// Which model vectorizes the query text for `eg query semantic`.
+///
+/// `Default` preserves the historical behavior (the built-in model); `Custom`
+/// (issue #167) resolves a `--embed-model` argument — a local directory or a
+/// Hugging Face id from the local cache only — loads it, and derives the same
+/// complete identity `eg re-embed` persists, so the #104 gate compares the
+/// store against the model that actually produced the query vector.
+#[cfg(feature = "embeddings")]
+enum QueryEmbedder {
+    Default,
+    Custom {
+        resolved: crate::reembed::ResolvedLocalModel,
+        /// Loaded lazily via [`QueryEmbedder::load`], AFTER the
+        /// declared-identity compatibility gate passes — loading a BERT model
+        /// is expensive, and a refused query should never pay it.
+        embedder: Option<crate::embeddings::aletheia_embeddings::Embedder>,
+    },
+}
+
+#[cfg(feature = "embeddings")]
+impl QueryEmbedder {
+    /// Resolves `--embed-model`: the model must already be available locally
+    /// (never downloaded). A missing model refuses with the stable exit-12
+    /// envelope, before any store I/O beyond the open.
+    ///
+    /// This does NOT load the model weights — see [`QueryEmbedder::load`].
+    /// The declared-identity compatibility gate runs on the cheap config
+    /// read; only a query that passes the gate pays for the load.
+    fn custom(raw: &str) -> Result<Self> {
+        use crate::reembed::{self, ReembedError};
+
+        let spec = reembed::resolve_model_spec(raw);
+        let resolved = match reembed::ensure_model_available_locally(&spec) {
+            Ok(resolved) => resolved,
+            Err(ReembedError::ModelUnavailableLocally {
+                spec,
+                checked,
+                missing,
+            }) => {
+                let envelope = reembed::model_unavailable_envelope(&spec, &checked, &missing);
+                println!(
+                    "{}",
+                    serde_json::to_string(&envelope).unwrap_or_else(|_| "{}".to_owned())
+                );
+                std::process::exit(reembed::REEMBED_MODEL_UNAVAILABLE_EXIT_CODE);
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context("failed to resolve --embed-model"));
+            }
+        };
+        Ok(Self::Custom {
+            resolved,
+            embedder: None,
+        })
+    }
+
+    /// Loads the model weights. Called after the declared-identity
+    /// compatibility gate passes; a refused query never reaches this.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model weights fail to load.
+    fn load(&mut self) -> Result<()> {
+        if let Self::Custom { resolved, embedder } = self
+            && embedder.is_none()
+        {
+            let loaded = crate::reembed::load_embedder(resolved).map_err(|error| {
+                anyhow::Error::new(error).context("failed to load --embed-model")
+            })?;
+            *embedder = Some(loaded);
+        }
+        Ok(())
+    }
+
+    /// The query-side identity at the model's declared dimension — the
+    /// pre-load gate input. The measured vector length replaces the dimension
+    /// once a vector exists, mirroring [`embed_query_checked`]'s
+    /// declare-then-measure discipline.
+    fn declared_identity(&self) -> Result<crate::ir::EmbeddingModel> {
+        match self {
+            Self::Default => Ok(crate::embeddings::default_embedding_model_identity(
+                crate::embeddings::DEFAULT_EMBEDDING_MODEL_DIMENSIONS,
+            )),
+            Self::Custom { resolved, .. } => {
+                let dim = crate::reembed::declared_model_dim(resolved).map_err(|error| {
+                    anyhow::Error::new(error).context("failed to read --embed-model config")
+                })?;
+                Ok(crate::reembed::target_model_identity(resolved, dim))
+            }
+        }
+    }
+
+    /// The query-side identity at the measured dimension of an embedded query
+    /// vector — the post-load gate input and the provenance identity.
+    fn measured_identity(&self, dim: usize) -> crate::ir::EmbeddingModel {
+        match self {
+            Self::Default => crate::embeddings::default_embedding_model_identity(dim),
+            Self::Custom { resolved, .. } => crate::reembed::target_model_identity(resolved, dim),
+        }
+    }
+
+    /// Embeds the query text with the resolved model. The embedder must have
+    /// been loaded via [`QueryEmbedder::load`] first.
+    fn embed(&self, query: &str) -> Result<Vec<f32>> {
+        match self {
+            Self::Default => embed_query_text(query),
+            Self::Custom {
+                embedder: Some(embedder),
+                ..
+            } => embed_query_text_with(embedder, query),
+            Self::Custom { embedder: None, .. } => {
+                anyhow::bail!("--embed-model was not loaded before embedding")
+            }
+        }
+    }
+}
+
 /// Refuses a semantic query whose embedder does not share the store's vector
 /// space (issue #104).
 ///
@@ -65,15 +204,31 @@ pub(crate) fn enforce_index_compatibility(
     sink: &EmbeddedAletheiaSink,
     records: &[GraphRecord],
 ) -> Result<crate::embeddings::IndexCompatibility> {
-    use crate::embeddings::{
-        DEFAULT_EMBEDDING_MODEL_DIMENSIONS, classify_index_compatibility,
-        default_embedding_model_identity, indexed_identities,
-    };
+    use crate::embeddings::{DEFAULT_EMBEDDING_MODEL_DIMENSIONS, default_embedding_model_identity};
+
+    enforce_index_compatibility_with(
+        sink,
+        records,
+        &default_embedding_model_identity(DEFAULT_EMBEDDING_MODEL_DIMENSIONS),
+    )
+}
+
+/// [`enforce_index_compatibility`] against an explicit query-side identity
+/// (issue #167): `--embed-model` queries gate on the custom model's identity,
+/// not the built-in default's, so a store re-embedded under model B answers a
+/// `--embed-model <B>` query and still refuses the default-model query.
+#[cfg(feature = "embeddings")]
+pub(crate) fn enforce_index_compatibility_with(
+    sink: &EmbeddedAletheiaSink,
+    records: &[GraphRecord],
+    query_identity: &crate::ir::EmbeddingModel,
+) -> Result<crate::embeddings::IndexCompatibility> {
+    use crate::embeddings::{classify_index_compatibility, indexed_identities};
 
     let verdict = classify_index_compatibility(
         &sink.embedding_index_state(),
         &indexed_identities(records),
-        &default_embedding_model_identity(DEFAULT_EMBEDDING_MODEL_DIMENSIONS),
+        query_identity,
     );
     refuse_verdict(&verdict)?;
     Ok(verdict)
@@ -140,7 +295,7 @@ pub(crate) fn scope_and_rank_semantic_matches(
     matches: &mut Vec<SemanticMatch>,
     under: Option<&str>,
     limit: usize,
-) {
+) -> usize {
     if let Some(prefix) = under {
         matches.retain(|m| {
             m.repo_relative_path
@@ -148,12 +303,16 @@ pub(crate) fn scope_and_rank_semantic_matches(
                 .is_some_and(|p| crate::query::path_is_under_prefix(p, prefix))
         });
     }
-    matches.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| a.record_id.cmp(&b.record_id))
-    });
+    // Single definition of the semantic total order (issue #199): the adapter
+    // already sorted the pool, and the `--under` retain above preserves that
+    // order, so this re-sort is belt-and-braces before the truncation boundary.
+    matches.sort_by(crate::adapters::compare_semantic_matches);
+    // Return the scoped candidate count BEFORE truncation (issue #263): the
+    // abstention verdict reports `total_candidates` over the full pool, not
+    // the `--limit` window.
+    let total_candidates = matches.len();
     matches.truncate(limit);
+    total_candidates
 }
 
 /// Which empty-result outcome `eg query semantic` reports when the final match
@@ -250,6 +409,75 @@ fn report_empty_semantic_result(
     std::process::exit(2);
 }
 
+/// Prints the issue #243 embedding-provenance envelope as the first line of a
+/// semantic answer, exactly once, in the answer's output format.
+///
+/// The wrapper routes through the shared [`print_result`] renderer, so JSON
+/// answers keep their JSONL contract (a leading `{"embedding_provenance":
+/// {...}}` line ahead of the unchanged `SemanticResult` rows) and text
+/// answers get one leading `embedding_provenance: ...` header line.
+#[cfg(feature = "embeddings")]
+fn print_embedding_provenance(
+    format: OutputFormat,
+    provenance: &crate::embeddings::EmbeddingProvenance,
+) -> Result<()> {
+    print_result(&EmbeddingProvenanceLine { provenance }, format)
+}
+
+/// Newtype letting the issue #243 envelope flow through [`print_result`].
+/// Serializes as `{"embedding_provenance": {...}}`; the text rendering is the
+/// envelope's one-line [`crate::embeddings::EmbeddingProvenance::as_text`].
+#[cfg(feature = "embeddings")]
+#[derive(serde::Serialize)]
+struct EmbeddingProvenanceLine<'a> {
+    #[serde(rename = "embedding_provenance")]
+    provenance: &'a crate::embeddings::EmbeddingProvenance,
+}
+
+#[cfg(feature = "embeddings")]
+impl PrintText for EmbeddingProvenanceLine<'_> {
+    fn as_text(&self) -> String {
+        self.provenance.as_text()
+    }
+}
+
+/// Prints the issue #221 answer-level confidence verdict as the first answer
+/// line after the embedding provenance, exactly once, in the answer's output
+/// format. Shared by both transports so the verdict is byte-identical.
+///
+/// The wrapper routes through the shared [`print_result`] renderer, so JSON
+/// answers keep their JSONL contract (a `{"confidence": {...}}` line ahead of
+/// the unchanged `SemanticResult` rows) and text answers get one leading
+/// `confidence: <verdict> (...)` line.
+#[cfg(feature = "embeddings")]
+fn print_semantic_confidence_verdict(
+    format: OutputFormat,
+    verdict: &crate::semantic_confidence::SemanticConfidenceVerdict,
+) -> Result<()> {
+    print_result(
+        &ConfidenceVerdictLine {
+            confidence: verdict,
+        },
+        format,
+    )
+}
+
+/// Newtype letting the issue #221 verdict flow through [`print_result`].
+/// Serializes as `{"confidence": {...}}`; the text rendering is the verdict's
+/// one-line [`crate::semantic_confidence::SemanticConfidenceVerdict::as_text`].
+#[cfg(feature = "embeddings")]
+#[derive(serde::Serialize)]
+struct ConfidenceVerdictLine<'a> {
+    confidence: &'a crate::semantic_confidence::SemanticConfidenceVerdict,
+}
+
+#[cfg(feature = "embeddings")]
+impl PrintText for ConfidenceVerdictLine<'_> {
+    fn as_text(&self) -> String {
+        self.confidence.as_text()
+    }
+}
+
 /// Semantic similarity search against an embedded store.
 ///
 /// `under` optionally scopes results to a repo-relative path prefix (issue #198,
@@ -265,6 +493,7 @@ pub(crate) fn query_semantic(
     repo: Option<&str>,
     under: Option<&str>,
     format: OutputFormat,
+    embed_model: Option<&str>,
 ) -> Result<()> {
     // Validate + normalize the scope prefix before any store I/O so a malformed
     // input fails fast with a machine-readable diagnostic (AC5), mirroring the
@@ -305,17 +534,65 @@ pub(crate) fn query_semantic(
     let index = query::RepositoryIndex::build(&records);
     let selected = resolve_repo_scope(&index, repo);
 
-    // Vector-space compatibility gate (issue #104), before the model is loaded.
-    // A store with no vector index at all is not an identity failure: report the
-    // documented no-embeddings outcome here rather than letting the vector search
-    // below surface an opaque engine error at exit 1.
-    if enforce_index_compatibility(&sink, &records)?
+    // Issue #167: which model vectorizes the query text. The default preserves
+    // historical behavior; `--embed-model` resolves a local directory or a
+    // locally-cached Hugging Face id — never downloaded; a missing model
+    // refuses with the stable exit-12 envelope — and gates the store against
+    // that model's complete identity. The weights load only after the gate
+    // below passes, so a refused query never pays for it.
+    let mut query_embedder = match embed_model {
+        Some(raw) => QueryEmbedder::custom(raw)?,
+        None => QueryEmbedder::Default,
+    };
+    let query_identity = query_embedder.declared_identity()?;
+
+    // Vector-space compatibility gate (issue #104), before the model weights
+    // are loaded. A store with no vector index at all is not an identity
+    // failure: report the documented no-embeddings outcome here rather than
+    // letting the vector search below surface an opaque engine error at
+    // exit 1.
+    if enforce_index_compatibility_with(&sink, &records, &query_identity)?
         == crate::embeddings::IndexCompatibility::IndexAbsent
     {
+        // Issue #243: even a never-embedded store gets a provenance envelope —
+        // the answer still names the query model and the absent index, with the
+        // absent-marker fingerprint. Built before the model is loaded, exactly
+        // like the gate above.
+        use crate::embeddings::{embedding_provenance, indexed_identities};
+        let provenance = embedding_provenance(&query_identity, &indexed_identities(&records));
+        print_embedding_provenance(format, &provenance)?;
         report_empty_semantic_result(under_prefix, false, true);
     }
 
-    let query_vector = embed_query_checked(query, &sink, &records)?;
+    // Embed the query text, then re-check the ACTUAL vector length against the
+    // index (issue #104's declare-then-measure discipline): the pre-load gate
+    // above can only compare the model's DECLARED dimension; the vector the
+    // model actually returns is the ground truth. The weights load here —
+    // after the gate passed — so a refused query never paid for them.
+    query_embedder.load()?;
+    let query_vector = query_embedder.embed(query)?;
+    {
+        use crate::embeddings::{classify_index_compatibility, indexed_identities};
+        let verdict = classify_index_compatibility(
+            &sink.embedding_index_state(),
+            &indexed_identities(&records),
+            &query_embedder.measured_identity(query_vector.len()),
+        );
+        refuse_verdict(&verdict)?;
+    }
+
+    // Issue #243: stamp the embedding-provenance envelope once, before any
+    // rows or verdicts. The query identity is derived from the actual embedded
+    // vector's length — the same derivation the gate above checked — and the
+    // index identity from the store that produced the ranking below.
+    {
+        use crate::embeddings::{embedding_provenance, indexed_identities};
+        let provenance = embedding_provenance(
+            &query_embedder.measured_identity(query_vector.len()),
+            &indexed_identities(&records),
+        );
+        print_embedding_provenance(format, &provenance)?;
+    }
 
     // Over-fetch the whole index, not just `limit` raw hits: the shared vector
     // index now also embeds agent-memory nodes (issue #91), so a query whose top
@@ -351,14 +628,31 @@ pub(crate) fn query_semantic(
 
     // Subsystem scoping (issue #198) is applied to the full candidate pool BEFORE
     // the top-N cap (AC4); the same helper also imposes canonical ordering (AC7).
-    scope_and_rank_semantic_matches(&mut matches, under_prefix, limit);
+    // It returns the scoped candidate count before truncation (issue #263).
+    let total_candidates = scope_and_rank_semantic_matches(&mut matches, under_prefix, limit);
 
     if matches.is_empty() {
         report_empty_semantic_result(under_prefix, index_has_hits, false);
     }
 
+    // Calibrated confidence verdict (issues #263, #221): stamp the top-level
+    // verdict on every non-empty answer, then return the rows — rows below
+    // the confident threshold stay in the answer, flagged per-row as weak
+    // leads, never silently dropped. `matches` is non-empty here and
+    // canonically ordered, so the first row holds the highest score of the
+    // full scoped pool (truncation keeps the top).
+    let best_score = matches[0].score;
+    let verdict = crate::semantic_confidence::SemanticConfidenceVerdict::new(
+        crate::semantic_confidence::SemanticConfidence::of_best(best_score),
+        best_score,
+        total_candidates,
+    );
+    print_semantic_confidence_verdict(format, &verdict)?;
+    // Issue #121: the top-`limit` cut narrows the scoped candidate pool —
+    // stamp every row so a truncated answer says so.
+    let completeness = RowCompleteness::capped(total_candidates, limit);
     for m in &matches {
-        print_result(&SemanticResult::from_match(m, &index), format)?;
+        print_result(&SemanticResult::from_match(m, &index, completeness), format)?;
     }
     Ok(())
 }
@@ -412,6 +706,11 @@ pub(crate) struct MemoryRecallResult<'a> {
     superseded_by_records: Option<Vec<crate::temporal_status::TemporalReference>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     contradicted_by: Option<Vec<crate::temporal_status::TemporalReference>>,
+    /// Recall-state label (issue #156). Present only with
+    /// `--include-retired`; retired records are excluded from default recall
+    /// before the row stage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retirement_state: Option<crate::memory_retire::RetirementStateLabel>,
 }
 
 #[cfg(feature = "embeddings")]
@@ -519,6 +818,48 @@ pub(crate) fn code_handle_from_link(
 /// cite where it came from (a `source_handle`, source artifact path, or session
 /// handle), and — under `verified_only` — cites present verification evidence.
 /// A hit lacking provenance is rejected here so it is excluded, never returned.
+///
+/// The record-level half is factored out for the degraded collapse path
+/// (issue #163), which iterates records directly instead of vector hits.
+#[cfg(feature = "embeddings")]
+pub(crate) fn is_recallable_memory_record(
+    record: &GraphRecord,
+    by_id: &BTreeMap<&str, &GraphRecord>,
+    edges_from: &query::OutgoingEdgeIndex<'_>,
+    tombstoned: &query::TombstonedSet<'_>,
+    verified_only: bool,
+) -> bool {
+    if !record
+        .node_kind_name()
+        .is_some_and(|k| matches!(k, "Observation" | "Decision" | "Failure"))
+    {
+        return false;
+    }
+    let GraphRecord::Node {
+        session_id,
+        source_handle,
+        source_artifact_path,
+        ..
+    } = record
+    else {
+        return false;
+    };
+    // Provenance must be a present, non-blank handle: a record carrying only
+    // empty strings is excluded, never emitted with an empty handle.
+    let has_provenance = non_empty(source_handle.as_ref()).is_some()
+        || non_empty(source_artifact_path.as_ref()).is_some()
+        || non_empty(session_id.as_ref()).is_some();
+    if !has_provenance {
+        return false;
+    }
+    if verified_only && !query::is_verified_claim(record, by_id, edges_from, tombstoned) {
+        return false;
+    }
+    true
+}
+
+/// Hit-shaped wrapper over [`is_recallable_memory_record`]: checks the hit's
+/// reported kind first, then applies the identical record-level rule.
 #[cfg(feature = "embeddings")]
 pub(crate) fn is_recallable_memory(
     m: &SemanticMatch,
@@ -537,31 +878,54 @@ pub(crate) fn is_recallable_memory(
     let Some(record) = by_id.get(m.record_id.as_str()).copied() else {
         return false;
     };
-    let GraphRecord::Node {
-        session_id,
-        source_handle,
-        source_artifact_path,
-        ..
-    } = record
-    else {
-        return false;
-    };
-    // Provenance must be a present, non-blank handle: a record carrying only
-    // empty strings is excluded, never emitted with an empty `source_handle`.
-    let has_provenance = non_empty(source_handle.as_ref()).is_some()
-        || non_empty(source_artifact_path.as_ref()).is_some()
-        || non_empty(session_id.as_ref()).is_some();
-    if !has_provenance {
-        return false;
+    is_recallable_memory_record(record, by_id, edges_from, tombstoned, verified_only)
+}
+
+/// Prints the explicit empty result for an author-scoped recall that matched
+/// nothing (issue #195).
+///
+/// An author selector matching no observations is a successful query with zero
+/// results — not an error and not a silent fallback to unscoped recall. The
+/// envelope echoes the selector (`agent` / `not_agent`), names the answer
+/// field carrying the authoring agent identity (`author_field`), and reports
+/// the matched count.
+#[cfg(feature = "embeddings")]
+fn print_empty_author_scope(
+    query: &str,
+    author_scope: &crate::query::AuthorScope,
+    format: OutputFormat,
+) -> Result<()> {
+    match format {
+        OutputFormat::Json => {
+            let envelope = serde_json::json!({
+                "ok": true,
+                "query": query,
+                "results": [],
+                "author_scope": {
+                    "agent": author_scope.include,
+                    "not_agent": author_scope.exclude,
+                    "author_field": "agent_id",
+                    "observations_matched": 0,
+                },
+                "message": "no observations matched the author selector",
+            });
+            println!("{}", serde_json::to_string(&envelope)?);
+        }
+        OutputFormat::Text => {
+            let mut selectors = Vec::new();
+            if let Some(include) = author_scope.include.as_deref() {
+                selectors.push(format!("agent={include}"));
+            }
+            if let Some(exclude) = author_scope.exclude.as_deref() {
+                selectors.push(format!("not_agent={exclude}"));
+            }
+            println!(
+                "no memory results matched the author selector ({})",
+                selectors.join(", ")
+            );
+        }
     }
-    // Verified-only reuses the memory-audit structural rule (issue #64): a
-    // resolvable, non-tombstoned verification record cited via VALIDATED_BY /
-    // HAS_EVIDENCE / PRODUCED_EVIDENCE, on either an inline evidence link or an
-    // outgoing edge. A triple-only citation stub never counts as verified.
-    if verified_only && !query::is_verified_claim(record, by_id, edges_from, tombstoned) {
-        return false;
-    }
-    true
+    Ok(())
 }
 
 /// Recalls prior agent memory by meaning, trust-separated from code (issue #91).
@@ -591,16 +955,503 @@ impl PrintText for ExcludedRecallDiagnostic<'_> {
     }
 }
 
+/// Serialization name of a [`query::CollapseMode`] for text output.
 #[cfg(feature = "embeddings")]
-#[allow(clippy::too_many_lines)]
+const fn collapse_mode_name(mode: query::CollapseMode) -> &'static str {
+    match mode {
+        query::CollapseMode::EmbeddingCosine => "embedding-cosine",
+        query::CollapseMode::NormalizedText => "normalized-text",
+    }
+}
+
+#[cfg(feature = "embeddings")]
+impl PrintText for query::CollapseEnvelope {
+    fn as_text(&self) -> String {
+        format!(
+            "collapse mode={} (requested {}) threshold={} source_records={} representatives={} query={}",
+            collapse_mode_name(self.collapse.mode),
+            self.collapse.mode_requested,
+            self.collapse.similarity_threshold,
+            self.collapse.source_records,
+            self.collapse.representatives,
+            self.query,
+        )
+    }
+}
+
+#[cfg(feature = "embeddings")]
+impl PrintText for query::CollapsedMemoryRow {
+    fn as_text(&self) -> String {
+        let score = self
+            .retrieval_score
+            .map_or_else(|| "-".to_owned(), |value| format!("{value:.4}"));
+        format!(
+            "{} [{}] {} score={} author={} source={} cluster_size={} members={}\n  {}",
+            self.record_id,
+            self.kind,
+            self.representative_trust_class,
+            score,
+            self.agent_id.as_deref().unwrap_or("(unknown)"),
+            self.source_handle.as_deref().unwrap_or("(unknown)"),
+            self.cluster_size,
+            self.member_ids.join(","),
+            self.memory_text,
+        )
+    }
+}
+
+/// Resolves the requested collapse mode against the store's vector-index
+/// state (issue #163).
+///
+/// `auto` uses embedding-cosine similarity when the store carries a loaded
+/// vector index and degrades to normalized-text equality clustering when the
+/// store was never embedded. A damaged (present-but-unreadable) index is
+/// refused rather than silently degraded over, and a forced
+/// `embedding-cosine` without a loaded index is refused too — both fail closed
+/// in the #104 spirit: never a semantic grouping the store cannot compute.
+#[cfg(feature = "embeddings")]
+fn resolve_collapse_mode(
+    requested: CollapseModeArg,
+    index_state: &crate::embeddings::VectorIndexState,
+) -> Result<query::CollapseMode> {
+    use crate::embeddings::VectorIndexState as IndexState;
+    match requested {
+        CollapseModeArg::Auto => match index_state {
+            IndexState::Loaded { .. } => Ok(query::CollapseMode::EmbeddingCosine),
+            IndexState::Absent => Ok(query::CollapseMode::NormalizedText),
+            IndexState::Unreadable { .. } => anyhow::bail!(
+                "cannot collapse observations: the store's vector index is present but unreadable; \
+                 refusing to degrade over a damaged index (re-ingest with --embed or repair the store)"
+            ),
+        },
+        CollapseModeArg::EmbeddingCosine => match index_state {
+            IndexState::Loaded { .. } => Ok(query::CollapseMode::EmbeddingCosine),
+            IndexState::Absent => anyhow::bail!(
+                "cannot collapse observations with --collapse-mode embedding-cosine: the store has \
+                 no vector index (re-run ingest with --embed)"
+            ),
+            IndexState::Unreadable { .. } => anyhow::bail!(
+                "cannot collapse observations: the store's vector index is present but unreadable"
+            ),
+        },
+        CollapseModeArg::NormalizedText => Ok(query::CollapseMode::NormalizedText),
+    }
+}
+
+/// Resolves the primary cited code target of a memory record (issue #163).
+///
+/// Considers inline evidence links with relation `OBSERVES` / `MENTIONS_SYMBOL`
+/// plus standalone outgoing edge records with the same labels. Inline links
+/// carrying a `target_record_id` use it directly; triple-only links
+/// (`target_repo_relative_path` + `target_span` + `target_git_commit`, as
+/// stored by CLI ingest which — unlike the daemon — does not canonicalize
+/// triples at write time) are resolved against the store's records with the
+/// same matching rule the daemon uses at ingest: node path, commit, and span
+/// must all agree. A triple that resolves to nothing leaves the record
+/// ineligible (fail closed to a singleton cluster), exactly as if it cited no
+/// target. The primary target is the candidate sorting first by (relation,
+/// target record ID, `as_of_commit`); `as_of_commit` is part of the identity,
+/// so the same record cited at two commits yields two different targets.
+/// Returns `None` when the record cites no code target — such a record is
+/// never eligible for merging and stays a singleton cluster.
+#[cfg(feature = "embeddings")]
+pub(crate) fn primary_cited_target(
+    record: &GraphRecord,
+    by_id: &BTreeMap<&str, &GraphRecord>,
+    edges_from: &query::OutgoingEdgeIndex<'_>,
+) -> Option<query::PrimaryCitedTarget> {
+    let GraphRecord::Node { evidence_links, .. } = record else {
+        return None;
+    };
+    let mut targets: Vec<(String, String, Option<String>)> = Vec::new();
+    if let Some(links) = evidence_links {
+        for link in links {
+            if !matches!(link.relation.as_str(), "OBSERVES" | "MENTIONS_SYMBOL") {
+                continue;
+            }
+            if let Some(target) = link.target_record_id.clone() {
+                targets.push((link.relation.clone(), target, link.as_of_commit.clone()));
+            } else if let Some(target) = resolve_triple_target(link, by_id) {
+                // The daemon canonicalizes a resolved triple by writing back
+                // only the target record ID; as_of_commit stays as the link
+                // carried it. Mirroring that here keeps a CLI-ingested triple
+                // citation and a daemon-ingested one of the same target on the
+                // same cluster key.
+                targets.push((link.relation.clone(), target, link.as_of_commit.clone()));
+            }
+        }
+    }
+    if let Some(outgoing) = edges_from.get(record.id()) {
+        for (label, target) in outgoing {
+            if matches!(label.as_str(), "OBSERVES" | "MENTIONS_SYMBOL") {
+                targets.push((label.as_str().to_owned(), (*target).to_owned(), None));
+            }
+        }
+    }
+    targets
+        .into_iter()
+        .min_by(|first, second| {
+            first
+                .0
+                .cmp(&second.0)
+                .then_with(|| first.1.cmp(&second.1))
+                .then_with(|| first.2.cmp(&second.2))
+        })
+        .map(
+            |(relation, target_record_id, as_of_commit)| query::PrimaryCitedTarget {
+                target_record_id,
+                relation,
+                as_of_commit,
+            },
+        )
+}
+
+/// Resolves a triple-only evidence link to its target record ID (issue #163).
+///
+/// Mirrors the daemon's ingest-time triple matching: the target is the node
+/// whose repository-relative path, temporal git commit, and source span all
+/// agree with the link's triple. Iteration is over the `BTreeMap` (sorted by
+/// record ID) so the first match is deterministic. Returns `None` when any
+/// triple field is missing or nothing matches — the caller fails closed.
+#[cfg(feature = "embeddings")]
+fn resolve_triple_target(
+    link: &crate::EvidenceLink,
+    by_id: &BTreeMap<&str, &GraphRecord>,
+) -> Option<String> {
+    let path = link.target_repo_relative_path.as_deref()?;
+    let commit = link.target_git_commit.as_deref()?;
+    let span = link.target_span.as_ref()?;
+    by_id.values().copied().find_map(|record| {
+        if let GraphRecord::Node {
+            id,
+            repo_relative_path: Some(record_path),
+            temporal: Some(temporal),
+            span: Some(record_span),
+            ..
+        } = record
+            && record_path == path
+            && temporal.git_commit == commit
+            && record_span == span
+        {
+            Some(id.to_owned())
+        } else {
+            None
+        }
+    })
+}
+
+/// Retirement view for memory recall (issue #156): the resolved per-record
+/// retirement states plus whether the caller asked to keep retired records in
+/// recall (`--include-retired`). Shared by the vector and degraded collapse
+/// lanes so exclusion and labeling stay consistent.
+#[cfg(feature = "embeddings")]
+struct RetirementRecallView {
+    states: std::collections::BTreeMap<String, crate::memory_retire::RetirementState>,
+    include_retired: bool,
+}
+
+/// Emits the collapsed answer: one envelope line, one row per representative,
+/// then any supersession exclusion diagnostics (issue #163).
+#[cfg(feature = "embeddings")]
+fn emit_collapsed_answer(
+    query: &str,
+    outcome: &query::CollapseOutcome,
+    mode_requested: &str,
+    format: OutputFormat,
+    author_scope: &crate::query::AuthorScope,
+    excluded_recall_diagnostics: &[ExcludedRecallDiagnostic],
+    retirement: &RetirementRecallView,
+) -> Result<()> {
+    if outcome.clusters.is_empty() {
+        if author_scope.is_active() {
+            print_empty_author_scope(query, author_scope, format)?;
+            return Ok(());
+        }
+        eprintln!(
+            "no memory results — store may lack embedded memory (re-run ingest with --embed) or all hits were filtered"
+        );
+        std::process::exit(2);
+    }
+    let envelope = query::collapse_envelope(
+        query,
+        outcome.mode,
+        mode_requested,
+        outcome.threshold,
+        outcome.source_candidate_count,
+        outcome.clusters.len(),
+    );
+    print_result(&envelope, format)?;
+    let mut rows = query::render_collapsed_rows(&outcome.clusters);
+    // Retirement labels (issue #156): only when retired records were kept.
+    if retirement.include_retired {
+        for row in &mut rows {
+            row.retirement_state = Some(crate::memory_retire::retirement_label(
+                &retirement.states,
+                &row.record_id,
+            ));
+        }
+    }
+    for row in rows {
+        print_result(&row, format)?;
+    }
+    for diag in excluded_recall_diagnostics {
+        print_result(diag, format)?;
+    }
+    Ok(())
+}
+
+/// Retirement exclusion for the degraded collapse lane (issue #156): a
+/// retired record is dropped from recall with a diagnostic unless the caller
+/// passed `--include-retired`. Returns true when the record was excluded.
+#[cfg(feature = "embeddings")]
+fn exclude_retired_candidate<'a>(
+    record: &'a GraphRecord,
+    retirement: &RetirementRecallView,
+    excluded_recall_diagnostics: &mut Vec<ExcludedRecallDiagnostic<'a>>,
+) -> bool {
+    if matches!(
+        retirement.states.get(record.id()),
+        Some(crate::memory_retire::RetirementState::Retired { .. })
+    ) && !retirement.include_retired
+    {
+        excluded_recall_diagnostics.push(ExcludedRecallDiagnostic {
+            record_id: record.id(),
+            reason: "retired",
+            status: "excluded",
+            superseded_by: None,
+            contradicted_by: None,
+        });
+        return true;
+    }
+    false
+}
+
+/// Builds one collapse candidate from a recallable memory record on the
+/// local (no-model) lane, or `None` when the record is filtered out
+/// (issue #163).
+///
+/// Without embeddings there is no meaning ranking, so the caller feeds every
+/// recallable memory record in the store as a candidate and clustering uses
+/// normalized-text equality — the query string is echoed in the envelope but
+/// never ranked against. The embedding model is never loaded on this path.
+/// All recall filters (`--verified-only`, `--agent` / `--not-agent`,
+/// `--repo`, `--supersession`) apply exactly as on the embedded lane.
+#[cfg(feature = "embeddings")]
+#[allow(clippy::too_many_arguments)]
+fn degraded_collapse_candidate<'a>(
+    record: &'a GraphRecord,
+    by_id: &BTreeMap<&str, &GraphRecord>,
+    edges_from: &query::OutgoingEdgeIndex,
+    tombstoned: &query::TombstonedSet,
+    verified_only: bool,
+    author_scope: &crate::query::AuthorScope,
+    selected: Option<&str>,
+    index: &query::RepositoryIndex,
+    resolver: &crate::temporal_status::TemporalResolver,
+    supersession: crate::temporal_status::SupersessionMode,
+    excluded_recall_diagnostics: &mut Vec<ExcludedRecallDiagnostic<'a>>,
+    retirement: &RetirementRecallView,
+) -> Option<query::CollapseCandidate> {
+    if !is_recallable_memory_record(record, by_id, edges_from, tombstoned, verified_only) {
+        return None;
+    }
+    // Retirement (issue #156): same exclusion contract as the vector lane.
+    if exclude_retired_candidate(record, retirement, excluded_recall_diagnostics) {
+        return None;
+    }
+    let GraphRecord::Node {
+        text,
+        summary,
+        agent_id,
+        agent_kind,
+        session_id,
+        observed_at,
+        confidence,
+        source_handle,
+        source_artifact_path,
+        evidence_links,
+        ..
+    } = record
+    else {
+        return None;
+    };
+
+    if !author_scope.matches(agent_id.as_deref()) {
+        return None;
+    }
+
+    // Scope through the code this memory cites, exactly as on the
+    // embedded lane: memory nodes are not in the containment topology.
+    let owners = memory_repo_owners(record.id(), evidence_links.as_ref(), edges_from, index);
+    if let Some(repo) = selected
+        && !owners.contains(&repo)
+    {
+        return None;
+    }
+
+    let source_handle_value = non_empty(source_handle.as_ref())
+        .or_else(|| non_empty(source_artifact_path.as_ref()))
+        .or_else(|| non_empty(session_id.as_ref()))
+        .unwrap_or_default()
+        .to_owned();
+
+    let verified = query::is_verified_claim(record, by_id, edges_from, tombstoned);
+    let (status, superseded_by_refs, contradicted_by_refs) = resolver.resolve_status(record.id());
+    let is_superseded = status == "superseded" || status == "cycle";
+    let is_contradicted = status == "contradicted";
+    let temporal_status = if is_superseded || is_contradicted {
+        let reason = if is_superseded {
+            "superseded"
+        } else {
+            "contradicted"
+        };
+        match supersession {
+            crate::temporal_status::SupersessionMode::Exclude => {
+                excluded_recall_diagnostics.push(ExcludedRecallDiagnostic {
+                    record_id: record.id(),
+                    reason,
+                    status: "excluded",
+                    superseded_by: if superseded_by_refs.is_empty() {
+                        None
+                    } else {
+                        Some(superseded_by_refs)
+                    },
+                    contradicted_by: if contradicted_by_refs.is_empty() {
+                        None
+                    } else {
+                        Some(contradicted_by_refs)
+                    },
+                });
+                return None;
+            }
+            crate::temporal_status::SupersessionMode::IncludeButFlag => Some(status.to_owned()),
+        }
+    } else {
+        match supersession {
+            crate::temporal_status::SupersessionMode::IncludeButFlag => Some(status.to_owned()),
+            crate::temporal_status::SupersessionMode::Exclude => None,
+        }
+    };
+
+    Some(query::CollapseCandidate {
+        record_id: record.id().to_owned(),
+        kind: record.node_kind_name().unwrap_or("Observation").to_owned(),
+        trust_class: match (verified, temporal_status.as_deref()) {
+            (_, Some("contradicted" | "cycle")) => query::TrustClass::AgentContradicted,
+            (true, _) => query::TrustClass::AgentVerified,
+            (false, _) => query::TrustClass::AgentUnverified,
+        },
+        agent_authored: true,
+        primary_target: primary_cited_target(record, by_id, edges_from),
+        body_text: text.as_deref().unwrap_or(summary.as_str()).to_owned(),
+        confidence_raw: confidence.as_deref().map(str::to_owned),
+        confidence: confidence
+            .as_deref()
+            .and_then(|value| value.parse::<f32>().ok()),
+        observed_at: observed_at.as_deref().map(str::to_owned),
+        // No vectors without an index: normalized-text equality clustering
+        // needs none, and no retrieval score exists without a ranking.
+        vector: None,
+        retrieval_score: None,
+        source_handle: Some(source_handle_value),
+        agent_id: agent_id.as_deref().map(str::to_owned),
+        agent_kind: agent_kind.as_deref().map(str::to_owned),
+        session_id: session_id.as_deref().map(str::to_owned),
+        // The representative keeps its stored provenance verbatim (issue
+        // #163): links are handles/spans/commits, never raw text.
+        evidence_links: evidence_links.clone(),
+    })
+}
+/// Degraded collapse over a store with no vector index (issue #163).
+#[cfg(feature = "embeddings")]
+#[allow(clippy::too_many_arguments)]
+fn query_semantic_memory_collapsed_degraded(
+    query: &str,
+    records: &[GraphRecord],
+    limit: usize,
+    repo: Option<&str>,
+    verified_only: bool,
+    agent: Option<&str>,
+    not_agent: Option<&str>,
+    format: OutputFormat,
+    supersession: crate::temporal_status::SupersessionMode,
+    similarity_threshold: f32,
+    mode_requested: &str,
+    include_retired: bool,
+) -> Result<()> {
+    let index = query::RepositoryIndex::build(records);
+    let selected = resolve_repo_scope(&index, repo);
+    // Retirement states (issue #156): same exclusion/labeling contract as the
+    // vector lane.
+    let retirement = RetirementRecallView {
+        states: crate::memory_retire::retirement_states(records, None),
+        include_retired,
+    };
+    let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+    let (edges_from, tombstoned) = query::verification_support_indexes(records);
+    let resolver = crate::temporal_status::TemporalResolver::build(records);
+    let mut excluded_recall_diagnostics = Vec::new();
+    let author_scope = crate::query::AuthorScope {
+        include: agent.map(str::to_owned),
+        exclude: not_agent.map(str::to_owned),
+    };
+
+    let mut candidates: Vec<query::CollapseCandidate> = Vec::new();
+    for record in records {
+        if let Some(candidate) = degraded_collapse_candidate(
+            record,
+            &by_id,
+            &edges_from,
+            &tombstoned,
+            verified_only,
+            &author_scope,
+            selected.as_deref(),
+            &index,
+            &resolver,
+            supersession,
+            &mut excluded_recall_diagnostics,
+            &retirement,
+        ) {
+            candidates.push(candidate);
+        }
+    }
+
+    let mut outcome = query::collapse_memory_recall(
+        &candidates,
+        &query::CollapseConfig {
+            mode: query::CollapseMode::NormalizedText,
+            similarity_threshold,
+        },
+    );
+    // The `limit` bounds representatives, not source records.
+    outcome.clusters.truncate(limit);
+    emit_collapsed_answer(
+        query,
+        &outcome,
+        mode_requested,
+        format,
+        &author_scope,
+        &excluded_recall_diagnostics,
+        &retirement,
+    )
+}
+
+#[cfg(feature = "embeddings")]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(crate) fn query_semantic_memory(
     query: &str,
     data_dir: &Path,
     limit: usize,
     repo: Option<&str>,
     verified_only: bool,
+    agent: Option<&str>,
+    not_agent: Option<&str>,
     format: OutputFormat,
     supersession: crate::temporal_status::SupersessionMode,
+    collapse: bool,
+    similarity_threshold: f32,
+    collapse_mode: CollapseModeArg,
+    include_retired: bool,
 ) -> Result<()> {
     validate_existing_embedded_store(data_dir)?;
 
@@ -610,6 +1461,13 @@ pub(crate) fn query_semantic_memory(
     let records = sink
         .read_all_records()
         .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))?;
+    // Retirement states (issue #156): retired records are excluded from
+    // default recall on every path below; `--include-retired` keeps them and
+    // labels each row.
+    let retirement = RetirementRecallView {
+        states: crate::memory_retire::retirement_states(&records, None),
+        include_retired,
+    };
     let index = query::RepositoryIndex::build(&records);
     let selected = resolve_repo_scope(&index, repo);
 
@@ -618,11 +1476,48 @@ pub(crate) fn query_semantic_memory(
     let resolver = crate::temporal_status::TemporalResolver::build(&records);
     let mut excluded_recall_diagnostics = Vec::new();
 
+    // Collapse setup (issue #163): validate the threshold up front and resolve
+    // the requested mode against the store's vector-index state before any
+    // model is loaded — normalized-text mode must never touch the embedder.
+    if collapse && !(0.0..=1.0).contains(&similarity_threshold) {
+        anyhow::bail!("--similarity-threshold must lie in [0.0, 1.0], got {similarity_threshold}");
+    }
+    let collapse_mode_requested: Option<&'static str> = collapse.then_some(match collapse_mode {
+        CollapseModeArg::Auto => "auto",
+        CollapseModeArg::EmbeddingCosine => "embedding-cosine",
+        CollapseModeArg::NormalizedText => "normalized-text",
+    });
+    let collapse_mode_resolved = collapse_mode_requested
+        .map(|_| resolve_collapse_mode(collapse_mode, &sink.embedding_index_state()))
+        .transpose()?;
+
     // Memory recall reads the SAME shared vector index code search does, so it
     // carries the same cross-vector-space hazard and the same gate (issue #104).
-    if enforce_index_compatibility(&sink, &records)?
-        == crate::embeddings::IndexCompatibility::IndexAbsent
-    {
+    //
+    // Normalized-text collapse never touches the embedder: it clusters the
+    // stored (redacted) text locally, so it works on any store — embedded or
+    // not — without loading a model and without consulting the compatibility
+    // gate (issue #163).
+    if collapse_mode_resolved == Some(query::CollapseMode::NormalizedText) {
+        return query_semantic_memory_collapsed_degraded(
+            query,
+            &records,
+            limit,
+            repo,
+            verified_only,
+            agent,
+            not_agent,
+            format,
+            supersession,
+            similarity_threshold,
+            collapse_mode_requested.unwrap_or("auto"),
+            include_retired,
+        );
+    }
+    let index_absent = enforce_index_compatibility(&sink, &records)?
+        == crate::embeddings::IndexCompatibility::IndexAbsent;
+    // Without `--collapse` a missing index is a no-result exit 2, as before.
+    if index_absent {
         eprintln!(
             "no memory results — store may lack embedded memory (re-run ingest with --embed) or all hits were filtered"
         );
@@ -630,6 +1525,13 @@ pub(crate) fn query_semantic_memory(
     }
 
     let query_vector = embed_query_checked(query, &sink, &records)?;
+
+    // Author selector for recalled observations (issue #195). Inactive by
+    // default: recall without `--agent` / `--not-agent` is unchanged.
+    let author_scope = crate::query::AuthorScope {
+        include: agent.map(str::to_owned),
+        exclude: not_agent.map(str::to_owned),
+    };
 
     // The shared vector index holds both code and memory; fetch a generous pool
     // and filter to memory so the `limit` bounds recalled memory, not the blend.
@@ -648,6 +1550,23 @@ pub(crate) fn query_semantic_memory(
         let Some(record) = by_id.get(m.record_id.as_str()).copied() else {
             continue;
         };
+        // Retirement (issue #156): retired records are excluded from default
+        // recall with an explicit diagnostic; `--include-retired` keeps them
+        // and labels the row below.
+        if matches!(
+            retirement.states.get(record.id()),
+            Some(crate::memory_retire::RetirementState::Retired { .. })
+        ) && !retirement.include_retired
+        {
+            excluded_recall_diagnostics.push(ExcludedRecallDiagnostic {
+                record_id: record.id(),
+                reason: "retired",
+                status: "excluded",
+                superseded_by: None,
+                contradicted_by: None,
+            });
+            continue;
+        }
         let GraphRecord::Node {
             text,
             summary,
@@ -667,6 +1586,14 @@ pub(crate) fn query_semantic_memory(
         else {
             continue;
         };
+
+        // Author scoping (issue #195): an active selector keeps only records
+        // carrying a resolvable authoring `agent_id`. Deterministic code-graph
+        // facts carry no `agent_id` and are structurally excluded from
+        // author-scoped recall (see `crate::query::AuthorScope::matches`).
+        if !author_scope.matches(agent_id.as_deref()) {
+            continue;
+        }
 
         // Scope through the code this memory cites: memory nodes are not in the
         // containment topology, so a `--repo` filter must resolve the repository
@@ -767,6 +1694,9 @@ pub(crate) fn query_semantic_memory(
                         } else {
                             Some(contradicted_by_refs)
                         },
+                        retirement_state: include_retired.then(|| {
+                            crate::memory_retire::retirement_label(&retirement.states, record.id())
+                        }),
                     });
                 }
             }
@@ -799,6 +1729,9 @@ pub(crate) fn query_semantic_memory(
                 },
                 superseded_by_records: None,
                 contradicted_by: None,
+                retirement_state: include_retired.then(|| {
+                    crate::memory_retire::retirement_label(&retirement.states, record.id())
+                }),
             });
         }
     }
@@ -812,9 +1745,81 @@ pub(crate) fn query_semantic_memory(
             .total_cmp(&a.retrieval_score)
             .then_with(|| a.record_id.cmp(b.record_id))
     });
+
+    if let Some(mode) = collapse_mode_resolved {
+        // Collapse BEFORE representative truncation: the `limit` bounds
+        // representatives, not source rows, so a large cluster is never cut
+        // off mid-answer (issue #163).
+        let fetch_vectors = mode == query::CollapseMode::EmbeddingCosine;
+        let mut candidates: Vec<query::CollapseCandidate> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let Some(record) = by_id.get(row.record_id).copied() else {
+                continue;
+            };
+            let evidence_links = match record {
+                GraphRecord::Node { evidence_links, .. } => evidence_links.clone(),
+                _ => None,
+            };
+            candidates.push(query::CollapseCandidate {
+                record_id: row.record_id.to_owned(),
+                kind: row.kind.to_owned(),
+                trust_class: match (row.review_state, row.temporal_status.as_deref()) {
+                    (_, Some("contradicted" | "cycle")) => query::TrustClass::AgentContradicted,
+                    ("verified", _) => query::TrustClass::AgentVerified,
+                    _ => query::TrustClass::AgentUnverified,
+                },
+                agent_authored: true,
+                primary_target: primary_cited_target(record, &by_id, &edges_from),
+                body_text: row.memory_text.to_owned(),
+                confidence_raw: row.confidence.map(str::to_owned),
+                confidence: row.confidence.and_then(|value| value.parse::<f32>().ok()),
+                observed_at: row.observed_at.map(str::to_owned),
+                // Embedding mode reuses stored vectors (no re-embedding); a
+                // missing vector fails closed to singleton behavior.
+                vector: if fetch_vectors {
+                    sink.stored_embedding_vector(record)
+                } else {
+                    None
+                },
+                retrieval_score: Some(row.retrieval_score),
+                source_handle: Some(row.source_handle.clone()),
+                agent_id: row.agent_id.map(str::to_owned),
+                agent_kind: row.agent_kind.map(str::to_owned),
+                session_id: row.session_id.map(str::to_owned),
+                // The representative keeps its stored provenance verbatim
+                // (issue #163): links are handles/spans/commits, never raw
+                // text.
+                evidence_links,
+            });
+        }
+        let mut outcome = query::collapse_memory_recall(
+            &candidates,
+            &query::CollapseConfig {
+                mode,
+                similarity_threshold,
+            },
+        );
+        outcome.clusters.truncate(limit);
+        return emit_collapsed_answer(
+            query,
+            &outcome,
+            collapse_mode_requested.unwrap_or("auto"),
+            format,
+            &author_scope,
+            &excluded_recall_diagnostics,
+            &retirement,
+        );
+    }
     rows.truncate(limit);
 
     if rows.is_empty() {
+        if author_scope.is_active() {
+            // Explicit empty result (issue #195): the author selector matched
+            // no observations. This is a successful query with zero results —
+            // not an error and not a silent fallback to unscoped recall.
+            print_empty_author_scope(query, &author_scope, format)?;
+            return Ok(());
+        }
         eprintln!(
             "no memory results — store may lack embedded memory (re-run ingest with --embed) or all hits were filtered"
         );
@@ -860,6 +1865,9 @@ pub(crate) fn query_semantic_via_daemon(
     );
 
     let query_vector = embed_query_text(query)?;
+    // Issue #243: the query identity reflects the actual embedder — derived
+    // from the produced vector's length, exactly as on the embedded lane.
+    let query_identity = crate::embeddings::default_embedding_model_identity(query_vector.len());
     let mut params = serde_json::json!({
         "query_vector": query_vector,
         "limit": limit as u64,
@@ -867,17 +1875,96 @@ pub(crate) fn query_semantic_via_daemon(
     if let Some(repo) = repo {
         params["repo"] = serde_json::json!(repo);
     }
-    let records = client
-        .query_verb("semantic_search", &params, None)
-        .map_err(|e| surface_daemon_selector_rejection(e, repo))?;
+    // Issue #243: fetch the raw result object (not just the records) so the
+    // answer carries the same embedding-provenance envelope the embedded lane
+    // stamps. The daemon builds the envelope from the same store/index that
+    // produced the ranking, so MCP consumers of this verb inherit it too.
+    let result = match client.query_verb_raw("semantic_search", &params, None) {
+        Ok(result) => result,
+        Err(error) => {
+            // A store with no vector index is a no-result answer, not a
+            // transport failure: stamp the envelope (query model from the
+            // actual local embedder, absent index) and exit 2, like the
+            // embedded lane.
+            let missing_index = error
+                .downcast_ref::<crate::daemon::DaemonQueryRejection>()
+                .is_some_and(|rejection| rejection.code == "missing_semantic_index");
+            if missing_index {
+                let provenance = crate::embeddings::embedding_provenance(&query_identity, &[]);
+                print_embedding_provenance(format, &provenance)?;
+                eprintln!(
+                    "no results — store may not have embeddings (re-run ingest with --embed)"
+                );
+                std::process::exit(2);
+            }
+            return Err(surface_daemon_selector_rejection(error, repo));
+        }
+    };
+
+    // Deserialize into the typed envelope and re-serialize through the shared
+    // printer: a raw JSON round-trip would reorder the fields (serde_json maps
+    // sort keys), breaking byte parity with the embedded lane.
+    let provenance: crate::embeddings::EmbeddingProvenance = serde_json::from_value(
+        result
+            .get("embedding_provenance")
+            .cloned()
+            .unwrap_or_default(),
+    )
+    .context("daemon semantic_search result is missing its embedding_provenance envelope")?;
+    print_embedding_provenance(format, &provenance)?;
+
+    let records: Vec<serde_json::Value> =
+        serde_json::from_value(result.get("records").cloned().unwrap_or_default())
+            .context("daemon semantic_search result has no records array")?;
 
     if records.is_empty() {
         eprintln!("no results — store may not have embeddings (re-run ingest with --embed)");
         std::process::exit(2);
     }
 
+    // Confidence verdict (issue #221): the daemon stamps the answer-level
+    // verdict itself; forward it through the typed struct so the JSON field
+    // order matches the embedded lane byte-for-byte. Rows below the confident
+    // threshold are still returned — flagged per-row as weak leads — never
+    // dropped.
+    let verdict = if let Some(value) = result.get("confidence") {
+        serde_json::from_value::<crate::semantic_confidence::SemanticConfidenceVerdict>(
+            value.clone(),
+        )
+        .context("daemon semantic_search result has a malformed confidence verdict")?
+    } else {
+        // Daemon predates issue #221: derive the verdict client-side from
+        // the returned rows. Confidence is a pure function of score, so
+        // the verdict is exact; total_candidates covers only the returned
+        // window because the old daemon does not report the pre-limit pool.
+        // The f64->f32 cast is safe: scores are cosine similarities in
+        // [0,1], and the precision loss is negligible for a threshold
+        // comparison.
+        #[allow(clippy::cast_possible_truncation)]
+        let best_score = records[0]
+            .get("score")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0) as f32;
+        crate::semantic_confidence::SemanticConfidenceVerdict::new(
+            crate::semantic_confidence::SemanticConfidence::of_best(best_score),
+            best_score,
+            records.len(),
+        )
+    };
+    print_semantic_confidence_verdict(format, &verdict)?;
+
+    // Issue #121: the daemon reports the pre-truncate pool in the page
+    // envelope; stamp every row so the --daemon answer carries the same
+    // completeness signal as the embedded lane. A daemon predating the signal
+    // reports nothing — then the rows carry no stamp rather than a guess.
+    let completeness =
+        RowCompleteness::from_daemon_page(result.get("page").unwrap_or(&serde_json::Value::Null));
     for rec in &records {
-        print_daemon_semantic_record(rec, format)?;
+        let mut stamped = rec.clone();
+        if let Some(completeness) = completeness {
+            stamp_json_row(&mut stamped, completeness);
+        }
+        print_daemon_semantic_record(&stamped, format)?;
     }
     Ok(())
 }
@@ -890,13 +1977,46 @@ pub(crate) fn print_daemon_semantic_record(
     rec: &serde_json::Value,
     format: OutputFormat,
 ) -> Result<()> {
+    // Issue #263: enrich daemon rows client-side with the calibrated
+    // confidence fields. Confidence is a pure function of score, so no daemon
+    // protocol change is needed.
+    // The f64->f32 cast is safe: scores are cosine similarities in [0,1], and
+    // the precision loss is negligible for a threshold comparison.
+    let mut enriched = rec.clone();
+    if let Some(obj) = enriched.as_object_mut() {
+        #[allow(clippy::cast_possible_truncation)]
+        let score = obj
+            .get("score")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0) as f32;
+        obj.insert(
+            "confidence_band".to_string(),
+            serde_json::Value::String(
+                crate::semantic_confidence::ConfidenceBand::of_score(score)
+                    .as_str()
+                    .to_string(),
+            ),
+        );
+        obj.insert(
+            "selection_threshold".to_string(),
+            serde_json::Value::from(crate::semantic_confidence::SEMANTIC_CONFIDENT_THRESHOLD),
+        );
+        obj.insert(
+            "selection_basis".to_string(),
+            serde_json::Value::String(
+                crate::semantic_confidence::SEMANTIC_SELECTION_BASIS.to_string(),
+            ),
+        );
+    }
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string(rec)?),
+        OutputFormat::Json => println!("{}", serde_json::to_string(&enriched)?),
         OutputFormat::Text => {
-            let record_id = rec["record_id"].as_str().unwrap_or("(unknown)");
-            let score = rec["score"].as_f64().unwrap_or(0.0);
-            let path = rec["repo_relative_path"].as_str().unwrap_or("(unknown)");
-            let line = rec["span"]["start_line"].as_u64();
+            let record_id = enriched["record_id"].as_str().unwrap_or("(unknown)");
+            let score = enriched["score"].as_f64().unwrap_or(0.0);
+            let path = enriched["repo_relative_path"]
+                .as_str()
+                .unwrap_or("(unknown)");
+            let line = enriched["span"]["start_line"].as_u64();
             let location = line.map_or_else(
                 || path.to_owned(),
                 |start_line| format!("{path}:{start_line}"),
@@ -989,15 +2109,11 @@ pub(crate) fn query_semantic_context(
     if let Some(repo) = selected.as_deref() {
         matches.retain(|m| index.owner_of(&m.record_id) == Some(repo));
     }
-    // Canonical ordering before truncation: equal-score ANN results can be
-    // returned in arbitrary order, so sort by score descending then record ID
-    // ascending so repeated runs choose the same rows at the `limit` boundary
-    // and emit byte-identical output.
-    matches.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| a.record_id.cmp(&b.record_id))
-    });
+    // Canonical total order before truncation (issue #199): the adapter already
+    // sorted the full pool, and the retains above preserve that order, so this
+    // re-sort is belt-and-braces — equal-score ANN rows can never swap
+    // positions across runs.
+    matches.sort_by(crate::adapters::compare_semantic_matches);
     matches.truncate(limit);
 
     let leads: Vec<query::SemanticLead> = matches
@@ -1037,9 +2153,12 @@ pub(crate) fn query_semantic_context(
         .matches
         .iter()
         .map(|m| {
-            let sections = build_context_sections(&m.context, &trust);
-            let (observations, excluded) =
+            let sections = build_context_sections(&records, &m.context, &trust);
+            let (observations, mut excluded) =
                 apply_supersession(sections.observations, resolver, supersession);
+            let (decisions, decision_excluded) =
+                apply_supersession(sections.decisions, resolver, supersession);
+            excluded.extend(decision_excluded);
             let repository_id = index.owner_of(&m.lead.record_id);
             SemanticContextMatch {
                 record_id: &m.lead.record_id,
@@ -1059,10 +2178,15 @@ pub(crate) fn query_semantic_context(
                 source_facts: sections.source_facts,
                 topology_edges: sections.topology_edges,
                 observations,
+                decisions,
                 project_state: sections.project_state,
                 artifacts: sections.artifacts,
                 verification_evidence: sections.verification_evidence,
                 unresolved: sections.unresolved,
+                // Issue #169: policy is deferred in the semantic-bridge lane.
+                // The fold is anchored to a single identity; the bridge
+                // returns many leads per query. Documented in
+                // docs/cli/policy-context.md.
                 excluded,
             }
         })
@@ -1257,6 +2381,63 @@ mod scoped_semantic {
         scope_and_rank_semantic_matches(&mut matches, None, 10);
         assert_eq!(matches.len(), 2);
     }
+
+    /// Issue #121 (AC4): when the candidate pool exceeds the top-k limit, the
+    /// rows the lane prints must carry `result_complete: false` with the
+    /// pre-truncate pool size and the applied limit. The embedder cannot run
+    /// in this harness, so the test drives the same helper + row constructor
+    /// the lane uses, with a fixed match set.
+    #[test]
+    fn truncated_pool_stamps_rows_incomplete() {
+        let mut matches = vec![
+            match_at("a", "src/a.rs", 0.9),
+            match_at("b", "src/b.rs", 0.8),
+            match_at("c", "src/c.rs", 0.7),
+            match_at("d", "src/d.rs", 0.6),
+            match_at("e", "src/e.rs", 0.5),
+        ];
+        let total_candidates = scope_and_rank_semantic_matches(&mut matches, None, 2);
+        assert_eq!(
+            total_candidates, 5,
+            "the helper reports the pre-truncate pool"
+        );
+        assert_eq!(matches.len(), 2, "the limit narrows the printed rows");
+
+        let index = query::RepositoryIndex::build(&[]);
+        let completeness = RowCompleteness::capped(total_candidates, 2);
+        for m in &matches {
+            let json = serde_json::to_value(SemanticResult::from_match(m, &index, completeness))
+                .expect("row serializes");
+            assert_eq!(
+                json["result_complete"], false,
+                "a narrowed top-k answer must report result_complete: false, got {json}"
+            );
+            assert_eq!(json["total_matches"], 5, "got {json}");
+            assert_eq!(json["applied_limit"], 2, "got {json}");
+        }
+    }
+
+    /// Issue #121 (AC4): when the pool fits the limit, the rows report
+    /// `result_complete: true` and omit the totals.
+    #[test]
+    fn pool_within_limit_stamps_rows_complete() {
+        let mut matches = vec![
+            match_at("a", "src/a.rs", 0.9),
+            match_at("b", "src/b.rs", 0.8),
+        ];
+        let total_candidates = scope_and_rank_semantic_matches(&mut matches, None, 10);
+        assert_eq!(matches.len(), 2);
+
+        let index = query::RepositoryIndex::build(&[]);
+        let completeness = RowCompleteness::capped(total_candidates, 10);
+        for m in &matches {
+            let json = serde_json::to_value(SemanticResult::from_match(m, &index, completeness))
+                .expect("row serializes");
+            assert_eq!(json["result_complete"], true, "got {json}");
+            assert!(json.get("total_matches").is_none(), "got {json}");
+            assert!(json.get("applied_limit").is_none(), "got {json}");
+        }
+    }
 }
 
 #[cfg(all(test, feature = "embeddings"))]
@@ -1269,6 +2450,8 @@ mod semantic_contract {
             end_byte: 5200,
             start_line: 142,
             end_line: 168,
+            start_column: None,
+            end_column: None,
         }
     }
 
@@ -1283,6 +2466,10 @@ mod semantic_contract {
             span: Some(full_span()),
             repository_id: Some("codegraph:v1:repo"),
             repository: Some("acme/widget"),
+            confidence_band: "strong",
+            selection_threshold: crate::semantic_confidence::SEMANTIC_CONFIDENT_THRESHOLD,
+            selection_basis: "corpus_calibrated_confidence_floor",
+            completeness: RowCompleteness::exhaustive(),
         };
         let json =
             serde_json::to_value(&result).expect("SemanticResult must serialize to JSON value");
@@ -1332,6 +2519,10 @@ mod semantic_contract {
             span: None,
             repository_id: None,
             repository: None,
+            confidence_band: "weak",
+            selection_threshold: crate::semantic_confidence::SEMANTIC_CONFIDENT_THRESHOLD,
+            selection_basis: "corpus_calibrated_confidence_floor",
+            completeness: RowCompleteness::exhaustive(),
         };
         let json = serde_json::to_value(&result).expect("serialize");
 
@@ -1349,5 +2540,36 @@ mod semantic_contract {
             json.get("span").is_none(),
             "contract: 'span' must be absent from JSON when None"
         );
+    }
+
+    /// Issue #221: the embedded CLI stamps the answer-level confidence
+    /// verdict as a `{"confidence": {...}}` JSON envelope (and a
+    /// `confidence: <verdict>` text line) via `ConfidenceVerdictLine`.
+    #[test]
+    fn confidence_verdict_line_uses_confidence_envelope() {
+        let verdict = crate::semantic_confidence::SemanticConfidenceVerdict::new(
+            crate::semantic_confidence::SemanticConfidence::Weak,
+            0.37,
+            100,
+        );
+        let line = ConfidenceVerdictLine {
+            confidence: &verdict,
+        };
+        let json = serde_json::to_value(&line).expect("serialize verdict line");
+        assert!(
+            json.get("confidence").is_some(),
+            "verdict must serialize under the confidence envelope, got {json}"
+        );
+        assert_eq!(
+            json["confidence"]["verdict"], "weak",
+            "envelope must carry the verdict tag, got {json}"
+        );
+        // Text rendering is the verdict's one-line as_text().
+        let text = line.as_text();
+        assert!(
+            text.starts_with("confidence: weak "),
+            "text verdict must start with the stable tag, got {text}"
+        );
+        assert!(!text.contains('\n'), "text verdict must be a single line");
     }
 }

@@ -192,6 +192,8 @@ fn observation_bundle_graph() -> (tempfile::TempDir, PathBuf, String) {
             end_byte: 120,
             start_line: 5,
             end_line: 9,
+            start_column: None,
+            end_column: None,
         },
         "target_fn".to_owned(),
         format!("Rust fn target_fn at {path}:5"),
@@ -306,6 +308,48 @@ fn query_locate_line_past_last_span_is_out_of_range() {
 }
 
 #[test]
+fn query_locate_trailing_lines_use_file_line_count() {
+    // Issue #212: `line_out_of_range` means "past the file's actual last
+    // line", not "past the last recorded symbol span". A line in trailing
+    // comments/blank lines after the last symbol is a typed
+    // `no_enclosing_symbol`; only a line past the file's true line count is
+    // out of range, and the diagnostic cites that count.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).expect("src dir");
+    // Line map: `target_fn` spans lines 1-4; the file runs to line 7
+    // (the trailing newline adds no extra line under `str::lines`).
+    let lib =
+        "pub fn target_fn() -> usize {\n    let x = 40 + 2;\n    x\n}\n\n// trailing comment\n\n";
+    assert_eq!(lib.lines().count(), 7, "fixture must have 7 lines");
+    fs::write(src.join("lib.rs"), lib).expect("lib.rs");
+    let jsonl = scan_repository_at_with_override(temp.path(), FIXED_TIME, Some("locate-trailing"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    // Line 6 (trailing comment: past the last symbol span but inside the
+    // file) is a gap, not out of range.
+    let parsed = run_locate_err(&graph, "src/lib.rs:6", 2);
+    assert_eq!(
+        parsed["error"]["code"], "no_enclosing_symbol",
+        "trailing in-file line must be no_enclosing_symbol, got {parsed:?}"
+    );
+    // Line 8 is past the file's true last line (7).
+    let parsed = run_locate_err(&graph, "src/lib.rs:8", 2);
+    assert_eq!(
+        parsed["error"]["code"], "line_out_of_range",
+        "line past the file's last line must be line_out_of_range, got {parsed:?}"
+    );
+    assert_eq!(
+        parsed["error"]["max_known_line"], 7,
+        "out-of-range must cite the file's true line count, got {parsed:?}"
+    );
+}
+
+#[test]
 fn query_locate_unknown_file_exits_2_no_match() {
     let (_temp, graph) = fixture_graph();
     let parsed = run_locate_err(&graph, "src/nope.rs:3", 2);
@@ -374,6 +418,8 @@ const fn line_span(start_line: usize, end_line: usize) -> SourceSpan {
         end_byte: end_line * 10 + 5,
         start_line,
         end_line,
+        start_column: None,
+        end_column: None,
     }
 }
 
@@ -598,4 +644,179 @@ fn query_locate_text_format_prints_symbol_and_sections() {
         .stdout(
             predicate::str::contains("method_one").and(predicate::str::contains("source_facts=")),
         );
+}
+
+// ---------------------------------------------------------------------------
+// AC2 regression: the sidecar fast path must preserve the cross-domain bundle
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_locate_sidecar_index_preserves_cross_domain_bundle() {
+    // The #447 sidecar fast path hydrates a `ByPath` closure: the file's spans
+    // plus ancestry. The path-less `Observation` node is NOT in that closure,
+    // but the locate answer's trust-separated bundle must still carry it —
+    // identical to the cold-scan answer (issue #212 AC2: the same bundle as
+    // `eg query context`, which always reads the whole graph).
+    let (_temp, graph, sym_id) = observation_bundle_graph();
+    let cold = run_locate_ok(&graph, "src/lib.rs:6");
+    egregore().arg("index").arg(&graph).assert().success();
+    let indexed = run_locate_ok(&graph, "src/lib.rs:6");
+
+    assert_eq!(indexed["symbol"]["record_id"], sym_id);
+    for section in [
+        "source_facts",
+        "observations",
+        "project_state",
+        "artifacts",
+        "verification_evidence",
+        "unresolved",
+    ] {
+        assert_eq!(
+            indexed[section], cold[section],
+            "sidecar fast path changed bundle section `{section}`"
+        );
+    }
+    assert_eq!(
+        indexed["observations"]
+            .as_array()
+            .expect("observations")
+            .len(),
+        1,
+        "the located symbol's observation must survive the sidecar fast path"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fixture: `query locate --daemon` (issue #212)
+// ---------------------------------------------------------------------------
+
+/// Starts a daemon on an embedded store ingested from `graph`, waiting until
+/// its runtime metadata reports `running`. Mirrors the helper in
+/// `repo_scope.rs`.
+#[cfg(feature = "embedded-aletheiadb")]
+fn ingest_and_start_daemon(graph: &Path, data_dir: &Path) -> std::process::Child {
+    use std::process::{Command as ProcessCommand, Stdio};
+
+    egregore()
+        .arg("ingest")
+        .arg(graph)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(data_dir)
+        .assert()
+        .success();
+
+    let daemon = ProcessCommand::new(assert_cmd::cargo::cargo_bin("egregore"))
+        .arg("daemon")
+        .arg("run")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .args(["--port", "0"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("daemon should spawn");
+
+    let mut runtime_name = data_dir
+        .file_name()
+        .expect("data dir has a name")
+        .to_os_string();
+    runtime_name.push(".egregore-runtime");
+    let runtime_metadata = data_dir.with_file_name(runtime_name).join("egregored.json");
+    let started = std::time::Instant::now();
+    loop {
+        if let Ok(contents) = fs::read_to_string(&runtime_metadata)
+            && contents.contains("\"running\"")
+        {
+            break;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "daemon should start and write running metadata"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    daemon
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn stop_daemon(data_dir: &Path, daemon: &mut std::process::Child) {
+    egregore()
+        .args(["daemon", "stop", "--data-dir"])
+        .arg(data_dir)
+        .assert()
+        .success();
+    let _ = daemon.wait();
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn query_locate_daemon_matches_graph_answer() {
+    // Issue #212 `--daemon`: the daemon-routed answer must be the same full
+    // envelope the `--graph` path emits — symbol, enclosing chain, and every
+    // trust-separated bundle section.
+    let (_temp, graph) = fixture_graph();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("egregore-store");
+    let mut daemon = ingest_and_start_daemon(&graph, &data_dir);
+
+    let result = std::panic::catch_unwind(|| {
+        let daemon_output = egregore()
+            .args(["query", "locate", "src/lib.rs:9", "--daemon", "--data-dir"])
+            .arg(&data_dir)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let daemon_answer: Value =
+            serde_json::from_str(std::str::from_utf8(&daemon_output).expect("utf8").trim())
+                .expect("daemon answer must be valid JSON");
+        let cold = run_locate_ok(&graph, "src/lib.rs:9");
+
+        assert_eq!(daemon_answer["ok"], true);
+        assert_eq!(
+            daemon_answer["symbol"], cold["symbol"],
+            "daemon symbol must match the --graph answer"
+        );
+        assert_eq!(
+            daemon_answer["enclosing_chain"], cold["enclosing_chain"],
+            "daemon enclosing chain must match the --graph answer"
+        );
+        for section in [
+            "source_facts",
+            "observations",
+            "project_state",
+            "artifacts",
+            "verification_evidence",
+            "unresolved",
+        ] {
+            assert_eq!(
+                daemon_answer[section], cold[section],
+                "daemon bundle section `{section}` must match the --graph answer"
+            );
+        }
+
+        // Typed positional errors keep their code over the daemon transport.
+        let err_output = egregore()
+            .args([
+                "query",
+                "locate",
+                "src/lib.rs:999",
+                "--daemon",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .assert()
+            .code(2)
+            .get_output()
+            .stdout
+            .clone();
+        let err_answer: Value =
+            serde_json::from_str(std::str::from_utf8(&err_output).expect("utf8").trim())
+                .expect("daemon error must be valid JSON");
+        assert_eq!(err_answer["error"]["code"], "line_out_of_range");
+    });
+
+    stop_daemon(&data_dir, &mut daemon);
+    result.expect("daemon locate assertions must pass");
 }

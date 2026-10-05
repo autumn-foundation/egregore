@@ -16,8 +16,9 @@ use crate::{
     identity,
     ir::{Graph, GraphRecord, ProducerKind, SCHEMA_VERSION, stable_id, versioned_stable_id},
     languages::cross_file::{
-        FileFacts, apply_out_of_line_test_scope, cross_file_call_records,
-        cross_file_implements_records, label_same_file_call_resolutions,
+        FileFacts, apply_out_of_line_cfg_gates, apply_out_of_line_test_roles,
+        apply_out_of_line_test_scope, cross_file_call_records, cross_file_implements_records,
+        cross_file_macro_records, label_same_file_call_resolutions,
     },
     repository_record_from_identity, scan_source_file_records,
     schema_version::validate_record_version,
@@ -136,11 +137,24 @@ use crate::{
 /// cached: it is recomputed on every refresh, so a source file byte-identical
 /// to its cached version whose owning `Cargo.toml` was added, renamed, or
 /// deleted is still re-attributed.
-///
+/// 26 -> 27: trunk repair restoring audit-gap issues (commit 0f3f6fd; no
+/// per-issue doc line was recorded).
+/// 27 -> 28: #256 history-replay window. The paired codegraph
+/// `SCHEMA_VERSION` bump 9 -> 10 changes every `codegraph:v<N>:` record ID
+/// prefix (and adds the `HistoryReplayWindow` node kind), so a cache holding
+/// v9 IDs would replay records whose endpoints no longer match freshly-minted
+/// v10 ones.
+/// 29 -> 30: #148 macro-definition symbols and repo-wide macro-invocation
+/// resolution. Per-file extraction no longer emits `unsupported macro
+/// invocation` Diagnostics eagerly: it now emits `macro` Symbol records plus
+/// the `FileFacts.macro_definitions`/`macro_invocations` vectors, and the new
+/// repo-wide pass re-derives resolved `CALLS` edges and diagnostics from
+/// those facts. Older caches would replay the pre-#148 diagnostic record set
+/// and miss the macro symbols and their edges, so they must rebuild.
 /// Independent of this version, the cache records the writing binary's
 /// producer signature (issue #234): a signature mismatch invalidates reuse
 /// without a schema bump, and caches missing the signature always rebuild.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 26;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 30;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -374,7 +388,7 @@ fn scan_repository_incremental_at_inner(
         } else {
             rebuilt_files.push(source_file.repo_relative_path.clone());
             let (records, facts) = match scan_source_file_records(&source_file, &repository_id)? {
-                crate::SourceFileScanOutcome::Extracted { records, facts } => (records, facts),
+                crate::SourceFileScanOutcome::Extracted { records, facts } => (records, *facts),
                 // A non-UTF-8 or unreadable file is skipped (issue #438): cache
                 // the diagnostic as this file's sole record so an unchanged file
                 // reuses it next refresh. Byte hashing above already succeeds
@@ -473,6 +487,11 @@ fn scan_repository_incremental_at_inner(
         .filter(|(_, cached_file)| !cached_file.facts.is_empty())
         .map(|(path, cached_file)| (path.clone(), cached_file.facts.clone()))
         .collect();
+    // Declared Cargo manifests, harvested BEFORE the cross-file passes: the
+    // import-target pass resolves absolute `<crate_name>::…` imports against
+    // owning-package names. Harvesting is a pure function of the repo root.
+    let manifest_facts = crate::manifest_deps::scan_manifest_package_facts(repo_root)?;
+    let attribution = crate::crate_attribution::CrateAttributionIndex::from_facts(manifest_facts);
     let mut cross_file_records = cross_file_call_records(&repository_id, &facts_by_file);
     // Repo-wide cross-file trait resolution (issue #344): recomputed from the
     // same `facts_by_file` as the CALLS pass, so a change on either side of an
@@ -483,6 +502,26 @@ fn scan_repository_incremental_at_inner(
         &repository_id,
         &facts_by_file,
     ));
+    // Repo-wide macro-invocation resolution (issue #148): recomputed from
+    // the same `facts_by_file` as the CALLS pass, so a macro added, removed,
+    // or renamed re-derives its CALLS edges and diagnostics here. Folded
+    // into the same stream and ID set so stale records are tombstoned on
+    // removal exactly like cross-file CALLS edges.
+    cross_file_records.extend(cross_file_macro_records(&repository_id, &facts_by_file));
+    // Inbound IMPORTS edges to imported Module/File targets (issue #444):
+    // recomputed from the same assembled graph as the CALLS pass, so an
+    // import added, removed, or retargeted re-derives its edge here. Folded
+    // into the same stream and ID set so stale edges are tombstoned on
+    // removal exactly like cross-file CALLS edges. Fail-closed: unresolvable
+    // imports mint no edge.
+    cross_file_records.extend(
+        crate::languages::cross_file::cross_file_import_target_edges(
+            &repository_id,
+            graph.records(),
+            &facts_by_file,
+            &attribution,
+        ),
+    );
     let cross_file_ids: BTreeSet<String> = cross_file_records
         .iter()
         .map(|record| record.id().to_owned())
@@ -517,6 +556,14 @@ fn scan_repository_incremental_at_inner(
     // so a gating change in a parent file re-contexts an unchanged module
     // file's cached panic-risk sites correctly.
     apply_out_of_line_test_scope(graph.records_mut(), &facts_by_file);
+    // Out-of-line `#[cfg(test)] mod x;` File-role stamping (issue #238):
+    // recomputed over the whole assembled graph every scan — never cached.
+    apply_out_of_line_test_roles(graph.records_mut(), &facts_by_file);
+    // Out-of-line `#[cfg(...)] mod x;` gate propagation (issue #190):
+    // recomputed over the whole assembled graph every scan — never cached —
+    // so a gating change in a parent file re-gates an unchanged module
+    // file's cached records correctly. The stamping is idempotent.
+    apply_out_of_line_cfg_gates(graph.records_mut(), &facts_by_file);
 
     let mut tombstoned_files = Vec::new();
     for (removed, cached_file) in &previous_cache.files {
@@ -554,8 +601,8 @@ fn scan_repository_incremental_at_inner(
     // renamed, added, or deleted. Recomputing here — the same "never cached,
     // always recomputed" class as `label_same_file_call_resolutions` — is what
     // keeps a refresh and a full scan of the same tree in exact agreement.
-    let manifest_facts = crate::manifest_deps::scan_manifest_package_facts(repo_root)?;
-    let attribution = crate::crate_attribution::CrateAttributionIndex::from_facts(manifest_facts);
+    // The index was built above for the import-target pass; only the stamping
+    // runs here.
     crate::crate_attribution::apply_crate_attribution(graph.records_mut(), &attribution);
 
     // Scan-coverage reconciliation (issue #135), previously emitted only by the

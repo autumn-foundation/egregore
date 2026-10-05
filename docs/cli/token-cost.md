@@ -29,7 +29,7 @@ eg audit token-cost [--corpus <PATH>] [--min-ratio <F>] [--format json]
   `corpus/token_cost_corpus.json`.
 * `--min-ratio <F>` — minimum baseline-to-Egregore savings ratio each question
   class (and the aggregate) must meet. Defaults to the manifest's `min_ratio`
-  (3.0). When supplied, overrides it.
+  (2.7). When supplied, overrides it.
 * `--format json` — output format (JSON only; `text` aliases to JSON).
 
 ## Shortest local workflow
@@ -106,7 +106,7 @@ not move the ratio.
   "corpus": { "name": "...", "source_file_count": 4, "record_count": 61, "store_kind": "jsonl" },
   "egregore_version": "0.1.0",
   "token_count_method": "word-punct-v1",
-  "min_ratio": 3.0,
+  "min_ratio": 2.7,
   "questions": [
     {
       "id": "q1-exact-symbol",

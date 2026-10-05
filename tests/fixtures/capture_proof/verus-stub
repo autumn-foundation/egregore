@@ -1,0 +1,60 @@
+#!/bin/sh
+# Stub `verus` binary for egregore issue #69 tests.
+#
+# Mimics real verus exit codes and output shapes closely enough to exercise the
+# capture-proof parser. NEVER installed anywhere: the tests point
+# `eg capture-proof --verus-bin` at this file explicitly, and the documented
+# workflow does the same with the operator's real local verus binary.
+set -u
+
+if [ "${1:-}" = "--version" ]; then
+    printf 'verus 0.4.0 (egregore issue #69 stub)\n'
+    exit 0
+fi
+
+# The proof target is the last non-flag positional argument.
+target=""
+for arg in "$@"; do
+    case "$arg" in
+        --*) ;;
+        *) target="$arg" ;;
+    esac
+done
+
+# Redaction canary: every run leaks a fake AWS key on stderr so the tests can
+# prove the v1 redaction policy scrubbed it before persistence.
+printf 'warning: build environment exposes AKIAIOSFODNN7EXAMPLE\n' >&2
+printf 'verifying file %s\n' "$target"
+
+if grep -q "VERUS_HANG" "$target" 2>/dev/null; then
+    # Simulates a hung solver: the capture must kill this after --timeout-secs.
+    sleep 3600
+    exit 0
+fi
+if grep -q "VERUS_SHOULD_FAIL" "$target" 2>/dev/null; then
+    cat <<'EOF'
+error: postcondition failed
+ --> proof_fail.rs:14:9
+  |
+14 |     ensures result == x + 1
+  |             ^^^^^^^^^^^^^^^ possible postcondition failure
+  |
+note: this is a stub diagnostic mirroring the verus shape
+verification results:: 1 verified, 1 errors
+EOF
+    exit 1
+fi
+if grep -q "VERUS_UNKNOWN_SHAPE" "$target" 2>/dev/null; then
+    printf 'qzxw blorple fnord 42\n'
+    exit 3
+fi
+if grep -q "VERUS_MALFORMED_SUMMARY" "$target" 2>/dev/null; then
+    printf 'verification results:: many verified, few errors\n'
+    exit 0
+fi
+if grep -q "VERUS_EXIT_MISMATCH" "$target" 2>/dev/null; then
+    printf 'verification results:: 2 verified, 0 errors\n'
+    exit 7
+fi
+printf 'verification results:: 2 verified, 0 errors\n'
+exit 0

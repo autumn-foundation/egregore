@@ -12,7 +12,7 @@ use crate::error::Result;
 /// 8→9: issue #117 adds the optional `crate_attribution` field (owning Cargo
 /// package name + the repo-relative path of the owning `Cargo.toml`) on every
 /// path-bearing code-graph node. Additive and never an identity input.
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// Schema version for agent-memory records (`Agent`, `AgentSession`, `Observation`, etc.).
 /// Documented in `docs/schema/agent-memory.md`.
@@ -84,7 +84,7 @@ pub const PRODUCER_ENVELOPE_SCHEMA_VERSION: u32 = 1;
 ///
 /// Present when the binary was built from a git checkout; absent when built from
 /// a clean release tarball. Documented in `docs/schema/producer-version.md`.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EgregoreGit {
     /// Short or full git commit SHA of the build tree.
     pub commit: String,
@@ -97,7 +97,7 @@ pub struct EgregoreGit {
 /// Adding a new variant is **additive** per `docs/schema/schema-versioning.md`.
 /// Removing or renaming a variant requires a producer-envelope `/v2/` bump.
 /// Documented in `docs/schema/producer-version.md`.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProducerKind {
     /// Tree-sitter-based code graph extractor (`scan` command).
@@ -120,6 +120,10 @@ pub enum ProducerKind {
     DriftEngine,
     /// Log-signature importer (`scan-logs` command, issues #319 / #320).
     LogImporter,
+    /// Repo-local design-doc importer (`import docs`, issue #149). Deterministic:
+    /// emits one artifact-domain node per markdown doc plus edges only for
+    /// explicit literal references resolved against a supplied code graph.
+    DocImporter,
     /// Any other producer not enumerated above, including future additive variants
     /// from newer binary versions read by an older binary.
     #[serde(other)]
@@ -141,6 +145,7 @@ impl ProducerKind {
             Self::TaskWriter => "task_writer",
             Self::DriftEngine => "drift_engine",
             Self::LogImporter => "log_importer",
+            Self::DocImporter => "doc_importer",
             Self::Other => "other",
         }
     }
@@ -161,7 +166,7 @@ impl ProducerKind {
 /// every record in that batch carries the same `Producer` value.
 ///
 /// Documented in `docs/schema/producer-version.md`.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Producer {
     /// Semver string from `CARGO_PKG_VERSION`.
     pub egregore_version: String,
@@ -278,7 +283,7 @@ impl Default for Graph {
 /// Inline content is bounded by a 16 KiB ceiling.  When the output exceeds
 /// that ceiling the `inline` field MUST be `None` and the full content is
 /// referenced by `hash` only.  Documented in `docs/schema/verification.md`.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OutputHandle {
     /// Inline content (None when bytes exceeds the 16 KiB ceiling).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -294,7 +299,7 @@ pub struct OutputHandle {
 /// The patch may be inlined only under the 16 KiB ceiling; otherwise the path
 /// points at protected artifact storage. Documented in
 /// `docs/schema/agent-actions.md`.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PatchHandle {
     /// Path to the stored patch bytes.
     pub path: String,
@@ -341,10 +346,91 @@ pub struct NodeProvenance {
     pub redaction_policy_version: Option<String>,
 }
 
+/// Derivation label stamped on every [`CostUsagePayload`].
+///
+/// The values were read verbatim from a trajectory transcript's `info` block,
+/// never computed by the importer. Cost figures are transcript-derived claims,
+/// not deterministic code facts.
+pub const COST_USAGE_DERIVATION_TRANSCRIPT: &str = "transcript_derived";
+
+/// Canonical JSON payload carried on a `CostUsage` node's `text` field by the
+/// `.traj` importer (issue #132).
+///
+/// Documented in `docs/schema/agent-memory.md` §4a ("`CostUsage` record
+/// shape"). Every `Option` field serializes as JSON `null` when the source
+/// trajectory's `info` block does not carry that field — `null` is the
+/// explicit unknown marker: a missing cost or token count is never
+/// fabricated, defaulted to zero, or inferred. A present zero (e.g.
+/// `cache_read_tokens: 0`) is real data and serializes as `0`.
+///
+/// The Codex and Claude-Code importers (issue #21) emit `CostUsage` nodes with
+/// a different, per-turn `text` shape; those legacy payloads do not parse as
+/// this struct and are excluded from the `eg query cost` rollup with a
+/// diagnostic rather than being silently dropped or misread.
+#[derive(schemars::JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct CostUsagePayload {
+    /// Derivation label: always [`COST_USAGE_DERIVATION_TRANSCRIPT`].
+    pub derivation: String,
+    /// Provider model name from the trajectory `info` block.
+    #[serde(default)]
+    pub model_name: Option<String>,
+    /// Billed cost in USD as reported by the trajectory source.
+    #[serde(default)]
+    pub actual_cost_usd: Option<f64>,
+    /// Total cost in USD as reported by the trajectory source.
+    #[serde(default)]
+    pub total_cost_usd: Option<f64>,
+    /// Reference/baseline cost in USD as reported by the trajectory source.
+    #[serde(default)]
+    pub baseline_cost_usd: Option<f64>,
+    /// Model the baseline cost was computed against.
+    #[serde(default)]
+    pub baseline_cost_model: Option<String>,
+    /// Prompt (input) token count.
+    #[serde(default)]
+    pub prompt_tokens: Option<u64>,
+    /// Cache-read token count.
+    #[serde(default)]
+    pub cache_read_tokens: Option<u64>,
+    /// Completion (output) token count.
+    #[serde(default)]
+    pub completion_tokens: Option<u64>,
+    /// Wall-clock run duration in seconds.
+    #[serde(default)]
+    pub duration_secs: Option<f64>,
+    /// BLAKE3 hex of the raw `info.task` text: the run's task handle. `None`
+    /// when the source carries no task text. The raw text is never inlined
+    /// into the graph (see `raw_traj_body_is_not_inlined`).
+    #[serde(default)]
+    pub task_handle: Option<String>,
+    /// Run verification outcome from the trajectory `info` block
+    /// (`"verified"` / `"failed"` / …), verbatim.
+    #[serde(default)]
+    pub verification_outcome: Option<String>,
+}
+
+impl CostUsagePayload {
+    /// Returns `true` when the payload carries at least one cost, token, or
+    /// duration measurement (the emission condition for issue #132: a
+    /// trajectory with no cost/token/duration data at all produces no
+    /// `CostUsage` record).
+    #[must_use]
+    pub const fn has_any_measurement(&self) -> bool {
+        self.actual_cost_usd.is_some()
+            || self.total_cost_usd.is_some()
+            || self.baseline_cost_usd.is_some()
+            || self.baseline_cost_model.is_some()
+            || self.prompt_tokens.is_some()
+            || self.cache_read_tokens.is_some()
+            || self.completion_tokens.is_some()
+            || self.duration_secs.is_some()
+    }
+}
+
 /// How a `Repository` node's stable ID was determined.
 ///
 /// Documented in `docs/schema/repository-identity.md`.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentitySource {
     /// Derived from the lowest-name-sorted git remote URL (normalized).
@@ -358,13 +444,26 @@ pub enum IdentitySource {
     OperatorOverride,
 }
 
+impl IdentitySource {
+    /// Closed `snake_case` vocabulary for operator-facing output (issue #193).
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Remote => "remote",
+            Self::LocalRootCommit => "local_root_commit",
+            Self::LocalPath => "local_path",
+            Self::OperatorOverride => "operator_override",
+        }
+    }
+}
+
 /// Identity payload carried on every `Repository` node.
 ///
 /// Describes how the node's stable ID was derived. Present only on
 /// `NodeKind::Repository` nodes; absent on all other node kinds.
 ///
 /// Documented in `docs/schema/repository-identity.md`.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RepositoryIdentityPayload {
     /// How the stable ID was computed.
     pub identity_source: IdentitySource,
@@ -388,7 +487,7 @@ pub struct RepositoryIdentityPayload {
 /// of a repo and non-Git directories serialize as `no_git`; a repository with no
 /// commits yet serializes as `unborn_head`. Documented in
 /// `docs/schema/source-snapshot.md` (issue #82).
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SnapshotHead {
     /// HEAD resolved to a commit; carries the full commit SHA.
@@ -411,7 +510,7 @@ pub enum SnapshotHead {
 /// override path as `valid_time`, so it never breaks JSONL determinism.
 ///
 /// Documented in `docs/schema/source-snapshot.md` (issue #82).
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceSnapshotPayload {
     /// HEAD commit state at scan time.
     pub head: SnapshotHead,
@@ -435,7 +534,7 @@ pub struct SourceSnapshotPayload {
 /// strictly local: never the output of `cargo metadata`, a network lookup, or
 /// a build. All fields are additive per `docs/schema/schema-versioning.md §2`
 /// and are never identity inputs beyond those hashed into the record ID.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DependencyDeclarationPayload {
     /// `[package].name` of the manifest declaring this dependency.
     pub declaring_package: String,
@@ -482,7 +581,7 @@ pub struct DependencyDeclarationPayload {
 /// `docs/schema/schema-versioning.md §2` and carry no paths or PII — only
 /// lowercased extensions, counts, and the named language scope — so the node is
 /// redaction-exempt deterministic code-graph data.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScanCoveragePayload {
     /// Total files the walk visited (files under excluded directories are never
     /// counted). Equals `files_indexed + sum(skipped_by_extension.values())`
@@ -520,6 +619,75 @@ pub struct ScanCoveragePayload {
     pub coverage_generation: Option<String>,
 }
 
+/// History-replay window summary stamped on the single `HistoryReplayWindow`
+/// node a *windowed* `eg scan-history` emits (issue #256).
+///
+/// Makes the replay window a stated, deterministic, queryable graph fact: which
+/// window form was requested, how many commits it selected, and the bounding
+/// commit SHAs / instant — so a windowed store is never mistaken for full
+/// history. All fields are additive per `docs/schema/schema-versioning.md` §2
+/// and carry no paths or PII — only the window kind, counts, commit SHAs, the
+/// operator-supplied revs, and a UTC instant — so the node is redaction-exempt
+/// deterministic code-graph data, like [`ScanCoveragePayload`].
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HistoryReplayWindowPayload {
+    /// The window form: `"count"`, `"since"`, or `"range"`.
+    pub window: String,
+    /// Commits the resolved window selected (always ≥ 1: an empty window is
+    /// rejected before any record is emitted).
+    pub selected_commit_count: usize,
+    /// The requested `--max-commits` bound (count windows only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_commits: Option<usize>,
+    /// The requested `--since` instant, normalized to UTC `Z` form (since
+    /// windows only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_instant: Option<String>,
+    /// The operator-supplied `--from` revision, as given (range windows only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_rev: Option<String>,
+    /// The operator-supplied `--to` revision, as given (`"HEAD"` when `--from`
+    /// was given alone and `--to` defaulted; range windows only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_rev: Option<String>,
+    /// The `--from` revision resolved to a commit SHA (range windows with an
+    /// explicit `--from` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_sha: Option<String>,
+    /// The `--to` revision resolved to a commit SHA (range windows only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_sha: Option<String>,
+    /// Oldest selected commit SHA (oldest-first replay order).
+    pub oldest_commit_sha: String,
+    /// Newest selected commit SHA.
+    pub newest_commit_sha: String,
+}
+
+/// History-replay resume marker stamped on the single `HistoryReplayTip` node
+/// (issue #224).
+///
+/// One node per *full* (unwindowed) `scan-history` replay, keyed by repository
+/// identity, records how far the replay reached: the tip commit SHA and the
+/// number of commits covered. A later `--resume-from` run reads this node back
+/// from the frontier JSONL and replays only `tip_sha..HEAD`, so the temporal
+/// graph stays current at the cost of new commits rather than all of history.
+/// All fields are additive per `docs/schema/schema-versioning.md §2` and
+/// carry no paths or PII — only the repository ID, commit SHAs, a count, and
+/// one UTC instant — so the node is redaction-exempt deterministic
+/// code-graph data, like [`ScanCoveragePayload`].
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct HistoryReplayTipPayload {
+    /// Stable repository identity this tip belongs to (the `Repository`
+    /// node's ID).
+    pub repository_id: String,
+    /// Full SHA of the newest commit covered by the replay (inclusive).
+    pub tip_sha: String,
+    /// Commits covered by the replay — the resume frontier size.
+    pub covered_commit_count: usize,
+    /// Committer date of the tip commit, UTC `Z` RFC 3339.
+    pub tip_committed_at: String,
+}
+
 /// Per-kind payload stamped on the four log-signature node kinds (issues
 /// #319 / #320).
 ///
@@ -533,7 +701,7 @@ pub struct ScanCoveragePayload {
 ///
 /// No field ever carries raw log text beyond a bounded, post-redaction excerpt
 /// (`template_excerpt` / `event_excerpt`).
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "log_kind", rename_all = "snake_case")]
 pub enum LogPayload {
     /// A captured log source artifact.
@@ -571,7 +739,7 @@ impl LogPayload {
 /// Identity inputs (`docs/schema/log-graph.md`): `repository_id`,
 /// `source_relative_path`, `source_artifact_hash`. `line_count`, capture time,
 /// and producer are non-identity.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LogSourcePayload {
     /// Repository-relative path of the captured log file.
     pub source_relative_path: String,
@@ -598,7 +766,7 @@ pub struct LogSourcePayload {
 /// Identity inputs: `repository_id`, `fingerprint_algorithm`,
 /// `normalized_template`, `severity`. `occurrence_count`, `first_seen`,
 /// `last_seen`, capture time, and producer are non-identity.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ErrorSignaturePayload {
     /// Fingerprint algorithm identifier (`template-v1`).
     pub fingerprint_algorithm: String,
@@ -633,7 +801,7 @@ pub struct ErrorSignaturePayload {
 /// Identity inputs: `repository_id`, `signature_id`, `event_valid_time`,
 /// `event_content_hash`. `source_line`, byte offsets, capture time, and
 /// producer are non-identity.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LogEventPayload {
     /// Bounded, post-redaction excerpt of the exemplar line(s).
     pub event_excerpt: String,
@@ -659,7 +827,7 @@ pub struct LogEventPayload {
 /// makes two distinct sources observing the same signature/hour mint DISTINCT
 /// bucket IDs (summed downstream), while a genuine rescan of identical bytes
 /// mints the SAME bucket ID (collapsed as a duplicate).
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LogOccurrenceBucketPayload {
     /// RFC 3339 UTC start of the bucket, floored to the hour.
     pub bucket_start: String,
@@ -701,7 +869,7 @@ pub struct LogOccurrenceBucketPayload {
 /// resolves the triple at write time.
 ///
 /// Documented in docs/schema/agent-memory.md.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceLink {
     /// Stable record ID of the cited graph node.
     /// Either this or the triple fields below must be present.
@@ -732,7 +900,7 @@ pub struct EvidenceLink {
 ///
 /// All fields omitted means "global to this operator"; see
 /// `docs/schema/user-context.md`.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub struct UserContextScope {
     /// Optional repository identity from the repository-identity domain.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -752,7 +920,7 @@ pub struct UserContextScope {
 ///
 /// The fields are flattened into node JSON so the schema remains a normal
 /// record shape instead of a nested metadata blob.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub struct UserContextFields {
     /// Candidate durable rule body.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -928,10 +1096,20 @@ impl UserContextFields {
 ///   is emitted to every candidate, each labeled `ambiguous`.
 /// - `unresolved` — no in-repo definition matched; the edge targets a
 ///   `Diagnostic` node recording the callee, never an invented symbol.
+/// - `unresolved_dispatch` — the call site is a trait-dispatch call (a
+///   `dyn Trait` or `T: Trait` receiver, issue #267) whose target set could
+///   not be reduced to a concrete in-crate symbol. Like `unresolved`, the
+///   edge targets a `Diagnostic` marker — named `unresolved_dispatch:
+///   Trait::method` and carrying the call-site span — never an invented
+///   symbol. It is a TYPED sibling of `unresolved` (the weakest signal in the
+///   ordering) so query lanes can enumerate dispatch boundaries exactly
+///   instead of lumping them with ordinary misses.
 ///
 /// Adding this optional field is additive per
 /// `docs/schema/schema-versioning.md`; legacy edges simply lack it.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CallResolution {
     /// Exactly one in-repo definition matched the call site.
@@ -940,6 +1118,9 @@ pub enum CallResolution {
     Ambiguous,
     /// No in-repo definition matched; the target is a `Diagnostic` marker.
     Unresolved,
+    /// A trait-dispatch call site with no reducible in-crate target; the
+    /// target is a typed `unresolved_dispatch: Trait::method` marker.
+    UnresolvedDispatch,
 }
 
 impl CallResolution {
@@ -950,6 +1131,7 @@ impl CallResolution {
             Self::Resolved => "resolved",
             Self::Ambiguous => "ambiguous",
             Self::Unresolved => "unresolved",
+            Self::UnresolvedDispatch => "unresolved_dispatch",
         }
     }
 
@@ -961,6 +1143,7 @@ impl CallResolution {
             "resolved" => Some(Self::Resolved),
             "ambiguous" => Some(Self::Ambiguous),
             "unresolved" => Some(Self::Unresolved),
+            "unresolved_dispatch" => Some(Self::UnresolvedDispatch),
             _ => None,
         }
     }
@@ -990,7 +1173,9 @@ impl CallResolution {
 ///
 /// Adding this optional edge field is additive per
 /// `docs/schema/schema-versioning.md`; legacy edges simply lack it.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum FrameResolution {
     /// Exactly one in-repo `Symbol` matched the frame.
@@ -1052,7 +1237,9 @@ impl FrameResolution {
 ///
 /// Adding this optional edge field is additive per
 /// `docs/schema/schema-versioning.md`; legacy edges simply lack it.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CorrelationBasis {
     /// The signature's `LogSource` artifact hash equals a `CommandRun` output
@@ -1102,7 +1289,7 @@ impl CorrelationBasis {
 /// repository-relative form (or a generalized external-toolchain form) so no
 /// absolute host path or username enters the graph. Frames are **non-identity**:
 /// they never participate in the `ErrorSignature` record-ID hash preimage.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StackFrame {
     /// Zero-based position of the frame in the captured backtrace.
     pub frame_index: u32,
@@ -1119,11 +1306,11 @@ pub struct StackFrame {
 }
 
 /// One JSONL graph record.
-// Node carries 10 optional provenance strings for agent-memory nodes.
+// Node carries 12 optional provenance strings for agent-memory nodes.
 // These are None for all code-graph nodes, so the memory cost is only
 // paid by agent-memory records that actually populate them.
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "record_type", rename_all = "snake_case")]
 pub enum GraphRecord {
     /// A graph node.
@@ -1208,6 +1395,80 @@ pub enum GraphRecord {
         /// `docs/schema/schema-versioning.md §2`; never an identity input.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         route: Option<Vec<RouteAnnotation>>,
+        // ── Deprecation facts (issue #249) ──────────────────────────────────
+        /// `#[deprecated]` attribute facts on a `Symbol` node (issue #249):
+        /// presence means the item carried the attribute; `since` and `note`
+        /// carry its verbatim bounded payloads (absent when the attribute did
+        /// not carry them — never synthesized). Additive per
+        /// `docs/schema/schema-versioning.md §2`; never an identity input.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deprecated: Option<DeprecationMark>,
+        // ── Lint-suppression facts (issue #227) ───────────────────────────
+        /// `#[allow(...)]` / `#![allow(...)]` suppression facts on a
+        /// `LintSuppression` node (issue #227): presence means an allow
+        /// attribute was detected over the Tree-sitter attribute AST; the
+        /// payload carries the sorted lint names, the closed attribute
+        /// scope, and the adjacent justification-comment signal. Additive
+        /// per `docs/schema/schema-versioning.md §2`; never an identity
+        /// input.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lint_suppression: Option<LintSuppressionFacts>,
+        // ── Conditional-compilation gate facts (issue #190) ───────────────
+        /// Normalized `#[cfg(...)]` / `#[cfg_attr(...)]` predicates lexically
+        /// gating a `Symbol`, `Module`, or `File` node (issue #190). Each
+        /// entry is the predicate text exactly as written in source (interior
+        /// whitespace collapsed) — never evaluated, satisfied, or expanded.
+        /// Entries run outermost gate first: the file's `#![cfg(...)]` inner
+        /// attributes, then enclosing gated items/modules, then the item's
+        /// own attributes. The item's effective compilation gate is the
+        /// conjunction of the `#[cfg(...)]` entries; a `#[cfg_attr(pred, …)]`
+        /// entry records the predicate gating that attribute's application
+        /// (not the item's compilation) so conditional-compilation facts are
+        /// never silently dropped — see `docs/cli/query.md` for the full
+        /// composition rule. Absent when the item carries no gate — never a
+        /// fabricated `true`, never an empty vector. A
+        /// `TrustClass::SourceDerived` code-graph fact drawn from the AST —
+        /// no agent-authored confidence. Additive per
+        /// `docs/schema/schema-versioning.md` §2; never an identity input.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cfg: Option<Vec<String>>,
+        // ── Entry-point facts (issue #240) ────────────────────────────────
+        /// Non-call entry-point facts on a `Symbol` node (issue #240):
+        /// presence means the item is a recognized non-call entry point — a
+        /// `#[test]` / `#[bench]` harness entry, an FFI export
+        /// (`#[no_mangle]` / `#[export_name]`), or a binary-crate `fn main`.
+        /// The mark's *presence* is the fact; the closed `kind` vocabulary
+        /// names which one. Additive per `docs/schema/schema-versioning.md`
+        /// §2 and never an identity input: stamping entry-point facts never
+        /// moves a record ID.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry_point: Option<EntryPointMark>,
+        // ── Test-vs-production role facts (issue #238) ───────────────────────
+        /// Deterministic test-vs-production classification of a `Symbol` or
+        /// `File` node (issue #238): `Test` when the item carries a
+        /// test-family attribute (`#[test]`, `#[tokio::test]`, `#[bench]`,
+        /// …), sits inside a `#[cfg(test)]`-gated module, or lives under a
+        /// top-level `tests/` or `benches/` root; `Production` otherwise. A
+        /// `TrustClass::SourceDerived` code-graph fact drawn from the AST and
+        /// the file path — no agent-authored confidence. Additive per
+        /// `docs/schema/schema-versioning.md` §2; never an identity input.
+        /// Absent on records produced before issue #238 (unknown, never
+        /// fabricated) and on node kinds outside the code-graph domain.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<SymbolRole>,
+        // ── Structural complexity facts (issue #162) ─────────────────────
+        /// Deterministic structural complexity score for Rust callable
+        /// `Symbol` nodes (`function` / `method` / `test` symbol kinds,
+        /// issue #162): 1 plus one per decision point in the item's own
+        /// body (`if` / `else if`, `for`, `while`, `loop`, each `match`
+        /// arm, each `?`, each `&&`, each `||`). Closure bodies count
+        /// toward the enclosing callable; nested `fn` items get their own
+        /// symbol and are not counted. Signature-only items (no body) score
+        /// the minimum 1. A `TrustClass::SourceDerived` code fact — no
+        /// agent-authored confidence. Additive per
+        /// `docs/schema/schema-versioning.md` §2; never an identity input.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        complexity: Option<u32>,
         // ── Owning-Cargo-package attribution (issue #117) ─────────────────────
         /// The Cargo package that owns this code fact, resolved from the
         /// NEAREST ENCLOSING `Cargo.toml`, together with that manifest's
@@ -1254,6 +1515,17 @@ pub enum GraphRecord {
         /// coverage stamping.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scan_coverage: Option<Box<ScanCoveragePayload>>,
+        /// History-replay window payload for the single `HistoryReplayWindow`
+        /// node (issue #256); absent on all other kinds and on unwindowed
+        /// (full-history) replays.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        history_replay_window: Option<Box<HistoryReplayWindowPayload>>,
+        /// History-replay resume marker for the single `HistoryReplayTip`
+        /// node (issue #224); absent on all other kinds and on windowed
+        /// replays, which never represent full history and are not valid
+        /// resume bases.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        history_replay_tip: Option<Box<HistoryReplayTipPayload>>,
         /// Embedding-model identity for the semantic `EmbeddingModel` node that
         /// records which model produced a store's queryable vector index (issue
         /// #104); absent on all other kinds and on stores embedded before
@@ -1265,6 +1537,15 @@ pub enum GraphRecord {
         /// Observation body text (Observation nodes).
         #[serde(skip_serializing_if = "Option::is_none")]
         text: Option<String>,
+        /// The decision statement (Decision nodes; issue #191). Additive:
+        /// absent on records produced before the IR read it (unknown, never
+        /// fabricated).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decision_text: Option<String>,
+        /// Why the agent made the decision (Decision nodes; issue #191).
+        /// Additive: absent on records produced before the IR read it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rationale_summary: Option<String>,
         /// ID of the record that supersedes this one.
         #[serde(skip_serializing_if = "Option::is_none")]
         superseded_by: Option<String>,
@@ -1607,6 +1888,19 @@ pub enum GraphRecord {
         /// edge carries exactly one basis — none is emitted without one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         basis: Option<CorrelationBasis>,
+        /// Per-call-site source spans retained from the deduplicated call sites
+        /// that produced this edge (issue #462); present only on `CALLS`
+        /// edges whose `resolution` is `Resolved`. Each span is interpreted in
+        /// the caller (edge `source`) symbol's file. `None` on every other
+        /// edge: ambiguous/unresolved `CALLS` edges carry no spans (the #233
+        /// fabrication-guard discipline — only provably single-target call
+        /// sites may become reference occurrences), and non-`CALLS` edges and
+        /// legacy records never carry it. Additive per
+        /// `docs/schema/schema-versioning.md`: `#[serde(default,
+        /// skip_serializing_if)]`, and never an identity input — the stable
+        /// edge ID stays `(label, source, target)` regardless of spans.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_site_spans: Option<Vec<SourceSpan>>,
         /// Struct-literal exhaustiveness marker (issue #443); present only on
         /// `CONSTRUCTS` edges. `Some(true)` when at least one collapsed
         /// construction site is the E0063-breakable exhaustive form (no
@@ -1763,6 +2057,12 @@ impl GraphRecord {
             note: None,
             content_signature: None,
             route: None,
+            deprecated: None,
+            lint_suppression: None,
+            cfg: None,
+            entry_point: None,
+            role: None,
+            complexity: None,
             crate_attribution: None,
             temporal: None,
             semantic_drift: None,
@@ -1770,6 +2070,8 @@ impl GraphRecord {
             repository_identity: None,
             source_snapshot: None,
             text: None,
+            decision_text: None,
+            rationale_summary: None,
             superseded_by: None,
             agent_id: None,
             agent_kind: None,
@@ -1857,6 +2159,8 @@ impl GraphRecord {
             dependency: None,
             log: None,
             scan_coverage: None,
+            history_replay_window: None,
+            history_replay_tip: None,
             embedding_model: None,
             user_context: UserContextFields::empty(),
             producer: None,
@@ -1892,6 +2196,12 @@ impl GraphRecord {
             note: None,
             content_signature: None,
             route: None,
+            deprecated: None,
+            lint_suppression: None,
+            cfg: None,
+            entry_point: None,
+            role: None,
+            complexity: None,
             crate_attribution: None,
             temporal: None,
             semantic_drift: None,
@@ -1899,6 +2209,8 @@ impl GraphRecord {
             repository_identity: None,
             source_snapshot: None,
             text: None,
+            decision_text: None,
+            rationale_summary: None,
             superseded_by: None,
             agent_id: None,
             agent_kind: None,
@@ -1986,6 +2298,8 @@ impl GraphRecord {
             dependency: None,
             log: None,
             scan_coverage: None,
+            history_replay_window: None,
+            history_replay_tip: None,
             embedding_model: None,
             user_context: UserContextFields::empty(),
             producer: None,
@@ -2020,6 +2334,12 @@ impl GraphRecord {
             note: None,
             content_signature: None,
             route: None,
+            deprecated: None,
+            lint_suppression: None,
+            cfg: None,
+            entry_point: None,
+            role: None,
+            complexity: None,
             crate_attribution: None,
             temporal: None,
             semantic_drift: None,
@@ -2027,6 +2347,8 @@ impl GraphRecord {
             repository_identity: None,
             source_snapshot: None,
             text: None,
+            decision_text: None,
+            rationale_summary: None,
             superseded_by: None,
             agent_id: None,
             agent_kind: None,
@@ -2114,6 +2436,8 @@ impl GraphRecord {
             dependency: None,
             log: None,
             scan_coverage: None,
+            history_replay_window: None,
+            history_replay_tip: None,
             embedding_model: None,
             user_context: UserContextFields::empty(),
             producer: None,
@@ -2153,6 +2477,12 @@ impl GraphRecord {
             note: None,
             content_signature: None,
             route: None,
+            deprecated: None,
+            lint_suppression: None,
+            cfg: None,
+            entry_point: None,
+            role: None,
+            complexity: None,
             crate_attribution: None,
             temporal: None,
             semantic_drift: None,
@@ -2160,6 +2490,8 @@ impl GraphRecord {
             repository_identity: None,
             source_snapshot: None,
             text: None,
+            decision_text: None,
+            rationale_summary: None,
             superseded_by: None,
             agent_id: None,
             agent_kind: None,
@@ -2247,6 +2579,8 @@ impl GraphRecord {
             dependency: None,
             log: None,
             scan_coverage: None,
+            history_replay_window: None,
+            history_replay_tip: None,
             embedding_model: None,
             user_context: UserContextFields::empty(),
             producer: None,
@@ -2274,6 +2608,7 @@ impl GraphRecord {
             frame_resolution: None,
             frame_index: None,
             basis: None,
+            call_site_spans: None,
             is_exhaustive: None,
             temporal: None,
             summary,
@@ -2303,6 +2638,7 @@ impl GraphRecord {
             frame_resolution: None,
             frame_index: None,
             basis: None,
+            call_site_spans: None,
             is_exhaustive: None,
             temporal: None,
             summary,
@@ -2339,6 +2675,39 @@ impl GraphRecord {
             frame_resolution: None,
             frame_index: None,
             basis: None,
+            call_site_spans: None,
+            is_exhaustive: None,
+            temporal: None,
+            summary,
+            producer: None,
+        }
+    }
+
+    /// Builds an artifact-domain edge record between artifact-stable IDs
+    /// (issue #149). Mirrors [`GraphRecord::project_edge`]: the edge id uses
+    /// the artifact stable-id namespace and schema version, and the record
+    /// carries no producer envelope (the caller stamps one when needed).
+    #[must_use]
+    pub fn artifact_edge(
+        label: EdgeLabel,
+        source: String,
+        target: String,
+        confidence: Option<String>,
+        summary: String,
+    ) -> Self {
+        let id = artifact_stable_id(&["artifact", "edge", label.as_str(), &source, &target]);
+        Self::Edge {
+            id,
+            schema_version: ARTIFACT_SCHEMA_VERSION,
+            label,
+            source,
+            target,
+            confidence,
+            resolution: None,
+            frame_resolution: None,
+            frame_index: None,
+            basis: None,
+            call_site_spans: None,
             is_exhaustive: None,
             temporal: None,
             summary,
@@ -2429,6 +2798,34 @@ impl GraphRecord {
     pub const fn construct_is_exhaustive(&self) -> Option<bool> {
         match self {
             Self::Edge { is_exhaustive, .. } => *is_exhaustive,
+            Self::Node { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Attaches per-call-site spans to a resolved `CALLS` edge record
+    /// (issue #462). Callers must only pass spans from `Resolved` call sites
+    /// and only call this on edges whose `resolution` is `Resolved`; the
+    /// fabrication-guard discipline is enforced by the resolution passes, not
+    /// here. No-op on node and tombstone records.
+    #[must_use]
+    pub fn with_call_site_spans(mut self, spans: Vec<SourceSpan>) -> Self {
+        if let Self::Edge {
+            call_site_spans, ..
+        } = &mut self
+        {
+            *call_site_spans = Some(spans);
+        }
+        self
+    }
+
+    /// Returns the retained per-call-site spans when this record is an edge
+    /// carrying them; `None` otherwise (issue #462).
+    #[must_use]
+    pub fn call_site_spans(&self) -> Option<&[SourceSpan]> {
+        match self {
+            Self::Edge {
+                call_site_spans, ..
+            } => call_site_spans.as_deref(),
             Self::Node { .. } | Self::Tombstone { .. } => None,
         }
     }
@@ -2524,6 +2921,52 @@ impl GraphRecord {
         self
     }
 
+    /// Stamps the decision statement on a `Decision` node (issue #191).
+    #[must_use]
+    pub fn with_decision_text(mut self, decision_text: &str) -> Self {
+        if let Self::Node {
+            decision_text: field,
+            ..
+        } = &mut self
+        {
+            *field = Some(decision_text.to_owned());
+        }
+        self
+    }
+
+    /// Stamps the decision rationale on a `Decision` node (issue #191).
+    #[must_use]
+    pub fn with_rationale_summary(mut self, rationale_summary: &str) -> Self {
+        if let Self::Node {
+            rationale_summary: field,
+            ..
+        } = &mut self
+        {
+            *field = Some(rationale_summary.to_owned());
+        }
+        self
+    }
+
+    /// Returns the decision statement when present (issue #191).
+    #[must_use]
+    pub fn decision_text(&self) -> Option<&str> {
+        match self {
+            Self::Node { decision_text, .. } => decision_text.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Returns the decision rationale when present (issue #191).
+    #[must_use]
+    pub fn rationale_summary(&self) -> Option<&str> {
+        match self {
+            Self::Node {
+                rationale_summary, ..
+            } => rationale_summary.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
     /// Returns the debt-marker note text when present.
     #[must_use]
     pub fn note(&self) -> Option<&str> {
@@ -2564,6 +3007,27 @@ impl GraphRecord {
         }
     }
 
+    /// Stamps the structural complexity score on a callable `Symbol` node
+    /// (issue #162). The value is additive metadata per
+    /// `docs/schema/schema-versioning.md` §2 and MUST NOT contribute to
+    /// stable ID composition. No-op on non-node records.
+    #[must_use]
+    pub const fn with_complexity(mut self, score: u32) -> Self {
+        if let Self::Node { complexity, .. } = &mut self {
+            *complexity = Some(score);
+        }
+        self
+    }
+
+    /// Returns the structural complexity score when present (issue #162).
+    #[must_use]
+    pub const fn complexity(&self) -> Option<u32> {
+        match self {
+            Self::Node { complexity, .. } => *complexity,
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
     /// Attaches route-annotation facts (`#[get("/path")]`, …) to a handler
     /// `Symbol` node (issue #445). The value is additive metadata per
     /// `docs/schema/schema-versioning.md §2` and MUST NOT contribute to stable
@@ -2583,6 +3047,129 @@ impl GraphRecord {
     pub fn route(&self) -> Option<&[RouteAnnotation]> {
         match self {
             Self::Node { route, .. } => route.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Attaches deprecation-attribute facts (`#[deprecated]`, …) to a
+    /// `Symbol` node (issue #249). The value is additive metadata per
+    /// `docs/schema/schema-versioning.md` §2 and MUST NOT contribute to
+    /// stable ID composition. No-op on non-node records.
+    #[must_use]
+    pub fn with_deprecated(mut self, mark: DeprecationMark) -> Self {
+        if let Self::Node { deprecated, .. } = &mut self {
+            *deprecated = Some(mark);
+        }
+        self
+    }
+
+    /// Returns the deprecation-attribute facts when present (issue #249).
+    #[must_use]
+    pub const fn deprecated(&self) -> Option<&DeprecationMark> {
+        match self {
+            Self::Node { deprecated, .. } => deprecated.as_ref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Attaches lint-suppression facts (`#[allow(...)]` / `#![allow(...)]`)
+    /// to a `LintSuppression` node (issue #227). The value is additive
+    /// metadata per `docs/schema/schema-versioning.md` §2 and MUST NOT
+    /// contribute to stable ID composition. No-op on non-node records.
+    #[must_use]
+    pub fn with_lint_suppression(mut self, facts: LintSuppressionFacts) -> Self {
+        if let Self::Node {
+            lint_suppression, ..
+        } = &mut self
+        {
+            *lint_suppression = Some(facts);
+        }
+        self
+    }
+
+    /// Returns the lint-suppression facts when present (issue #227).
+    #[must_use]
+    pub const fn lint_suppression(&self) -> Option<&LintSuppressionFacts> {
+        match self {
+            Self::Node {
+                lint_suppression, ..
+            } => lint_suppression.as_ref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Attaches the conditional-compilation gate chain to a `Symbol`,
+    /// `Module`, or `File` node record (issue #190): the normalized
+    /// `#[cfg(...)]` / `#[cfg_attr(...)]` predicates, outermost gate first
+    /// (file inner attributes, then enclosing gated items/modules, then the
+    /// item's own). The value is additive metadata per
+    /// `docs/schema/schema-versioning.md` §2 and MUST NOT contribute to
+    /// stable ID composition. No-op on non-node records. Callers pass a
+    /// non-empty chain — absent means ungated, never an empty vector.
+    #[must_use]
+    pub fn with_cfg(mut self, gates: Vec<String>) -> Self {
+        debug_assert!(
+            !gates.is_empty(),
+            "with_cfg must not stamp an empty gate chain: absent means ungated"
+        );
+        if let Self::Node { cfg, .. } = &mut self {
+            *cfg = Some(gates);
+        }
+        self
+    }
+
+    /// Returns the conditional-compilation gate chain when stamped
+    /// (issue #190), outermost gate first. `None` means the record predates
+    /// issue #190 or the item is ungated — unknown-or-absent, never a
+    /// fabricated gate.
+    #[must_use]
+    pub const fn cfg(&self) -> Option<&Vec<String>> {
+        match self {
+            Self::Node { cfg, .. } => cfg.as_ref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Attaches non-call entry-point facts to a `Symbol` node (issue #240).
+    /// The value is additive metadata per `docs/schema/schema-versioning.md`
+    /// §2 and MUST NOT contribute to stable ID composition. No-op on
+    /// non-node records.
+    #[must_use]
+    pub const fn with_entry_point(mut self, mark: EntryPointMark) -> Self {
+        if let Self::Node { entry_point, .. } = &mut self {
+            *entry_point = Some(mark);
+        }
+        self
+    }
+
+    /// Returns the non-call entry-point facts when present (issue #240).
+    #[must_use]
+    pub const fn entry_point(&self) -> Option<&EntryPointMark> {
+        match self {
+            Self::Node { entry_point, .. } => entry_point.as_ref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Attaches a test-vs-production role to a `Symbol` or `File` node
+    /// (issue #238). The value is additive metadata per
+    /// `docs/schema/schema-versioning.md` §2 and MUST NOT contribute to
+    /// stable ID composition. No-op on non-node records.
+    #[must_use]
+    pub const fn with_role(mut self, role: SymbolRole) -> Self {
+        if let Self::Node { role: slot, .. } = &mut self {
+            *slot = Some(role);
+        }
+        self
+    }
+
+    /// Returns the test-vs-production role when stamped (issue #238).
+    /// `None` means the record predates issue #238 or its producer does not
+    /// classify roles — unknown, never a fabricated `Production`.
+    #[must_use]
+    pub const fn role(&self) -> Option<&SymbolRole> {
+        match self {
+            Self::Node { role, .. } => role.as_ref(),
             Self::Edge { .. } | Self::Tombstone { .. } => None,
         }
     }
@@ -2794,6 +3381,58 @@ impl GraphRecord {
         }
     }
 
+    /// Stamps a [`HistoryReplayWindowPayload`] on the `HistoryReplayWindow`
+    /// node (issue #256). No-op on non-node records.
+    #[must_use]
+    pub fn with_history_replay_window(mut self, payload: HistoryReplayWindowPayload) -> Self {
+        if let Self::Node {
+            history_replay_window,
+            ..
+        } = &mut self
+        {
+            *history_replay_window = Some(Box::new(payload));
+        }
+        self
+    }
+
+    /// Returns the history-replay window payload when this record is a
+    /// `HistoryReplayWindow` node carrying one; `None` otherwise (issue #256).
+    #[must_use]
+    pub fn history_replay_window(&self) -> Option<&HistoryReplayWindowPayload> {
+        match self {
+            Self::Node {
+                history_replay_window,
+                ..
+            } => history_replay_window.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Stamps a [`HistoryReplayTipPayload`] on the `HistoryReplayTip` node
+    /// (issue #224). No-op on non-node records.
+    #[must_use]
+    pub fn with_history_replay_tip(mut self, payload: HistoryReplayTipPayload) -> Self {
+        if let Self::Node {
+            history_replay_tip, ..
+        } = &mut self
+        {
+            *history_replay_tip = Some(Box::new(payload));
+        }
+        self
+    }
+
+    /// Returns the history-replay tip payload when this record is a
+    /// `HistoryReplayTip` node carrying one; `None` otherwise (issue #224).
+    #[must_use]
+    pub fn history_replay_tip(&self) -> Option<&HistoryReplayTipPayload> {
+        match self {
+            Self::Node {
+                history_replay_tip, ..
+            } => history_replay_tip.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
     /// Stamps the queryable vector index's [`EmbeddingModel`] identity on an
     /// `EmbeddingModel` node (issue #104). No-op on non-node records.
     #[must_use]
@@ -2969,6 +3608,30 @@ impl GraphRecord {
         self
     }
 
+    /// Sets the display title on a node record (issue #149). No-op on edges
+    /// and tombstones.
+    #[must_use]
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        if let Self::Node { title: t, .. } = &mut self {
+            *t = Some(title.into());
+        }
+        self
+    }
+
+    /// Sets the BLAKE3 content hash of the raw source bytes on a node record
+    /// (issue #149). No-op on edges and tombstones.
+    #[must_use]
+    pub fn with_source_artifact_hash(mut self, hash: impl Into<String>) -> Self {
+        if let Self::Node {
+            source_artifact_hash: h,
+            ..
+        } = &mut self
+        {
+            *h = Some(hash.into());
+        }
+        self
+    }
+
     /// Stamps the producer identity envelope on this record.
     ///
     /// The `producer` field is a non-identity envelope: it MUST NOT contribute
@@ -3021,7 +3684,9 @@ impl GraphRecord {
 }
 
 /// Git and bitemporal provenance attached to history-backed records.
-#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Serialize, Deserialize, Hash)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Serialize, Deserialize, Hash,
+)]
 pub struct TemporalMetadata {
     /// Git commit SHA that supplied the valid-time source tree.
     pub git_commit: String,
@@ -3079,7 +3744,7 @@ impl Domain {
 }
 
 /// Structured identity for an embedding model.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EmbeddingModel {
     /// Provider boundary that supplied the model.
     pub provider: String,
@@ -3094,7 +3759,7 @@ pub struct EmbeddingModel {
 }
 
 /// Semantic distance metric used by a drift measurement.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MetricKind {
     /// One minus cosine similarity.
@@ -3118,7 +3783,7 @@ impl MetricKind {
 }
 
 /// Selection policy that caused a drift record to be emitted.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectionBasis {
     /// Emit every drift whose score is greater than or equal to the threshold.
@@ -3142,7 +3807,7 @@ impl SelectionBasis {
 }
 
 /// Structured metadata for a semantic drift measurement.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticDriftMetadata {
     /// Structured embedding model identity.
     pub embedding_model: EmbeddingModel,
@@ -3171,7 +3836,9 @@ pub struct SemanticDriftMetadata {
 impl Eq for SemanticDriftMetadata {}
 
 /// Initial graph node kinds.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "PascalCase")]
 pub enum NodeKind {
     /// Indexed repository root.
@@ -3200,6 +3867,13 @@ pub enum NodeKind {
     /// block. The `name` field carries the closed site kind
     /// (`block` / `fn` / `impl`).
     UnsafeSite,
+    /// Deterministic `#[allow(...)]` / `#![allow(...)]` lint-suppression site
+    /// (issue #227): one node per allow attribute, detected over the
+    /// Tree-sitter attribute AST. The `name` field carries the closed scope
+    /// (`item` / `module` / `crate`) and the additive [`LintSuppressionFacts`]
+    /// payload carries the sorted lint names plus the adjacent
+    /// justification-comment signal.
+    LintSuppression,
     /// Directly-declared Cargo manifest dependency (issue #180).
     DependencyDeclaration,
     /// File-level scan-coverage summary (issue #135): one node per full
@@ -3207,6 +3881,23 @@ pub enum NodeKind {
     /// per-extension skip tally). Attached to its `Repository` by a `CONTAINS`
     /// edge so coverage is citable and never an orphan.
     ScanCoverage,
+    /// History-replay window summary (issue #256): one node per *windowed*
+    /// `eg scan-history`, carrying a [`HistoryReplayWindowPayload`] (the
+    /// resolved window: kind, selected commit count, and bounding SHAs /
+    /// instant) so a windowed store is never mistaken for full history.
+    /// Attached to its `Repository` by a `CONTAINS` edge so the summary is
+    /// citable and never an orphan. Never emitted for unwindowed (full)
+    /// replays, which stay byte-identical to pre-#256 output.
+    HistoryReplayWindow,
+    /// History-replay resume marker (issue #224): one node per *full*
+    /// `eg scan-history`, carrying a [`HistoryReplayTipPayload`] (the
+    /// repository identity, the tip commit SHA reached, and the covered
+    /// commit count) so a later `--resume-from` run can replay only the
+    /// commits after the tip. Keyed per repository identity, attached to its
+    /// `Repository` by a `CONTAINS` edge, and upserted by stable ID on every
+    /// full replay. Never emitted for windowed replays, which do not
+    /// represent full history and are not valid resume bases.
+    HistoryReplayTip,
     /// Git commit observed during history replay.
     Commit,
     /// File-level change observed in a commit.
@@ -3282,6 +3973,21 @@ pub enum NodeKind {
     FileEdit,
     /// Patch content, validation status, and source trajectory (M2).
     PatchArtifact,
+    // ── Design-doc node kinds (docs/schema/doc-ingest.md, issue #149) ────────
+    /// Architecture decision document artifact (artifact domain). Materializes
+    /// the reserved `ADR` shape from `docs/schema/agent-actions.md` §10.
+    #[serde(rename = "ADR")]
+    Adr,
+    /// Product requirements document artifact (artifact domain). Materializes
+    /// the reserved `PRD` shape from `docs/schema/agent-actions.md` §10.
+    #[serde(rename = "PRD")]
+    Prd,
+    /// Implementation or project plan document artifact (artifact domain).
+    /// Materializes the reserved `Plan` shape from
+    /// `docs/schema/agent-actions.md` §10; named `PlanDoc` because `Plan` is
+    /// already the project-domain task-plan kind.
+    #[serde(rename = "PlanDoc")]
+    PlanDoc,
     /// Failed command, invalid patch, or blocked workflow (M2).
     Failure,
     /// Durable decision inferred from explicit context (reserved, agent-memory §4a).
@@ -3320,6 +4026,22 @@ pub enum NodeKind {
     /// retracted the target, when (transaction time), the reason, and the prior
     /// record handle, so logical retraction never leaves a silent hole.
     Retraction,
+    // ── Retirement receipt node kinds (issue #156) ───────────────────────────
+    /// Auditable retirement receipt for an agent-memory observation-class
+    /// record. Records who retired the target (`agent_id`), when on the
+    /// transaction-time axis (`transaction_time`), the typed reason from the
+    /// closed set (`text`: `superseded` / `drifted` / `contradicted` /
+    /// `operator-decision`), and the cited evidence handle(s)
+    /// (`evidence_links`). The receipt never mutates the target's provenance
+    /// in place: retirement is logical, and recall excludes the target while
+    /// the latest receipt for it is a retirement.
+    RetirementReceipt,
+    /// Auditable reinstatement receipt returning a retired record to active
+    /// recall (issue #156). Records who reinstated the target (`agent_id`),
+    /// when (`transaction_time`), and why (`text`, free text). The latest
+    /// receipt for a target decides its recall state, so the retire/reinstate
+    /// trail stays complete and queryable.
+    ReinstatementReceipt,
     // ── Log-signature node kinds (docs/schema/log-graph.md, issues #319/#320) ─
     /// A captured log source artifact (one scanned log file). Carries the
     /// artifact hash, format, and line count in its `log` payload.
@@ -3346,7 +4068,7 @@ impl NodeKind {
     /// macro regenerates from the enum definition itself. Adding a variant
     /// without listing it here fails that test. (A guard that merely iterated
     /// this array would be circular and could not fail.)
-    pub const ALL: [Self; 60] = [
+    pub const ALL: [Self; 68] = [
         Self::Repository,
         Self::File,
         Self::Module,
@@ -3356,8 +4078,11 @@ impl NodeKind {
         Self::PanicRiskSite,
         Self::DebtMarker,
         Self::UnsafeSite,
+        Self::LintSuppression,
         Self::DependencyDeclaration,
         Self::ScanCoverage,
+        Self::HistoryReplayWindow,
+        Self::HistoryReplayTip,
         Self::Commit,
         Self::Change,
         Self::SemanticDrift,
@@ -3387,6 +4112,9 @@ impl NodeKind {
         Self::CommandRun,
         Self::FileEdit,
         Self::PatchArtifact,
+        Self::Adr,
+        Self::Prd,
+        Self::PlanDoc,
         Self::Failure,
         Self::Decision,
         Self::TestRun,
@@ -3403,6 +4131,8 @@ impl NodeKind {
         Self::Constraint,
         Self::CostUsage,
         Self::Retraction,
+        Self::RetirementReceipt,
+        Self::ReinstatementReceipt,
         Self::LogSource,
         Self::ErrorSignature,
         Self::LogEvent,
@@ -3422,8 +4152,11 @@ impl NodeKind {
             Self::PanicRiskSite => "PanicRiskSite",
             Self::DebtMarker => "DebtMarker",
             Self::UnsafeSite => "UnsafeSite",
+            Self::LintSuppression => "LintSuppression",
             Self::DependencyDeclaration => "DependencyDeclaration",
             Self::ScanCoverage => "ScanCoverage",
+            Self::HistoryReplayWindow => "HistoryReplayWindow",
+            Self::HistoryReplayTip => "HistoryReplayTip",
             Self::Commit => "Commit",
             Self::Change => "Change",
             Self::SemanticDrift => "SemanticDrift",
@@ -3453,6 +4186,9 @@ impl NodeKind {
             Self::CommandRun => "CommandRun",
             Self::FileEdit => "FileEdit",
             Self::PatchArtifact => "PatchArtifact",
+            Self::Adr => "ADR",
+            Self::Prd => "PRD",
+            Self::PlanDoc => "PlanDoc",
             Self::Failure => "Failure",
             Self::Decision => "Decision",
             Self::TestRun => "TestRun",
@@ -3469,6 +4205,8 @@ impl NodeKind {
             Self::Constraint => "Constraint",
             Self::CostUsage => "CostUsage",
             Self::Retraction => "Retraction",
+            Self::RetirementReceipt => "RetirementReceipt",
+            Self::ReinstatementReceipt => "ReinstatementReceipt",
             Self::LogSource => "LogSource",
             Self::ErrorSignature => "ErrorSignature",
             Self::LogEvent => "LogEvent",
@@ -3478,7 +4216,9 @@ impl NodeKind {
 }
 
 /// Initial graph edge labels.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EdgeLabel {
     /// Hierarchical ownership.
@@ -3530,6 +4270,13 @@ pub enum EdgeLabel {
     OwnedByTask,
     /// Project record points to its external source handle.
     ExternalHandle,
+    /// Project task depends on another project task (issue #161). FROM
+    /// `project.Task` TO `project.Task`; emitted only from the latest revision
+    /// of the declaring task's local JSONL row. Edges never name unresolved
+    /// targets: unknown `depends_on` entries become `[unresolved_dependency]`
+    /// diagnostics instead. Self-dependencies are emitted as edges and surface
+    /// as query-time cycle diagnostics.
+    DependsOn,
     /// Project task intends to touch a code-graph file.
     TouchesFile,
     /// Project PR `Task` was merged as a specific code-graph `Commit`
@@ -3619,7 +4366,7 @@ impl EdgeLabel {
     /// of edge types Egregore can ever write (issue #486).
     /// `edge_label_all_matches_the_enum_definition` pins it exhaustive against
     /// the same independent `serde` oracle [`NodeKind::ALL`] uses.
-    pub const ALL: [Self; 49] = [
+    pub const ALL: [Self; 50] = [
         Self::Contains,
         Self::Defines,
         Self::Imports,
@@ -3644,6 +4391,7 @@ impl EdgeLabel {
         Self::ClosesAcceptanceCriterion,
         Self::OwnedByTask,
         Self::ExternalHandle,
+        Self::DependsOn,
         Self::TouchesFile,
         Self::MergedAs,
         Self::ReviewsCommit,
@@ -3699,6 +4447,7 @@ impl EdgeLabel {
             "CLOSES_ACCEPTANCE_CRITERION" => Some(Self::ClosesAcceptanceCriterion),
             "OWNED_BY_TASK" => Some(Self::OwnedByTask),
             "EXTERNAL_HANDLE" => Some(Self::ExternalHandle),
+            "DEPENDS_ON" => Some(Self::DependsOn),
             "TOUCHES_FILE" => Some(Self::TouchesFile),
             "MERGED_AS" => Some(Self::MergedAs),
             "REVIEWS_COMMIT" => Some(Self::ReviewsCommit),
@@ -3746,6 +4495,7 @@ impl EdgeLabel {
                 | Self::ClosesAcceptanceCriterion
                 | Self::OwnedByTask
                 | Self::ExternalHandle
+                | Self::DependsOn
                 | Self::TouchesFile
                 | Self::MergedAs
                 | Self::ReviewsCommit
@@ -3818,6 +4568,7 @@ impl EdgeLabel {
             Self::ClosesAcceptanceCriterion => "CLOSES_ACCEPTANCE_CRITERION",
             Self::OwnedByTask => "OWNED_BY_TASK",
             Self::ExternalHandle => "EXTERNAL_HANDLE",
+            Self::DependsOn => "DEPENDS_ON",
             Self::TouchesFile => "TOUCHES_FILE",
             Self::MergedAs => "MERGED_AS",
             Self::ReviewsCommit => "REVIEWS_COMMIT",
@@ -3853,12 +4604,184 @@ impl EdgeLabel {
 /// `DELETE`, `PATCH`, `HEAD`, `OPTIONS`); `path` is the first string-literal
 /// argument inside the attribute (`/api/v1/contacts`). Additive metadata; never
 /// an identity input.
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 pub struct RouteAnnotation {
     /// HTTP method, uppercased from the attribute identifier.
     pub method: String,
     /// Route path, the first string literal in the attribute.
     pub path: String,
+}
+
+/// Maximum number of characters captured from one `#[deprecated]` attribute
+/// payload (`since` or `note`) (issue #249).
+///
+/// The bound keeps graph records small and deterministic: a longer attribute
+/// literal is stored as its verbatim first-`MAX_DEPRECATION_STRING_LEN`
+/// characters, with no truncation marker synthesized (a marker would not be
+/// the attribute's text).
+pub const MAX_DEPRECATION_STRING_LEN: usize = 256;
+
+/// Deprecation-annotation facts captured from a Rust `#[deprecated]`
+/// attribute on a `Symbol` node (issue #249).
+///
+/// The mark's *presence* is the deprecation fact: a bare `#[deprecated]`
+/// yields a mark with both payloads `None`. Absent `since` / `note` are
+/// never synthesized from elsewhere — absent is the documented absent
+/// value.
+///
+/// Additive per `docs/schema/schema-versioning.md` §2, and **never an identity
+/// input**: the stable ID preimage is unchanged, so stamping deprecation
+/// facts never moves a record ID.
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
+pub struct DeprecationMark {
+    /// The `since` value from `#[deprecated(since = "...")]`, bounded to
+    /// [`MAX_DEPRECATION_STRING_LEN`] chars and passed through redaction
+    /// policy v1 like issue #124 doc facts. Absent when the attribute did
+    /// not carry `since`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// The `note` value from `#[deprecated(note = "...")]` or the
+    /// `#[deprecated = "..."]` shorthand, bounded and redacted the same way.
+    /// Absent when the attribute did not carry a note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Closed vocabulary of attribute-application scopes for a lint suppression
+/// (issue #227).
+#[derive(
+    Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum LintSuppressionScope {
+    /// An outer `#[allow(...)]` on an item, or a `#![allow(...)]` inside a
+    /// non-module body (e.g. a function body): the suppression applies to the
+    /// annotated item.
+    Item,
+    /// A `#![allow(...)]` at the start of a module body: the suppression
+    /// applies to the whole module.
+    Module,
+    /// A `#![allow(...)]` at the crate root (`source_file`): the suppression
+    /// applies to the whole crate.
+    Crate,
+}
+
+impl LintSuppressionScope {
+    /// Returns the serialized scope string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Item => "item",
+            Self::Module => "module",
+            Self::Crate => "crate",
+        }
+    }
+}
+
+/// Deterministic `#[allow(...)]` / `#![allow(...)]` suppression facts carried
+/// by a `LintSuppression` node (issue #227).
+///
+/// Additive per `docs/schema/schema-versioning.md` §2, and **never an identity
+/// input**: the stable ID preimage is unchanged, so stamping suppression facts
+/// never moves a record ID.
+#[derive(
+    Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, schemars::JsonSchema,
+)]
+pub struct LintSuppressionFacts {
+    /// Lint names silenced by the attribute, sorted and deduplicated
+    /// (`dead_code`, `clippy::too_many_arguments`, …). Multi-lint forms
+    /// contribute one entry per lint-path token; non-path tokens in the
+    /// attribute's token tree contribute nothing.
+    pub lints: Vec<String>,
+    /// The closed attribute-application scope.
+    pub scope: LintSuppressionScope,
+    /// Whether an adjacent comment (a line or block comment — doc comments
+    /// included — ending on the line directly above the attribute, or on the
+    /// same line after it) was detected at extraction time. A justification
+    /// *signal*, never a verdict on whether the suppression is warranted.
+    pub has_justification: bool,
+    /// Whether the attribute is an inner `#![allow(...)]` (`true`) or an
+    /// outer `#[allow(...)]` (`false`). The query lane keys its
+    /// enclosing-symbol rule on this: an outer attribute annotates the
+    /// *following* item (nearest following symbol), while an inner attribute
+    /// applies to the *enclosing* item (innermost containing symbol).
+    pub is_inner: bool,
+}
+
+/// Non-call entry-point classification for one `Symbol` node (issue #240).
+///
+/// The mark's *presence* is the entry-point fact: the item is a recognized
+/// non-call entry point, so the dead-code triage lane excludes it from the
+/// candidate set. The closed [`EntryPointKind`] vocabulary names which one.
+///
+/// Additive per `docs/schema/schema-versioning.md` §2, and **never an identity
+/// input**: the stable ID preimage is unchanged, so stamping entry-point
+/// facts never moves a record ID.
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
+pub struct EntryPointMark {
+    /// Which closed entry-point class the item belongs to.
+    pub kind: EntryPointKind,
+}
+
+/// Closed vocabulary of recognized non-call entry points (issue #240).
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryPointKind {
+    /// `#[test]` / `#[bench]`, or a path attribute ending in `::test` /
+    /// `::bench` (e.g. `#[tokio::test]`): a test-harness entry point.
+    Test,
+    /// `#[no_mangle]` / `#[export_name = "..."]`: an FFI export reachable
+    /// from outside the crate without a recorded call edge.
+    FfiExport,
+    /// A free `fn main` in a binary crate root (`src/main.rs`,
+    /// `src/bin/**`): the binary's entry point.
+    BinaryEntry,
+}
+
+/// Deterministic test-vs-production classification of one `Symbol` or `File`
+/// node (issue #238).
+///
+/// The full decision procedure lives in
+/// `docs/cli/test-production-roles.md`; in short, `Test` iff the item
+/// carries a test-family attribute (`#[test]`, `#[tokio::test]`, `#[bench]`,
+/// or another `*::test` / `*::bench` path), sits lexically inside a
+/// `#[cfg(test)]`-gated module (directly or through an enclosing gated
+/// `mod`), or lives under a top-level `tests/` or `benches/` root —
+/// `Production` otherwise. A `TrustClass::SourceDerived` fact: drawn from the
+/// AST and the file path, carrying no agent-authored confidence.
+///
+/// Additive per `docs/schema/schema-versioning.md` §2, and **never an identity
+/// input**: the stable ID preimage is unchanged, so stamping a role never
+/// moves a record ID.
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SymbolRole {
+    /// Test code: a test-harness entry, a `#[cfg(test)]`-gated module member,
+    /// or an integration-test / bench-root file.
+    Test,
+    /// Production (shipping) code: matched none of the test signals.
+    Production,
+}
+
+impl SymbolRole {
+    /// The stable wire string: `"test"` or `"production"`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Test => "test",
+            Self::Production => "production",
+        }
+    }
 }
 
 /// Owning-Cargo-package attribution for one code-graph node (issue #117).
@@ -3884,7 +4807,9 @@ pub struct RouteAnnotation {
 ///
 /// Attribution is nearest-enclosing-manifest directory containment, never proof
 /// the file is compiled into that package.
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 pub struct CrateAttribution {
     /// Whether an owning package was resolved.
     pub status: CrateAttributionStatus,
@@ -4072,7 +4997,9 @@ impl CrateAttribution {
 }
 
 /// Whether a node resolved to an owning Cargo package (issue #117).
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CrateAttributionStatus {
     /// An owning package was resolved; `package_name` and
@@ -4097,7 +5024,9 @@ impl CrateAttributionStatus {
 ///
 /// A CLOSED vocabulary. Each variant is a named, operator-checkable fact about
 /// the manifest tree — never a guess, and never a carrier for raw error text.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CrateAttributionReason {
     /// No `Cargo.toml` sits in any ancestor directory: a stray source file
@@ -4136,8 +5065,18 @@ impl CrateAttributionReason {
     }
 }
 
-/// Source byte and line span for syntax-backed records.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+/// Source byte, line, and column span for syntax-backed records.
+///
+/// Columns are zero-based byte offsets from the start of the line (Tree-sitter
+/// `Point.column` semantics), matching the SCIP
+/// `UTF8CodeUnitOffsetFromLineStart` position encoding the exporter declares.
+/// `None` means the producer did not record columns (legacy records and
+/// non-tree-sitter sources such as GitHub line anchors); an absent field is
+/// UNKNOWN, never "column 0". Columns are coordinates, not identity inputs
+/// (ADR-0004).
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 pub struct SourceSpan {
     /// Start byte, inclusive.
     pub start_byte: usize,
@@ -4147,6 +5086,12 @@ pub struct SourceSpan {
     pub start_line: usize,
     /// One-based end line.
     pub end_line: usize,
+    /// Zero-based start column (UTF-8 byte offset from line start), if recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_column: Option<usize>,
+    /// Zero-based end column, exclusive, same units as `start_column`, if recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_column: Option<usize>,
 }
 
 /// Builds a stable code-graph ID from semantic, repo-relative inputs.
@@ -4474,5 +5419,253 @@ mod label_inventory_tests {
                 label.as_str()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod source_span_tests {
+    use super::SourceSpan;
+
+    fn columnar() -> SourceSpan {
+        SourceSpan {
+            start_byte: 4,
+            end_byte: 20,
+            start_line: 2,
+            end_line: 2,
+            start_column: Some(4),
+            end_column: Some(20),
+        }
+    }
+
+    #[test]
+    fn columns_round_trip_through_json() {
+        let span = columnar();
+        let json = serde_json::to_string(&span).expect("serialize");
+        assert!(
+            json.contains("\"start_column\":4"),
+            "columns serialize: {json}"
+        );
+        assert!(
+            json.contains("\"end_column\":20"),
+            "columns serialize: {json}"
+        );
+        let back: SourceSpan = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, span);
+    }
+
+    #[test]
+    fn absent_columns_serialize_without_the_keys() {
+        // Absent must mean UNKNOWN — never a null a reader could mistake for
+        // a computed "column 0" (issue #463, same contract as #117).
+        let span = SourceSpan {
+            start_column: None,
+            end_column: None,
+            ..columnar()
+        };
+        let json = serde_json::to_string(&span).expect("serialize");
+        assert!(
+            !json.contains("start_column") && !json.contains("end_column"),
+            "column-less spans must omit the keys entirely: {json}"
+        );
+    }
+
+    #[test]
+    fn legacy_span_json_without_columns_deserializes_to_unknown() {
+        // A pre-#463 v9 span line carries no column keys; it must still parse
+        // and read back as UNKNOWN, not column 0 (issue #463).
+        let legacy = r#"{"start_byte":4,"end_byte":20,"start_line":2,"end_line":2}"#;
+        let span: SourceSpan = serde_json::from_str(legacy).expect("legacy parses");
+        assert_eq!(span.start_column, None);
+        assert_eq!(span.end_column, None);
+        assert_eq!(span.start_line, 2);
+    }
+}
+
+#[cfg(test)]
+mod call_resolution_tests {
+    use super::CallResolution;
+
+    #[test]
+    fn unresolved_dispatch_has_a_stable_wire_form() {
+        // Issue #267: trait-dispatch call sites that cannot be reduced to a
+        // concrete in-crate symbol carry a TYPED resolution — not the generic
+        // `unresolved` — so query lanes can enumerate the boundary exactly.
+        assert_eq!(
+            CallResolution::UnresolvedDispatch.as_str(),
+            "unresolved_dispatch"
+        );
+        assert_eq!(
+            CallResolution::from_wire("unresolved_dispatch"),
+            Some(CallResolution::UnresolvedDispatch)
+        );
+        // The existing wire forms keep working.
+        assert_eq!(
+            CallResolution::from_wire("resolved"),
+            Some(CallResolution::Resolved)
+        );
+        assert_eq!(
+            CallResolution::from_wire("ambiguous"),
+            Some(CallResolution::Ambiguous)
+        );
+        assert_eq!(
+            CallResolution::from_wire("unresolved"),
+            Some(CallResolution::Unresolved)
+        );
+        assert_eq!(CallResolution::from_wire("unresolved_dispatch_typo"), None);
+    }
+
+    #[test]
+    fn unresolved_dispatch_is_the_weakest_signal() {
+        // Weakest-link path semantics (`.max()`): a dispatch boundary never
+        // upgrades a path past an honest unresolved signal.
+        assert!(CallResolution::UnresolvedDispatch > CallResolution::Unresolved);
+        assert!(CallResolution::UnresolvedDispatch > CallResolution::Ambiguous);
+        assert!(CallResolution::UnresolvedDispatch > CallResolution::Resolved);
+    }
+
+    #[test]
+    fn unresolved_dispatch_serializes_through_serde() {
+        let json = serde_json::to_string(&CallResolution::UnresolvedDispatch)
+            .expect("resolution serializes");
+        assert_eq!(json, "\"unresolved_dispatch\"");
+        let back: CallResolution = serde_json::from_str(&json).expect("resolution deserializes");
+        assert_eq!(back, CallResolution::UnresolvedDispatch);
+    }
+}
+
+#[cfg(test)]
+mod symbol_role_tests {
+    use super::{GraphRecord, SourceSpan, SymbolRole};
+
+    fn test_symbol() -> GraphRecord {
+        GraphRecord::symbol(
+            "node:symbol:repo:src/lib.rs:check".to_owned(),
+            "Function",
+            "src/lib.rs".to_owned(),
+            SourceSpan {
+                start_byte: 0,
+                end_byte: 10,
+                start_line: 1,
+                end_line: 1,
+                start_column: None,
+                end_column: None,
+            },
+            "check".to_owned(),
+            "fn check()".to_owned(),
+        )
+    }
+
+    #[test]
+    fn role_does_not_change_stable_id() {
+        // Issue #238: role is additive metadata, never an identity input.
+        let base = test_symbol();
+        let base_id = base.id().to_owned();
+        for role in [SymbolRole::Test, SymbolRole::Production] {
+            let stamped = base.clone().with_role(role);
+            assert_eq!(
+                stamped.id(),
+                base_id,
+                "stamping {role:?} must not change the stable ID"
+            );
+            assert_eq!(stamped.role(), Some(&role));
+        }
+        assert_eq!(base.role(), None, "unstamped record has unknown role");
+    }
+
+    #[test]
+    fn role_serde_wire_values_are_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&SymbolRole::Test).expect("serializes"),
+            "\"test\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SymbolRole::Production).expect("serializes"),
+            "\"production\""
+        );
+        let back: SymbolRole = serde_json::from_str("\"test\"").expect("deserializes");
+        assert_eq!(back, SymbolRole::Test);
+        let back: SymbolRole = serde_json::from_str("\"production\"").expect("deserializes");
+        assert_eq!(back, SymbolRole::Production);
+    }
+
+    #[test]
+    fn role_round_trips_through_record_json() {
+        let record = test_symbol().with_role(SymbolRole::Test);
+        let json = serde_json::to_string(&record).expect("record serializes");
+        assert!(
+            json.contains("\"role\":\"test\""),
+            "role is serialized on the record, got: {json}"
+        );
+        let back: GraphRecord = serde_json::from_str(&json).expect("record deserializes");
+        assert_eq!(back.role(), Some(&SymbolRole::Test));
+        assert_eq!(back.id(), record.id(), "ID survives the round trip");
+    }
+
+    #[test]
+    fn missing_role_deserializes_as_unknown() {
+        // Pre-#238 records carry no `role` field: they deserialize to
+        // unknown (`None`), never a fabricated `Production`.
+        let json = serde_json::to_string(&test_symbol()).expect("serializes");
+        assert!(!json.contains("\"role\""), "unstamped record omits role");
+        let back: GraphRecord = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back.role(), None);
+    }
+}
+
+#[cfg(test)]
+mod decision_fields_tests {
+    //! Issue #191: the `Decision` record schema
+    //! (`docs/schema/agent-memory.md`, "Decision record shape") requires
+    //! `decision_text` and `rationale_summary`, but the IR drops them on read
+    //! — so the recall layer can never surface rationale. These fields are
+    //! additive reads over data that already exists, not a schema change.
+    use super::*;
+
+    /// A Decision JSONL line in the traj-importer shape (schema-required
+    /// `decision_text` / `rationale_summary` present).
+    fn decision_jsonl() -> &'static str {
+        r#"{"record_type":"node","id":"agent_memory:v1:dec-191","kind":"Decision","schema_version":1,"summary":"decision summary","domain":"agent_memory","decision_text":"Use BTreeMap for deterministic ordering","rationale_summary":"HashMap iteration order made the ordering tests flaky","confidence":"0.9","agent_id":"agent-1","session_id":"sess-1","source_handle":"traj-abc123"}"#
+    }
+
+    #[test]
+    fn decision_text_and_rationale_survive_ir_round_trip() {
+        // RED: the IR has no fields for these, so they are silently dropped.
+        let record: GraphRecord =
+            serde_json::from_str(decision_jsonl()).expect("Decision JSONL deserializes");
+        let json = serde_json::to_string(&record).expect("serializes");
+        assert!(
+            json.contains("Use BTreeMap for deterministic ordering"),
+            "decision_text must survive the IR round trip, not be dropped: {json}"
+        );
+        assert!(
+            json.contains("HashMap iteration order made the ordering tests flaky"),
+            "rationale_summary must survive the IR round trip, not be dropped: {json}"
+        );
+    }
+
+    #[test]
+    fn legacy_records_without_decision_fields_still_deserialize() {
+        // Additive per docs/schema/schema-versioning.md §2: records produced
+        // before the IR read these fields deserialize fine; the unstamped
+        // record omits the fields, never fabricates them.
+        let json = decision_jsonl()
+            .replace(
+                ",\"decision_text\":\"Use BTreeMap for deterministic ordering\"",
+                "",
+            )
+            .replace(
+                ",\"rationale_summary\":\"HashMap iteration order made the ordering tests flaky\"",
+                "",
+            );
+        let record: GraphRecord = serde_json::from_str(&json).expect("deserializes");
+        let json = serde_json::to_string(&record).expect("serializes");
+        assert!(
+            !json.contains("decision_text"),
+            "unstamped record omits decision_text: {json}"
+        );
+        assert!(
+            !json.contains("rationale_summary"),
+            "unstamped record omits rationale_summary: {json}"
+        );
     }
 }

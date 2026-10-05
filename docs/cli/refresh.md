@@ -20,9 +20,8 @@ eg refresh <repo_path> --data-dir <dir> [--cache <path>] [--format json|text] [-
 ## Shortest Workflow
 
 ```sh
-# 1. First-time build (full scan + ingest).
-eg scan . --out graph.jsonl
-eg ingest graph.jsonl --adapter embedded --data-dir .egregore
+# 1. First-time build.
+eg init . --data-dir .egregore
 
 # 2. Edit source files …
 
@@ -38,9 +37,9 @@ every subsequent edit cycle.
 
 ---
 
-## How It Differs from `eg scan` + `eg ingest`
+## How It Differs from `eg init`
 
-| | `eg scan` + `eg ingest` | `eg refresh` |
+| | `eg init` | `eg refresh` |
 |---|---|---|
 | **Files processed** | Every file in the repository | Only changed/added/removed files |
 | **Cost** | O(repository size) | O(diff size) |
@@ -135,6 +134,10 @@ Changed file and symbol nodes receive fresh embeddings.  Tombstoned nodes are
 removed from the semantic index.
 
 `embed_status` in the JSON report: `"refreshed"`
+
+Refresh re-embeds changed nodes under the *same* model the store was built
+with. To move the *whole* store to a *different* model without re-scanning
+sources, use `eg re-embed` instead (issue #167) — see `docs/cli/re-embed.md`.
 
 ---
 

@@ -27,6 +27,8 @@ const fn span(start_line: usize, end_line: usize) -> SourceSpan {
         end_byte: 100,
         start_line,
         end_line,
+        start_column: None,
+        end_column: None,
     }
 }
 
@@ -133,16 +135,24 @@ fn mcp_server_has_instructions() {
 
 // ── AC2: Tool registration ─────────────────────────────────────────────────────
 
-/// The MCP tool router must register exactly the three required tools.
+/// The MCP tool router must register exactly the seven required read tools.
 #[test]
-fn tool_router_registers_exactly_three_required_tools() {
+fn tool_router_registers_exactly_seven_required_read_tools() {
     let inspect = EgregoreMcpServer::inspect_store_tool_attr();
     let symbol = EgregoreMcpServer::symbol_context_tool_attr();
     let task = EgregoreMcpServer::task_evidence_tool_attr();
+    let freshness = EgregoreMcpServer::store_freshness_tool_attr();
+    let failures = EgregoreMcpServer::failure_history_tool_attr();
+    let search = EgregoreMcpServer::search_code_tool_attr();
+    let temporal = EgregoreMcpServer::symbol_at_tool_attr();
 
     assert_eq!(inspect.name, "inspect_store", "first tool name");
     assert_eq!(symbol.name, "symbol_context", "second tool name");
     assert_eq!(task.name, "task_evidence", "third tool name");
+    assert_eq!(freshness.name, "store_freshness", "fourth tool name");
+    assert_eq!(failures.name, "failure_history", "fifth tool name");
+    assert_eq!(search.name, "search_code", "sixth tool name");
+    assert_eq!(temporal.name, "symbol_at", "seventh tool name");
 }
 
 /// Each registered tool must have a non-empty description and an object input schema.
@@ -152,6 +162,10 @@ fn all_tools_have_nonempty_description_and_object_input_schema() {
         EgregoreMcpServer::inspect_store_tool_attr(),
         EgregoreMcpServer::symbol_context_tool_attr(),
         EgregoreMcpServer::task_evidence_tool_attr(),
+        EgregoreMcpServer::store_freshness_tool_attr(),
+        EgregoreMcpServer::failure_history_tool_attr(),
+        EgregoreMcpServer::search_code_tool_attr(),
+        EgregoreMcpServer::symbol_at_tool_attr(),
     ] {
         let name = tool.name.as_ref();
         assert!(
@@ -356,6 +370,10 @@ fn symbol_context_separates_source_facts_from_observations() {
         result["observations"].is_array(),
         "must include observations array; got {result}"
     );
+    assert!(
+        result["decisions"].is_array(),
+        "must include decisions array (issue #191); got {result}"
+    );
 }
 
 /// inspect_store must attribute records to their domain (codegraph vs agent_memory).
@@ -382,6 +400,10 @@ fn tool_descriptions_contain_no_bearer_tokens() {
         EgregoreMcpServer::inspect_store_tool_attr(),
         EgregoreMcpServer::symbol_context_tool_attr(),
         EgregoreMcpServer::task_evidence_tool_attr(),
+        EgregoreMcpServer::store_freshness_tool_attr(),
+        EgregoreMcpServer::failure_history_tool_attr(),
+        EgregoreMcpServer::search_code_tool_attr(),
+        EgregoreMcpServer::symbol_at_tool_attr(),
     ] {
         let desc = tool.description.as_deref().unwrap_or("");
         assert!(
@@ -477,6 +499,8 @@ fn tool_registration_works_without_daemon() {
     let _inspect = EgregoreMcpServer::inspect_store_tool_attr();
     let _symbol = EgregoreMcpServer::symbol_context_tool_attr();
     let _task = EgregoreMcpServer::task_evidence_tool_attr();
+    let _freshness = EgregoreMcpServer::store_freshness_tool_attr();
+    let _failures = EgregoreMcpServer::failure_history_tool_attr();
     // If we reach here without panic, the test passes.
 }
 
@@ -508,4 +532,153 @@ fn inspect_store_domain_categories_are_labeled() {
             "domain category '{key}' must be a human-readable label, not a raw domain string"
         );
     }
+}
+
+// ── Issue #192: ambiguous_symbol disambiguation contract ──────────────────────
+
+/// Two distinct symbols sharing the name `build`, each with its own observation.
+fn ambiguous_symbol_fixture() -> Vec<GraphRecord> {
+    let alpha_id = "codegraph:v4:alpha000build";
+    let beta_id = "codegraph:v4:beta0000build";
+    let mut alpha = GraphRecord::symbol(
+        alpha_id.to_owned(),
+        "function",
+        "src/alpha.rs".to_owned(),
+        span(10, 20),
+        "build".to_owned(),
+        "Rust function build in alpha".to_owned(),
+    );
+    alpha = alpha.with_valid_time_inferred("2026-01-01T00:00:00Z");
+    let mut beta = GraphRecord::symbol(
+        beta_id.to_owned(),
+        "function",
+        "src/beta.rs".to_owned(),
+        span(30, 45),
+        "build".to_owned(),
+        "Rust function build in beta".to_owned(),
+    );
+    beta = beta.with_valid_time_inferred("2026-01-01T00:00:00Z");
+    vec![
+        alpha,
+        beta,
+        make_observation("agent_memory:v1:obsalpha", "alpha build is slow", alpha_id),
+        make_observation("agent_memory:v1:obsbeta", "beta build is cached", beta_id),
+    ]
+}
+
+#[test]
+fn symbol_context_ambiguous_name_surfaces_ambiguous_symbol_code() {
+    use aletheia_egregore::mcp::tool_symbol_context_from_records_with_candidate;
+
+    let records = ambiguous_symbol_fixture();
+    let payload = tool_symbol_context_from_records_with_candidate(&records, "build", None);
+
+    assert_eq!(payload["ok"], serde_json::Value::from(false));
+    assert_eq!(
+        payload["error"]["code"],
+        serde_json::Value::from("ambiguous_symbol")
+    );
+    assert_ne!(
+        payload["error"]["code"],
+        serde_json::Value::from("no_match"),
+        "ambiguity must not be reported as no_match"
+    );
+    assert!(
+        payload.get("source_facts").is_none(),
+        "an ambiguous payload must not carry blended sections"
+    );
+
+    let candidates = payload["error"]["candidates"]
+        .as_array()
+        .expect("ambiguous_symbol must enumerate candidates");
+    assert_eq!(candidates.len(), 2, "one candidate per distinct identity");
+    let handles: Vec<&str> = candidates
+        .iter()
+        .map(|c| {
+            c["file_span_handle"]
+                .as_str()
+                .expect("candidate needs a handle")
+        })
+        .collect();
+    assert_eq!(handles, vec!["src/alpha.rs:10-20", "src/beta.rs:30-45"]);
+    for c in candidates {
+        assert!(
+            c["record_id"].as_str().is_some_and(|s| !s.is_empty()),
+            "each candidate cites its stable record_id"
+        );
+    }
+}
+
+#[test]
+fn symbol_context_candidate_record_id_returns_identity_pure_context() {
+    use aletheia_egregore::mcp::tool_symbol_context_from_records_with_candidate;
+
+    let records = ambiguous_symbol_fixture();
+    let payload = tool_symbol_context_from_records_with_candidate(
+        &records,
+        "build",
+        Some("codegraph:v4:alpha000build"),
+    );
+
+    assert_eq!(payload["ok"], serde_json::Value::from(true));
+    let observations = payload["observations"]
+        .as_array()
+        .expect("success payload carries observations");
+    assert_eq!(
+        observations.len(),
+        1,
+        "only the selected symbol's observation"
+    );
+    // Zero sibling-symbol records in any section: beta's observation and its
+    // symbol must be absent everywhere.
+    let haystack = serde_json::to_string(&payload).expect("payload serializes");
+    assert!(
+        !haystack.contains("codegraph:v4:beta0000build"),
+        "sibling identity must not appear anywhere in the re-queried payload"
+    );
+    assert!(
+        !haystack.contains("beta build is cached"),
+        "sibling observation text must not leak into the re-queried payload"
+    );
+}
+
+#[test]
+fn symbol_context_candidate_file_span_handle_returns_identity_pure_context() {
+    use aletheia_egregore::mcp::tool_symbol_context_from_records_with_candidate;
+
+    let records = ambiguous_symbol_fixture();
+    let payload = tool_symbol_context_from_records_with_candidate(
+        &records,
+        "build",
+        Some("src/beta.rs:30-45"),
+    );
+
+    assert_eq!(payload["ok"], serde_json::Value::from(true));
+    let haystack = serde_json::to_string(&payload).expect("payload serializes");
+    assert!(
+        !haystack.contains("codegraph:v4:alpha000build"),
+        "sibling identity must not appear anywhere in the re-queried payload"
+    );
+    assert!(
+        haystack.contains("codegraph:v4:beta0000build"),
+        "the selected identity must be present"
+    );
+}
+
+#[test]
+fn symbol_context_unresolvable_candidate_is_no_match() {
+    use aletheia_egregore::mcp::tool_symbol_context_from_records_with_candidate;
+
+    let records = ambiguous_symbol_fixture();
+    let payload = tool_symbol_context_from_records_with_candidate(
+        &records,
+        "build",
+        Some("codegraph:v4:no0000such"),
+    );
+
+    assert_eq!(payload["ok"], serde_json::Value::from(false));
+    assert_eq!(
+        payload["error"]["code"],
+        serde_json::Value::from("no_match")
+    );
 }

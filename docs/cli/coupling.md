@@ -220,6 +220,11 @@ silent output:
   edit.
 - **`eg query deltas` (issue #118)** — what actually changed between two
   specific commits, grouped by class; not a ranking of habitual partners.
+- **`eg query churn` (issue #128)** — which files change the *most* (per-file
+  change frequency, the CodeScene-style hotspot half). Churn and coupling
+  answer orthogonal questions: a high-churn file with no strong partner is
+  busy but independent, while a pair of low-churn files with high Jaccard
+  coupling is exactly the hidden-coupling signal churn alone misses.
 - **`eg query lifeline` (issue #96)** — one symbol's lifecycle across
   history, not cross-file correlation.
 - **`git log --name-only --pretty=format:` + shell counting** — fast and

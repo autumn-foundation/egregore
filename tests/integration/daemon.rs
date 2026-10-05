@@ -21,10 +21,10 @@ use aletheia_egregore::{
     },
     import_traj,
     ir::{
-        AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, GraphRecord, IdentitySource, NodeKind,
-        PROJECT_SCHEMA_VERSION, RepositoryIdentityPayload, SCHEMA_VERSION, SEMANTIC_SCHEMA_VERSION,
-        SourceSpan, TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION, agent_memory_stable_id,
-        stable_id, user_context_stable_id,
+        AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, EvidenceLink, GraphRecord, IdentitySource,
+        NodeKind, PROJECT_SCHEMA_VERSION, RepositoryIdentityPayload, SCHEMA_VERSION,
+        SEMANTIC_SCHEMA_VERSION, SourceSpan, TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION,
+        agent_memory_stable_id, stable_id, user_context_stable_id,
     },
     traj::ImportOptions,
 };
@@ -1229,6 +1229,8 @@ fn daemon_health_probe_bounds_unroutable_connect() {
         transports: None,
         token_expires_at_unix_ms: None,
         daemons_index_url: None,
+        storage_mode: "plaintext".to_owned(),
+        key_source: None,
     });
 
     let started = Instant::now();
@@ -2081,6 +2083,224 @@ fn daemon_does_not_commit_when_idempotency_receipt_reservation_fails() {
         read_response.contains("\"record\":null"),
         "record should not commit when receipt reservation fails, got {read_response}"
     );
+
+    daemon.stop();
+}
+
+/// Builds an observation node carrying one inline `OBSERVES` evidence link
+/// (issue #241).
+fn dangling_citation_observation(id: &str, target: &str, body: &str) -> GraphRecord {
+    let link = EvidenceLink {
+        target_record_id: Some(target.to_owned()),
+        target_domain: "codegraph".to_owned(),
+        relation: "OBSERVES".to_owned(),
+        confidence: "0.9".to_owned(),
+        as_of_commit: None,
+        target_repo_relative_path: None,
+        target_span: None,
+        target_git_commit: None,
+    };
+    let mut record = GraphRecord::node(
+        id.to_owned(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "observation".to_owned(),
+    );
+    if let GraphRecord::Node {
+        evidence_links,
+        text,
+        schema_version,
+        agent_id,
+        agent_kind,
+        session_id,
+        observed_at,
+        ingested_at,
+        confidence,
+        ..
+    } = &mut record
+    {
+        *evidence_links = Some(vec![link]);
+        *text = Some(body.to_owned());
+        // Agent-memory observations validate against
+        // AGENT_MEMORY_SCHEMA_VERSION, not the codegraph SCHEMA_VERSION
+        // that GraphRecord::node stamps.
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        // The daemon requires these fields on agent-memory Observation nodes.
+        *agent_id = Some("test-agent".to_owned());
+        *agent_kind = Some("codex".to_owned());
+        *session_id = Some("test-session".to_owned());
+        *observed_at = Some("2026-09-17T00:00:00Z".to_owned());
+        *ingested_at = Some("2026-09-17T00:00:00Z".to_owned());
+        *confidence = Some("0.9".to_owned());
+    }
+    record
+}
+
+/// Asserts the quarantine diagnostic shape for a dangling citation (issue #241).
+fn assert_dangling_diagnostic(
+    result: &serde_json::Value,
+    citing_record_id: &str,
+    target_record_id: &str,
+) {
+    assert_eq!(result["attempted"], 2);
+    assert_eq!(result["succeeded"], 1);
+    assert_eq!(result["failed"], 1);
+    let failure = &result["failures"][0];
+    assert_eq!(failure["record_id"], citing_record_id);
+    let message = failure["message"]
+        .as_str()
+        .expect("failure message should be text");
+    assert!(
+        !message.contains("SENTINEL_SECRET_BODY"),
+        "diagnostic must never echo payload text"
+    );
+    let diagnostic: serde_json::Value =
+        serde_json::from_str(message).expect("diagnostic should be machine-readable JSON");
+    assert_eq!(diagnostic["code"], "dangling_evidence_citation");
+    assert_eq!(diagnostic["citing_record_id"], citing_record_id);
+    assert_eq!(diagnostic["target_record_id"], target_record_id);
+    assert_eq!(diagnostic["relation"], "OBSERVES");
+    assert_eq!(diagnostic["target_domain"], "codegraph");
+}
+
+/// Fetches a record by ID through the daemon's record GET endpoint.
+fn fetch_record(metadata: &DaemonMetadata, record_id: &str) -> String {
+    http_request(
+        &metadata.address,
+        &format!(
+            "GET /v1/records/{record_id} HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            metadata.token
+        ),
+    )
+}
+
+/// Asserts an unknown dangling-citation policy value is rejected with a 400.
+fn assert_unknown_policy_is_rejected(metadata: &DaemonMetadata) {
+    // Unknown policy value is a 400.
+    let response = http_json(
+        metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "dangling-bogus",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "dangling-bogus",
+            "domain": "agent_memory",
+            "created_at": "2026-09-17T00:00:00Z",
+            "payload": {
+                "records": [],
+                "dangling_citation_policy": "bogus",
+            }
+        }),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "unknown policy should be a 400, got {response}"
+    );
+}
+
+#[test]
+fn daemon_ingest_applies_dangling_citation_policy() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let observation = dangling_citation_observation(
+        "agent_memory:v1:daemon-obs1",
+        "codegraph:v1:ghost",
+        "SENTINEL_SECRET_BODY",
+    );
+    let mut agent = GraphRecord::node(
+        "agent_memory:v1:daemon-agent1".to_owned(),
+        NodeKind::Agent,
+        None,
+        None,
+        None,
+        "agent".to_owned(),
+    );
+    // Agent-memory nodes validate against AGENT_MEMORY_SCHEMA_VERSION, not
+    // the codegraph SCHEMA_VERSION that GraphRecord::node stamps. The daemon
+    // also requires agent_id/agent_kind/name on agent-memory Agent nodes.
+    if let GraphRecord::Node {
+        schema_version,
+        agent_id,
+        agent_kind,
+        name,
+        ..
+    } = &mut agent
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("test-agent".to_owned());
+        *agent_kind = Some("codex".to_owned());
+        *name = Some("test-agent".to_owned());
+    }
+
+    // Default policy (no field): quarantine — the citing record is skipped
+    // with a machine-readable diagnostic, the rest of the batch ingests.
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "dangling-quarantine",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "dangling-quarantine",
+            "domain": "agent_memory",
+            "created_at": "2026-09-17T00:00:00Z",
+            "payload": { "records": [observation, agent] }
+        }),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "quarantine ingest should succeed, got {response}"
+    );
+    let result = &response_json(&response)["result"];
+    assert_dangling_diagnostic(result, "agent_memory:v1:daemon-obs1", "codegraph:v1:ghost");
+
+    // The citing record never entered the store; the valid one did.
+    let missing = fetch_record(&metadata, "agent_memory:v1:daemon-obs1");
+    assert!(
+        missing.contains("\"record\":null"),
+        "quarantined record must be absent, got {missing}"
+    );
+    let present = fetch_record(&metadata, "agent_memory:v1:daemon-agent1");
+    assert!(
+        !present.contains("\"record\":null"),
+        "valid record must persist, got {present}"
+    );
+
+    // Explicit reject-batch: nothing is written.
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "dangling-reject",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "dangling-reject",
+            "domain": "agent_memory",
+            "created_at": "2026-09-17T00:00:00Z",
+            "payload": {
+                "records": [observation, agent],
+                "dangling_citation_policy": "reject-batch",
+            }
+        }),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "reject-batch ingest should succeed, got {response}"
+    );
+    let result = &response_json(&response)["result"];
+    assert_eq!(result["succeeded"], 0);
+    assert_eq!(result["failed"], 2);
+
+    assert_unknown_policy_is_rejected(&metadata);
 
     daemon.stop();
 }
@@ -4356,12 +4576,21 @@ fn all_node_kinds_have_documented_schema() {
         // Unsafe-surface sites (issue #222), documented in
         // docs/cli/unsafe-sites.md.
         | NodeKind::UnsafeSite
+        // Lint-suppression inventory (issue #227), documented in
+        // docs/cli/suppressions.md.
+        | NodeKind::LintSuppression
         // Declared Cargo dependencies (issue #180), documented in
         // docs/cli/manifest-deps.md.
         | NodeKind::DependencyDeclaration
         // File-level scan-coverage summary (issue #135), documented in
         // docs/cli/scan.md and docs/cli/inspect.md.
-        | NodeKind::ScanCoverage => "code-graph-documented",
+        // History-replay window summary (issue #256), documented in
+        // docs/cli/scan-history.md.
+        | NodeKind::ScanCoverage
+        | NodeKind::HistoryReplayWindow
+        // History-replay resume marker (issue #224), documented in
+        // docs/cli/scan-history.md.
+        | NodeKind::HistoryReplayTip => "code-graph-documented",
         // Documented in docs/schema/semantic-drift.md
         NodeKind::SemanticDrift | NodeKind::EmbeddingModel | NodeKind::EmbeddingVector => {
             "semantic-domain-documented"
@@ -4369,9 +4598,19 @@ fn all_node_kinds_have_documented_schema() {
         // Documented in docs/schema/agent-memory.md (full schema).
         // Retraction is the operator retraction event (issue #231):
         // docs/schema/agent-memory.md §4a and docs/cli/forget.md.
-        NodeKind::Agent | NodeKind::AgentSession | NodeKind::Observation | NodeKind::Retraction => {
-            "agent-memory-documented"
-        }
+        // Retirement receipts (issue #156): docs/schema/agent-memory.md
+        // and docs/cli/retire.md.
+        NodeKind::Agent
+        | NodeKind::AgentSession
+        | NodeKind::Observation
+        | NodeKind::Retraction
+        | NodeKind::RetirementReceipt
+        | NodeKind::ReinstatementReceipt
+        // `CostUsage` (issue #132): promoted from a reserved kind to a
+        // specified record — docs/schema/agent-memory.md §4a
+        // ("`CostUsage` record shape"). The M3 Codex importer also emits
+        // `CostUsage` nodes (per-turn, legacy text shape).
+        | NodeKind::CostUsage => "agent-memory-documented",
         // Project-domain day-one shapes documented in docs/schema/project-graph.md
         NodeKind::Task | NodeKind::AcceptanceCriterion | NodeKind::ExternalLink => {
             "project-domain-documented"
@@ -4396,10 +4635,16 @@ fn all_node_kinds_have_documented_schema() {
         NodeKind::AgentRun | NodeKind::AgentTurn | NodeKind::Failure | NodeKind::Decision => {
             "agent-memory-m2-traj-importer"
         }
-        NodeKind::ToolCall | NodeKind::FileEdit | NodeKind::PatchArtifact => {
-            "agent-actions-documented"
-        }
-        // Documented in docs/schema/verification.md (full schema, day-one shapes)
+        // Design-doc artifact kinds (issue #149): the reserved ADR/PRD/Plan
+        // shapes, documented in docs/schema/agent-actions.md §10 and
+        // docs/schema/doc-ingest.md — same documented status as the other
+        // agent-actions kinds.
+        NodeKind::ToolCall
+        | NodeKind::FileEdit
+        | NodeKind::PatchArtifact
+        | NodeKind::Adr
+        | NodeKind::Prd
+        | NodeKind::PlanDoc => "agent-actions-documented",
         NodeKind::Verification => "verification-documented",
         // Reserved in docs/schema/verification.md §5 with one-line definitions
         NodeKind::CommandRun
@@ -4415,8 +4660,6 @@ fn all_node_kinds_have_documented_schema() {
         | NodeKind::WorkflowRule
         | NodeKind::NamingDecision
         | NodeKind::Constraint => "user-context-documented",
-        // M3 Codex importer node kinds (issue #21)
-        NodeKind::CostUsage => "agent-memory-m3-codex-importer",
         // Log-signature node kinds (issues #319 / #320), documented in
         // docs/schema/log-graph.md and docs/cli/scan-logs.md.
         NodeKind::LogSource
@@ -4461,6 +4704,7 @@ fn all_edge_labels_have_documented_schema() {
         | EdgeLabel::ClosesAcceptanceCriterion
         | EdgeLabel::OwnedByTask
         | EdgeLabel::ExternalHandle
+        | EdgeLabel::DependsOn
         | EdgeLabel::TouchesFile
         | EdgeLabel::MergedAs
         | EdgeLabel::ReviewsCommit
@@ -8132,10 +8376,14 @@ fn agent_registration_produces_agent_memory_ids() {
 }
 
 // (d) An evidence link whose target_record_id does not exist in the store
-// is rejected with the documented unresolved_evidence_target error code.
+// is quarantined under the default dangling-citation policy (issue #241):
+// the batch returns 200, the citing record is skipped with a
+// machine-readable `dangling_evidence_citation` diagnostic, and it never
+// enters the store. (Before #241 this was a hard non-200
+// `unresolved_evidence_target` rejection; the policy now owns the decision.)
 #[cfg(feature = "embedded-aletheiadb")]
 #[test]
-fn evidence_link_with_missing_target_is_rejected() {
+fn evidence_link_with_missing_target_is_quarantined() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
     let mut daemon = start_daemon(&data_dir);
@@ -8178,14 +8426,41 @@ fn evidence_link_with_missing_target_is_rejected() {
     );
 
     assert!(
-        !response.starts_with("HTTP/1.1 200"),
-        "ingest with unresolved evidence link target should be rejected, got {response}"
+        response.starts_with("HTTP/1.1 200"),
+        "quarantine ingest should succeed with the record skipped, got {response}"
     );
 
     let body = response_json(&response);
+    let result = &body["result"];
+    assert_eq!(result["attempted"], 1);
+    assert_eq!(result["succeeded"], 0);
+    assert_eq!(result["failed"], 1);
+    let message = result["failures"][0]["message"]
+        .as_str()
+        .expect("failure message should be text");
+    let diagnostic: serde_json::Value =
+        serde_json::from_str(message).expect("diagnostic should be machine-readable JSON");
+    assert_eq!(diagnostic["code"], "dangling_evidence_citation");
     assert_eq!(
-        body["error"]["code"], "unresolved_evidence_target",
-        "rejection must carry unresolved_evidence_target code per schema doc, got {body}"
+        diagnostic["citing_record_id"],
+        "agent_memory:v1:evidence-link-test-obs"
+    );
+    assert_eq!(
+        diagnostic["target_record_id"],
+        "codegraph:v3:nonexistent-symbol-xyzzy"
+    );
+
+    // The quarantined record never entered the store.
+    let missing = http_request(
+        &metadata.address,
+        &format!(
+            "GET /v1/records/agent_memory:v1:evidence-link-test-obs HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            metadata.token
+        ),
+    );
+    assert!(
+        missing.contains("\"record\":null"),
+        "quarantined record must be absent, got {missing}"
     );
 
     daemon.stop();
@@ -10345,6 +10620,163 @@ fn query_verb_conformance() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn daemon_locate_verb_returns_full_envelope() {
+    // Issue #212 `--daemon`: the `locate` verb must return the same full
+    // locate/context envelope as `eg query locate --graph` — the located
+    // symbol, its enclosing chain, and the trust-separated cross-domain
+    // bundle — plus the typed positional errors.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let graph_path = temp.path().join("graph.jsonl");
+    let mut daemon = start_daemon(&data_dir);
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan")
+        .arg(fixture_repo())
+        .arg("--repo-id-override")
+        .arg("fixture-rust-basic-stable")
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    let metadata = read_metadata(&data_dir);
+
+    let records = graph_records_json(&graph_path);
+    let ingest_res = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "locate-ingest",
+            "agent_id": "verb-test-agent",
+            "session_id": "verb-test-session",
+            "idempotency_key": "locate-ingest-key",
+            "domain": "codegraph",
+            "created_at": "2026-05-19T00:00:00Z",
+            "payload": { "records": records }
+        }),
+    );
+    assert!(
+        ingest_res.starts_with("HTTP/1.1 200"),
+        "fixture ingest should succeed, got {ingest_res}"
+    );
+
+    // ── locate: line 15 is inside `nested::Widget` ──────────────────────────
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "locate-ok",
+            "agent_id": "verb-test-agent",
+            "verb": "locate",
+            "params": { "repo_relative_path": "src/lib.rs", "line": 15 }
+        }),
+    );
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "locate should return 200, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["ok"], true, "locate must have ok:true, got {body}");
+    assert_eq!(
+        body["result"]["verb"], "locate",
+        "result.verb must be locate, got {body}"
+    );
+    let envelope = &body["result"]["locate"];
+    assert_eq!(envelope["ok"], true, "locate envelope must have ok:true");
+    assert_eq!(
+        envelope["symbol"]["name"], "nested::Widget",
+        "line 15 must resolve inside nested::Widget, got {envelope}"
+    );
+    // The full trust-separated bundle is present.
+    for section in [
+        "source_facts",
+        "observations",
+        "project_state",
+        "artifacts",
+        "verification_evidence",
+        "unresolved",
+    ] {
+        assert!(
+            envelope[section].is_array(),
+            "locate envelope must carry section {section}, got {envelope}"
+        );
+    }
+    assert!(
+        envelope["enclosing_chain"].is_array(),
+        "locate envelope must carry the enclosing chain, got {envelope}"
+    );
+
+    // ── locate: line past the file's last line → typed 404 ─────────────────
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "locate-oor",
+            "agent_id": "verb-test-agent",
+            "verb": "locate",
+            "params": { "repo_relative_path": "src/lib.rs", "line": 99999 }
+        }),
+    );
+    assert!(
+        res.starts_with("HTTP/1.1 404"),
+        "out-of-range locate should return 404, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["ok"], false, "error must have ok:false, got {body}");
+    assert_eq!(
+        body["error"]["code"], "line_out_of_range",
+        "error code must be the typed line_out_of_range, got {body}"
+    );
+
+    // ── locate: unknown path → typed 404 ────────────────────────────────────
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "locate-nomatch",
+            "agent_id": "verb-test-agent",
+            "verb": "locate",
+            "params": { "repo_relative_path": "src/nope.rs", "line": 1 }
+        }),
+    );
+    assert!(
+        res.starts_with("HTTP/1.1 404"),
+        "unknown-path locate should return 404, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(
+        body["error"]["code"], "no_match",
+        "error code must be the typed no_match, got {body}"
+    );
+
+    // ── locate: missing line → 400 ──────────────────────────────────────────
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "locate-bad",
+            "agent_id": "verb-test-agent",
+            "verb": "locate",
+            "params": { "repo_relative_path": "src/lib.rs" }
+        }),
+    );
+    assert!(
+        res.starts_with("HTTP/1.1 400"),
+        "locate without line should return 400, got {res}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
 fn eg_query_daemon_smoke() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
@@ -12258,6 +12690,8 @@ fn build_semantic_fixture_store(data_dir: &Path, count: usize) -> Vec<String> {
                 end_byte: 10 + i,
                 start_line: i + 1,
                 end_line: i + 1,
+                start_column: None,
+                end_column: None,
             },
             format!("sym{i:02}"),
             format!("fixture symbol number {i}"),
@@ -12377,6 +12811,8 @@ fn daemon_semantic_search_bad_repo_selector_wins_over_missing_index() {
                 end_byte: 10,
                 start_line: 1,
                 end_line: 1,
+                start_column: None,
+                end_column: None,
             },
             "plain".to_owned(),
             "fixture symbol".to_owned(),
@@ -12573,6 +13009,269 @@ fn daemon_semantic_search_omits_span_when_absent() {
     );
 }
 
+// ── Issue #243: the verb result carries the embedding-provenance envelope ────
+#[cfg(feature = "embeddings")]
+#[test]
+fn daemon_semantic_search_result_carries_embedding_provenance() {
+    // The envelope is built from the same store/index that produced the
+    // ranking, so `--daemon` CLI answers and future MCP consumers get the same
+    // contract as the embedded lane. Driven with a synthetic query vector — no
+    // embedding model is loaded anywhere in this test.
+    use aletheia_egregore::embeddings::{
+        default_embedding_model_identity, embedding_index_identity_record,
+    };
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("semantic-provenance-store");
+    build_semantic_fixture_store(&data_dir, 8);
+
+    // Stamp the index identity the daemon reads back: the default model
+    // identity at the fixture's synthetic dimension, so the query identity
+    // (derived from the actual query vector length) matches it exactly.
+    let identity = default_embedding_model_identity(SEMANTIC_FIXTURE_DIM);
+    {
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("store should reopen");
+        sink.write_record(&embedding_index_identity_record(&identity))
+            .expect("identity record should write");
+        sink.persist_indexes().expect("indexes should persist");
+    }
+
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "provenance-verb",
+            "agent_id": "semantic-test-agent",
+            "verb": "semantic_search",
+            "params": { "query_vector": semantic_vec_at(0.0), "limit": 5_u64 }
+        }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "semantic_search should return 200, got {res}"
+    );
+    let body = response_json(&res);
+    let provenance = &body["result"]["embedding_provenance"];
+    assert!(
+        provenance.is_object(),
+        "verb result must carry the embedding_provenance envelope, got {body}"
+    );
+    assert_eq!(
+        provenance["query_model"]["provider"], "aletheiadb_re_export",
+        "query identity names the embedder, got {provenance}"
+    );
+    assert_eq!(
+        provenance["query_model"]["name"], "sentence-transformers/all-MiniLM-L6-v2",
+        "got {provenance}"
+    );
+    assert_eq!(
+        provenance["query_model"]["dim"], SEMANTIC_FIXTURE_DIM as u64,
+        "query identity reflects the ACTUAL query vector length, got {provenance}"
+    );
+    assert_eq!(
+        provenance["index_model"]["name"], "sentence-transformers/all-MiniLM-L6-v2",
+        "index identity is read from the ranked store, got {provenance}"
+    );
+    assert_eq!(provenance["metric"], "cosine", "got {provenance}");
+    assert_eq!(provenance["model_match"], true, "got {provenance}");
+    assert_eq!(
+        provenance["mismatch_fields"],
+        serde_json::json!([]),
+        "got {provenance}"
+    );
+    assert_eq!(
+        provenance["index_fingerprint"].as_str().map(str::len),
+        Some(64),
+        "fingerprint is BLAKE3 hex, got {provenance}"
+    );
+    // Rows are unchanged: still bounded retrieval leads.
+    let rows = body["result"]["records"]
+        .as_array()
+        .expect("records must be an array");
+    assert!(!rows.is_empty(), "expected ranked rows, got {body}");
+}
+
+// ── Issue #221: the semantic_search verb result carries a top-level ─────────
+// confidence verdict (confident | weak | abstain) derived deterministically
+// from the ranked score distribution against the documented thresholds.
+// Driven with a synthetic query vector — no embedding model is loaded
+// anywhere in this test.
+
+/// Valid verdict tags for the issue #221 answer-level confidence verdict.
+#[cfg(feature = "embeddings")]
+const SEMANTIC_CONFIDENCE_VERDICT_TAGS: &[&str] = &["confident", "weak", "abstain"];
+
+/// Issues a `semantic_search` verb and returns the full parsed response body.
+#[cfg(feature = "embeddings")]
+fn daemon_semantic_search_body(
+    metadata: &DaemonMetadata,
+    request_id: &str,
+    query_vector: &[f32],
+    limit: usize,
+) -> serde_json::Value {
+    let res = http_json(
+        metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": request_id,
+            "agent_id": "semantic-test-agent",
+            "verb": "semantic_search",
+            "params": { "query_vector": query_vector, "limit": limit as u64 }
+        }),
+    );
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "semantic_search should return 200, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["ok"], true, "semantic_search must be ok, got {body}");
+    body
+}
+
+#[cfg(feature = "embeddings")]
+#[test]
+fn daemon_semantic_search_result_carries_confidence_verdict() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("semantic-confidence-store");
+    build_semantic_fixture_store(&data_dir, 8);
+
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // limit < pool so total_candidates can be checked against the
+    // pre-truncation pool, not the returned window.
+    let query = semantic_vec_at(0.0);
+    let body = daemon_semantic_search_body(&metadata, "confidence-verb-1", &query, 5);
+    // Second identical call: the verdict must be byte-identical (determinism).
+    let again = daemon_semantic_search_body(&metadata, "confidence-verb-2", &query, 5);
+    daemon.stop();
+
+    for (n, body) in ["first", "second"].iter().zip([&body, &again]) {
+        let confidence = &body["result"]["confidence"];
+        assert!(
+            confidence.is_object(),
+            "{n} verb result must carry the top-level confidence verdict object (issue #221), got {body}"
+        );
+        let verdict = confidence["verdict"].as_str().unwrap_or_default();
+        assert!(
+            SEMANTIC_CONFIDENCE_VERDICT_TAGS.contains(&verdict),
+            "{n} confidence.verdict must be one of confident|weak|abstain, got {verdict} in {confidence}"
+        );
+    }
+
+    // The verdict is derived from the returned rows' score distribution: the
+    // best row's band must agree with the verdict. The calibrated bands under
+    // test are confident >= 0.39, weak in [0.34, 0.39), abstain < 0.34
+    // (docs/cli/query.md, "Confidence verdicts").
+    let rows = body["result"]["records"]
+        .as_array()
+        .expect("records must be an array");
+    assert_eq!(rows.len(), 5, "limit bounds the returned rows, got {body}");
+    let best = rows
+        .iter()
+        .map(|r| r["score"].as_f64().unwrap_or(0.0))
+        .fold(f64::NEG_INFINITY, f64::max);
+    let expected = if best >= 0.39 {
+        "confident"
+    } else if best >= 0.34 {
+        "weak"
+    } else {
+        "abstain"
+    };
+    assert_eq!(
+        body["result"]["confidence"]["verdict"].as_str(),
+        Some(expected),
+        "verdict must be derived from the best row score {best}"
+    );
+    // The verdict carries its derivation for machine consumers. Thresholds
+    // are f32 constants, so compare with an epsilon: 0.39 is not
+    // exactly representable in binary.
+    let confidence = &body["result"]["confidence"];
+    assert!(
+        (confidence["confident_threshold"].as_f64().unwrap_or(-1.0) - 0.39).abs() < 1e-6,
+        "verdict must name the confident threshold, got {confidence}"
+    );
+    assert!(
+        (confidence["weak_threshold"].as_f64().unwrap_or(-1.0) - 0.34).abs() < 1e-6,
+        "verdict must name the weak threshold, got {confidence}"
+    );
+    assert_eq!(
+        confidence["selection_basis"].as_str(),
+        Some("corpus_calibrated_confidence_floor"),
+        "verdict must name the selection basis, got {confidence}"
+    );
+    assert_eq!(
+        confidence["total_candidates"].as_u64(),
+        Some(8),
+        "total_candidates covers the pre-truncation pool, got {confidence}"
+    );
+    assert!(
+        (confidence["best_score"].as_f64().unwrap_or(-1.0) - best).abs() < 1e-6,
+        "best_score must match the best row score, got {confidence}"
+    );
+
+    // Determinism: two identical verbs yield byte-identical verdict objects.
+    let first = serde_json::to_string(&body["result"]["confidence"]).expect("serialize");
+    let second = serde_json::to_string(&again["result"]["confidence"]).expect("serialize");
+    assert_eq!(
+        first, second,
+        "identical store+query+model must yield byte-identical verdicts"
+    );
+}
+
+// ── Issue #221: embedded/daemon classifier parity ───────────────────────────
+// The daemon's verdict wiring must agree with the library classifier
+// (`SemanticConfidence::of_best`): for each query, the daemon's verdict tag
+// must equal the classifier applied to the daemon's own best score. This
+// locks the wiring, not just the constants — if the daemon ever hardcodes
+// divergent thresholds, this fails even when the constants change.
+#[cfg(feature = "embeddings")]
+#[test]
+fn daemon_verdict_matches_library_classifier() {
+    use aletheia_egregore::semantic_confidence::SemanticConfidence;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("semantic-classifier-parity-store");
+    build_semantic_fixture_store(&data_dir, 12);
+
+    let queries = semantic_fixture_query_vectors();
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_running_metadata(&data_dir);
+
+    for (idx, query) in queries.iter().enumerate().take(5) {
+        let body =
+            daemon_semantic_search_body(&metadata, &format!("classifier-parity-{idx}"), query, 5);
+        let confidence = &body["result"]["confidence"];
+        let daemon_tag = confidence["verdict"].as_str().expect("verdict tag");
+        #[allow(clippy::cast_possible_truncation)]
+        let best = confidence["best_score"].as_f64().expect("best_score") as f32;
+        // Skip near-boundary scores: a 1e-4 score drift across transports
+        // could flip the verdict, which is correct behavior, not a bug.
+        let near_boundary = [
+            aletheia_egregore::semantic_confidence::SEMANTIC_CONFIDENT_THRESHOLD,
+            aletheia_egregore::semantic_confidence::SEMANTIC_WEAK_THRESHOLD,
+        ]
+        .iter()
+        .any(|t| (best - t).abs() < 1e-3);
+        if near_boundary {
+            continue;
+        }
+        let expected = SemanticConfidence::of_best(best).as_str();
+        assert_eq!(
+            daemon_tag, expected,
+            "daemon verdict wiring must match the library classifier for query {idx} (best {best})"
+        );
+    }
+    daemon.stop();
+}
+
 // ── AC6 + AC7: rows are bounded retrieval leads, never raw content or proof ───
 #[cfg(feature = "embeddings")]
 #[test]
@@ -12615,6 +13314,8 @@ fn daemon_semantic_search_reports_missing_index() {
                 end_byte: 10,
                 start_line: 1,
                 end_line: 1,
+                start_column: None,
+                end_column: None,
             },
             "plain".to_owned(),
             "no embedding here".to_owned(),
@@ -13346,6 +14047,8 @@ fn agent_sessions_fixture_records() -> Vec<GraphRecord> {
                 end_byte: 100,
                 start_line: 1,
                 end_line: 100,
+                start_column: None,
+                end_column: None,
             },
             "src/lib.rs".to_owned(),
             "rust",
@@ -13367,6 +14070,8 @@ fn agent_sessions_fixture_records() -> Vec<GraphRecord> {
                 end_byte: 40,
                 start_line: 10,
                 end_line: 20,
+                start_column: None,
+                end_column: None,
             },
             "widget".to_owned(),
             "rust",
@@ -14248,4 +14953,214 @@ fn agent_sessions_for_repo_pre_digest_delay_hook_does_not_fire_without_the_env_v
         res.starts_with("HTTP/1.1 200"),
         "without the delay hook armed, a normal query must succeed, got {res}"
     );
+}
+
+// ── `query resolve` through the daemon's `resolve_record` verb (issue #160) ──
+
+/// A fixed, well-formed codegraph handle for daemon resolve tests.
+const RESOLVE_TEST_ID: &str =
+    "codegraph:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+/// Builds a minimal Symbol node with a temporal block for daemon resolve tests.
+fn resolve_test_symbol(start_line: u32, commit: &str, valid_time: &str) -> serde_json::Value {
+    serde_json::json!({
+        "record_type": "node",
+        "id": RESOLVE_TEST_ID,
+        "kind": "Symbol",
+        "schema_version": 1,
+        "summary": "daemon resolve test fixture",
+        "user_context": {},
+        "name": "target",
+        "repo_relative_path": "src/lib.rs",
+        "span": {
+            "start_byte": 0,
+            "end_byte": 10,
+            "start_line": start_line,
+            "end_line": start_line,
+            "start_column": 1,
+            "end_column": 10
+        },
+        "signature": "pub fn target() -> u32",
+        "content_signature": format!("content@{start_line}"),
+        "temporal": {
+            "git_commit": commit,
+            "git_parent_commits": [],
+            "valid_time": valid_time,
+            "observed_at": valid_time
+        },
+    })
+}
+
+/// Ingests `records` into the daemon at `metadata` and asserts HTTP 200.
+fn ingest_records_for_resolve(metadata: &DaemonMetadata, records: &[serde_json::Value]) {
+    let res = http_json(
+        metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "resolve-ingest",
+            "agent_id": "resolve-agent",
+            "session_id": "resolve-session",
+            "idempotency_key": "resolve-ingest-key",
+            "domain": "codegraph",
+            "created_at": "2026-05-19T00:00:00Z",
+            "payload": { "records": records }
+        }),
+    );
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "resolve ingest should succeed, got {res}"
+    );
+}
+
+/// Starts a daemon with two temporal versions of one symbol ingested:
+/// c1 (`aaa…`, line 1, 2026-03-01) and c2 (`bbb…`, line 5, 2026-03-03).
+/// Returns the temp dir guard, the running daemon, and the data dir.
+fn start_daemon_with_resolve_history() -> (tempfile::TempDir, RunningDaemon, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    ingest_records_for_resolve(
+        &metadata,
+        &[
+            resolve_test_symbol(
+                1,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "2026-03-01T00:00:00Z",
+            ),
+            resolve_test_symbol(
+                5,
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "2026-03-03T00:00:00Z",
+            ),
+        ],
+    );
+    // Re-read metadata after ingest so the daemon has flushed; the CLI only
+    // needs the data dir.
+    (temp, daemon, data_dir)
+}
+
+#[test]
+fn eg_query_resolve_daemon_current_is_valid() {
+    let (_temp, mut daemon, data_dir) = start_daemon_with_resolve_history();
+    let output = Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("query")
+        .arg("resolve")
+        .arg(RESOLVE_TEST_ID)
+        .arg("--daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("query resolve should run");
+    daemon.stop();
+    assert!(
+        output.status.success(),
+        "daemon resolve should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let answer: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(answer["record_id"], RESOLVE_TEST_ID);
+    assert_eq!(answer["verdict"], "valid");
+    assert_eq!(answer["repo_relative_path"], "src/lib.rs");
+    // The current view is the c2 version (line 5).
+    assert_eq!(answer["span"]["start_line"], 5);
+}
+
+#[test]
+fn eg_query_resolve_daemon_at_pins_the_old_snapshot() {
+    let (_temp, mut daemon, data_dir) = start_daemon_with_resolve_history();
+    let output = Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("query")
+        .arg("resolve")
+        .arg(RESOLVE_TEST_ID)
+        .arg("--daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--at")
+        .arg("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("query resolve should run");
+    daemon.stop();
+    assert!(
+        output.status.success(),
+        "daemon resolve --at should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let answer: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(answer["record_id"], RESOLVE_TEST_ID);
+    // c1's coordinates (line 1) differ from the current view (line 5).
+    assert_eq!(answer["verdict"], "drifted");
+    assert_eq!(answer["span"]["start_line"], 1);
+    assert_eq!(answer["current_span"]["start_line"], 5);
+    assert!(answer["detail"].is_string());
+}
+
+#[test]
+fn eg_query_resolve_daemon_as_of_pins_the_old_snapshot() {
+    let (_temp, mut daemon, data_dir) = start_daemon_with_resolve_history();
+    let output = Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("query")
+        .arg("resolve")
+        .arg(RESOLVE_TEST_ID)
+        .arg("--daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--as-of")
+        .arg("2026-03-02T00:00:00Z")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("query resolve should run");
+    daemon.stop();
+    assert!(
+        output.status.success(),
+        "daemon resolve --as-of should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let answer: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(answer["record_id"], RESOLVE_TEST_ID);
+    assert_eq!(answer["verdict"], "drifted");
+    assert_eq!(answer["span"]["start_line"], 1);
+    assert_eq!(answer["current_span"]["start_line"], 5);
+}
+
+#[test]
+fn eg_query_resolve_daemon_dangling_is_exit_two() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let output = Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("query")
+        .arg("resolve")
+        .arg("codegraph:v1:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+        .arg("--daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("query resolve should run");
+    daemon.stop();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "dangling daemon resolve should exit 2, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "dangling_handle");
 }

@@ -16,6 +16,16 @@ Egregore guarantees that scanning operations (`eg scan` and `eg scan-history`) a
 
 Both commands are fully offline and run with no network access.
 
+### History windows (issue #256)
+
+The `scan-history` window flags (`--max-commits`, `--since`, `--from` /
+`--to`) use the same read-only plumbing — `git rev-list`, `git rev-parse`,
+and the tree-object reads above — so the no-mutation guarantee extends to
+windowed replays unchanged. A windowed replay additionally records its
+resolved window as a `HistoryReplayWindow` node (see
+`docs/cli/scan-history.md`) so a bounded-history graph can never be mistaken
+for a full-history one.
+
 ## Out of Scope
 
 - **Output File Writes**: The command will write the final serialized JSONL graph to the path supplied in the `--out` flag, creating or overwriting that file. If the path specified by `--out` lives inside the repository directory, it will modify that file in the working tree. For a completely mutation-free run, specify an `--out` file path located outside the repository root.

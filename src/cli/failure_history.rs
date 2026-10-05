@@ -1,5 +1,7 @@
 use super::*;
 
+use super::record_budget::RecordBudget;
+
 /// Builds one redaction-safe failed-attempt view from a context attempt.
 pub(crate) fn failure_attempt_json<'a>(
     attempt: &query::FailureAttempt<'a>,
@@ -31,6 +33,7 @@ pub(crate) fn query_failures_cmd(
     repo_scope: Option<&str>,
     at_head: bool,
     all_history: bool,
+    max_records: Option<usize>,
 ) -> Result<()> {
     // Corpus-mode selection (issue #456): head-anchor by default over a
     // scan-history store; `--all-history` opts into the union. Pre-filter drops
@@ -133,10 +136,22 @@ pub(crate) fn query_failures_cmd(
             && a.target_domain == b.target_domain
     });
 
-    let returned = runtime_failures.len()
-        + agent_failures.len()
-        + superseding_successes.len()
-        + patch_artifacts.len();
+    // Record budget (issue #211): sections fill sequentially in envelope
+    // order; each keeps its top-ranked prefix and the remainder flows on.
+    let mut budget = RecordBudget::new(max_records);
+    let runtime_failures = budget.section(runtime_failures);
+    let agent_failures = budget.section(agent_failures);
+    let superseding_successes = budget.section(superseding_successes);
+    let patch_artifacts = budget.section(patch_artifacts);
+
+    let returned = runtime_failures.returned()
+        + agent_failures.returned()
+        + superseding_successes.returned()
+        + patch_artifacts.returned();
+    let has_more = runtime_failures.was_truncated()
+        || agent_failures.was_truncated()
+        || superseding_successes.was_truncated()
+        || patch_artifacts.was_truncated();
 
     let corpus_disclaimer = corpus_mode.disclaimer().to_owned();
 
@@ -154,7 +169,7 @@ pub(crate) fn query_failures_cmd(
         diagnostics,
         page: AuditPage {
             cursor: None,
-            has_more: false,
+            has_more,
             returned,
         },
         corpus_mode: corpus_mode.as_str(),

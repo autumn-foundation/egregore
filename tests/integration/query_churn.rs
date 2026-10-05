@@ -591,7 +591,9 @@ fn churn_excludes_tombstoned_files_and_symbol_edges() {
         contains("repo:main", "commit:1"),
         contains("repo:main", "commit:2"),
         file_node("file:a", "src/a.rs", "c1", "2026-01-01T00:00:00Z"),
-        file_node("file:gone", "src/gone.rs", "c1", "2026-01-01T00:00:00Z"),
+        // Non-temporal: a tombstone with no re-ingest still deletes the file
+        // (the temporal exemption is covered by the #432 parity tests below).
+        file_node_nontemporal("file:gone", "src/gone.rs"),
         contains("repo:main", "file:a"),
         contains("repo:main", "file:gone"),
         symbol,
@@ -719,5 +721,165 @@ fn churn_excludes_retracted_change_edges_but_keeps_historical_provenance() {
     assert!(
         !rendered.contains("src/a.rs"),
         "fully retracted file must not appear anywhere in the answer"
+    );
+}
+
+// ── Latest-write-wins liveness (issue #432) ──────────────────────────────────
+// The remaining tier-2 lane: over an append-only `--graph`, a File node or
+// CHANGED_IN edge re-ingested AFTER its own tombstone is live again. The
+// shared `query::liveness::Liveness` gate keeps the tombstone active only
+// while it is the id's most recent write.
+
+/// `repo_relative_path` → `commit_count` over the ranked files.
+fn ranked_counts(parsed: &serde_json::Value) -> std::collections::BTreeMap<String, u64> {
+    parsed["result"]["files"]
+        .as_array()
+        .expect("files array")
+        .iter()
+        .map(|f| {
+            (
+                f["repo_relative_path"]
+                    .as_str()
+                    .expect("repo_relative_path")
+                    .to_owned(),
+                f["commit_count"].as_u64().expect("commit_count"),
+            )
+        })
+        .collect()
+}
+
+/// A File node WITHOUT temporal provenance: the current-state class a
+/// tombstone can suppress (unlike history snapshots, which are exempt).
+fn file_node_nontemporal(id: &str, path: &str) -> GraphRecord {
+    GraphRecord::node(
+        id.to_owned(),
+        NodeKind::File,
+        Some(path.to_owned()),
+        None,
+        Some(path.to_owned()),
+        format!("source file {path}"),
+    )
+}
+
+/// Tombstone id helper for ids without a live record at hand.
+fn tombstone_of_id(deleted_id: &str, tombstone_id: &str) -> GraphRecord {
+    GraphRecord::Tombstone {
+        id: tombstone_id.to_owned(),
+        schema_version: 4,
+        deleted_id: deleted_id.to_owned(),
+        summary: format!("tombstoned {deleted_id}"),
+        producer: None,
+    }
+}
+
+#[test]
+fn churn_file_revived_after_tombstone_is_live() {
+    // Divergence repro (issue #432): a non-temporal File node re-ingested
+    // AFTER its own tombstone is live again under latest-write-wins. The raw
+    // tombstoned-membership gate drops it.
+    let revived = file_node_nontemporal("file:revived", "src/revived.rs");
+    let revived_tombstone = tombstone_of(&revived, "tombstone:file-revived");
+    let records = vec![
+        repo_node("repo:main", "main-repo"),
+        commit_node("commit:1", "c1", &[], "2026-01-01T00:00:00Z"),
+        commit_node("commit:2", "c2", &["c1"], "2026-01-02T00:00:00Z"),
+        contains("repo:main", "commit:1"),
+        contains("repo:main", "commit:2"),
+        // Control file: live throughout, one change.
+        file_node("file:steady", "src/steady.rs", "c1", "2026-01-01T00:00:00Z"),
+        contains("repo:main", "file:steady"),
+        // Revived file: node, tombstone, node again (latest write wins).
+        revived,
+        contains("repo:main", "file:revived"),
+        revived_tombstone,
+        file_node_nontemporal("file:revived", "src/revived.rs"),
+        // Tombstoned without re-ingest: stays deleted.
+        file_node_nontemporal("file:gone", "src/gone.rs"),
+        tombstone_of_id("file:gone", "tombstone:file-gone"),
+        changed_in("file:revived", "commit:1", "c1", "2026-01-01T00:00:00Z"),
+        changed_in("file:revived", "commit:2", "c2", "2026-01-02T00:00:00Z"),
+        changed_in("file:steady", "commit:1", "c1", "2026-01-01T00:00:00Z"),
+        changed_in("file:gone", "commit:1", "c1", "2026-01-01T00:00:00Z"),
+    ];
+    let (_temp, graph) = write_graph(&records);
+
+    let counts = ranked_counts(&run_churn_json(&graph, &[]));
+
+    assert_eq!(
+        counts.get("src/revived.rs"),
+        Some(&2),
+        "a file re-ingested after its tombstone is live again"
+    );
+    assert_eq!(
+        counts.get("src/steady.rs"),
+        Some(&1),
+        "control file still ranks"
+    );
+    assert!(
+        !counts.contains_key("src/gone.rs"),
+        "a tombstone with no re-ingest still deletes the file"
+    );
+}
+
+#[test]
+fn churn_temporal_file_tombstoned_without_reingest_still_ranks() {
+    // The `has_temporal` exemption (issue #432): the liveness gate keeps every
+    // temporal snapshot even for tombstoned records, so a tombstoned history
+    // File node with no re-ingest still ranks.
+    let records = vec![
+        repo_node("repo:main", "main-repo"),
+        commit_node("commit:1", "c1", &[], "2026-01-01T00:00:00Z"),
+        contains("repo:main", "commit:1"),
+        file_node("file:steady", "src/steady.rs", "c1", "2026-01-01T00:00:00Z"),
+        contains("repo:main", "file:steady"),
+        file_node("file:hist", "src/hist.rs", "c1", "2026-01-01T00:00:00Z"),
+        contains("repo:main", "file:hist"),
+        tombstone_of_id("file:hist", "tombstone:file-hist"),
+        changed_in("file:steady", "commit:1", "c1", "2026-01-01T00:00:00Z"),
+        changed_in("file:hist", "commit:1", "c1", "2026-01-01T00:00:00Z"),
+    ];
+    let (_temp, graph) = write_graph(&records);
+
+    let counts = ranked_counts(&run_churn_json(&graph, &[]));
+
+    assert_eq!(
+        counts.get("src/hist.rs"),
+        Some(&1),
+        "a tombstoned temporal file snapshot still ranks"
+    );
+    assert_eq!(
+        counts.get("src/steady.rs"),
+        Some(&1),
+        "control file still ranks"
+    );
+}
+
+#[test]
+fn churn_change_edge_revived_after_tombstone_counts() {
+    // Edge-side repro (issue #432): a non-temporal (retractable) CHANGED_IN
+    // edge re-ingested AFTER its own tombstone is live again.
+    let edge = changed_in_untemporal("file:e", "commit:2");
+    let edge_tombstone = tombstone_of(&edge, "tombstone:edge-e");
+    let records = vec![
+        repo_node("repo:main", "main-repo"),
+        commit_node("commit:1", "c1", &[], "2026-01-01T00:00:00Z"),
+        commit_node("commit:2", "c2", &["c1"], "2026-01-02T00:00:00Z"),
+        contains("repo:main", "commit:1"),
+        contains("repo:main", "commit:2"),
+        file_node("file:e", "src/e.rs", "c1", "2026-01-01T00:00:00Z"),
+        contains("repo:main", "file:e"),
+        changed_in("file:e", "commit:1", "c1", "2026-01-01T00:00:00Z"),
+        edge,
+        edge_tombstone,
+        changed_in_untemporal("file:e", "commit:2"),
+    ];
+    let (_temp, graph) = write_graph(&records);
+
+    let counts = ranked_counts(&run_churn_json(&graph, &[]));
+
+    assert_eq!(
+        counts.get("src/e.rs"),
+        Some(&2),
+        "a change edge re-ingested after its tombstone counts again"
     );
 }

@@ -51,6 +51,8 @@ fn build_embedded_store(data_dir: &Path) {
                 end_byte: 10 + i,
                 start_line: i + 1,
                 end_line: i + 1,
+                start_column: None,
+                end_column: None,
             },
             format!("sym{i:02}"),
             format!("fixture symbol number {i}"),

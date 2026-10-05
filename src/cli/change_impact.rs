@@ -1,5 +1,7 @@
 use super::*;
 
+use super::record_budget::{BudgetedSection, RecordBudget};
+
 // ---------------------------------------------------------------------------
 // change-impact query (issue #76)
 // ---------------------------------------------------------------------------
@@ -77,14 +79,14 @@ pub(crate) struct ChangeImpactResponse<'a> {
     corpus_mode_source: &'static str,
     /// One-line human description of the corpus that was read.
     corpus_disclaimer: String,
-    direct_callers: Vec<ImpactLeadJson<'a>>,
-    direct_callees: Vec<ImpactLeadJson<'a>>,
-    referencing_files: Vec<ImpactLeadJson<'a>>,
-    implementation_symbols: Vec<ImpactLeadJson<'a>>,
-    containing_context: Vec<ImpactLeadJson<'a>>,
+    direct_callers: BudgetedSection<ImpactLeadJson<'a>>,
+    direct_callees: BudgetedSection<ImpactLeadJson<'a>>,
+    referencing_files: BudgetedSection<ImpactLeadJson<'a>>,
+    implementation_symbols: BudgetedSection<ImpactLeadJson<'a>>,
+    containing_context: BudgetedSection<ImpactLeadJson<'a>>,
     /// Struct-literal construction sites of the anchor type (issue #443); each
     /// row carries an `e0063_risk` flag. Always present (empty when none).
-    construction_sites: Vec<ImpactLeadJson<'a>>,
+    construction_sites: BudgetedSection<ImpactLeadJson<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     truncations: Vec<ImpactTruncationJson>,
     diagnostics: Vec<AuditDiagnostic<'a>>,
@@ -145,6 +147,7 @@ pub(crate) fn impact_lead_json<'a>(lead: &'a query::ImpactLead<'a>) -> Option<Im
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::similar_names)]
 pub(crate) fn query_change_impact_cmd(
     records: &[GraphRecord],
     handle: &str,
@@ -153,6 +156,7 @@ pub(crate) fn query_change_impact_cmd(
     depth: usize,
     at_head: bool,
     all_history: bool,
+    max_records: Option<usize>,
 ) -> Result<()> {
     // Corpus-mode selection (issue #456): a current-state lane over a
     // scan-history store defaults to HEAD-anchoring; `--all-history` opts into
@@ -260,13 +264,10 @@ pub(crate) fn query_change_impact_cmd(
             && a.relation == b.relation
     });
 
-    let total_returned = ctx.direct_callers.len()
-        + ctx.direct_callees.len()
-        + ctx.referencing_files.len()
-        + ctx.implementation_symbols.len()
-        + ctx.containing_context.len()
-        + ctx.construction_sites.len();
-
+    // Record budget (issue #211): sections fill sequentially in envelope
+    // order; each keeps its top-ranked prefix and the remainder flows on.
+    // (`truncations` keeps reporting this lane's separate per-group row cap;
+    // the record budget divides what is left after that cap.)
     let truncations: Vec<ImpactTruncationJson> = ctx
         .truncations
         .iter()
@@ -278,6 +279,58 @@ pub(crate) fn query_change_impact_cmd(
         })
         .collect();
 
+    // `direct_callers`/`direct_callees` are the domain's relation names.
+    let mut budget = RecordBudget::new(max_records);
+    let direct_callers = budget.section(
+        ctx.direct_callers
+            .iter()
+            .filter_map(impact_lead_json)
+            .collect(),
+    );
+    let direct_callees = budget.section(
+        ctx.direct_callees
+            .iter()
+            .filter_map(impact_lead_json)
+            .collect(),
+    );
+    let referencing_files = budget.section(
+        ctx.referencing_files
+            .iter()
+            .filter_map(impact_lead_json)
+            .collect(),
+    );
+    let implementation_symbols = budget.section(
+        ctx.implementation_symbols
+            .iter()
+            .filter_map(impact_lead_json)
+            .collect(),
+    );
+    let containing_context = budget.section(
+        ctx.containing_context
+            .iter()
+            .filter_map(impact_lead_json)
+            .collect(),
+    );
+    let construction_sites = budget.section(
+        ctx.construction_sites
+            .iter()
+            .filter_map(impact_lead_json)
+            .collect(),
+    );
+
+    let total_returned = direct_callers.returned()
+        + direct_callees.returned()
+        + referencing_files.returned()
+        + implementation_symbols.returned()
+        + containing_context.returned()
+        + construction_sites.returned();
+    let has_more = direct_callers.was_truncated()
+        || direct_callees.was_truncated()
+        || referencing_files.was_truncated()
+        || implementation_symbols.was_truncated()
+        || containing_context.was_truncated()
+        || construction_sites.was_truncated();
+
     let response = ChangeImpactResponse {
         ok: true,
         handle,
@@ -288,41 +341,17 @@ pub(crate) fn query_change_impact_cmd(
         corpus_mode: corpus_mode.as_str(),
         corpus_mode_source: corpus_mode_source.as_str(),
         corpus_disclaimer: corpus_mode.disclaimer().to_owned(),
-        direct_callers: ctx
-            .direct_callers
-            .iter()
-            .filter_map(impact_lead_json)
-            .collect(),
-        direct_callees: ctx
-            .direct_callees
-            .iter()
-            .filter_map(impact_lead_json)
-            .collect(),
-        referencing_files: ctx
-            .referencing_files
-            .iter()
-            .filter_map(impact_lead_json)
-            .collect(),
-        implementation_symbols: ctx
-            .implementation_symbols
-            .iter()
-            .filter_map(impact_lead_json)
-            .collect(),
-        containing_context: ctx
-            .containing_context
-            .iter()
-            .filter_map(impact_lead_json)
-            .collect(),
-        construction_sites: ctx
-            .construction_sites
-            .iter()
-            .filter_map(impact_lead_json)
-            .collect(),
+        direct_callers,
+        direct_callees,
+        referencing_files,
+        implementation_symbols,
+        containing_context,
+        construction_sites,
         truncations,
         diagnostics,
         page: AuditPage {
             cursor: None,
-            has_more: false,
+            has_more,
             returned: total_returned,
         },
     };

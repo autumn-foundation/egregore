@@ -36,8 +36,10 @@ pub const REDACTION_MARKER: &str = "«redacted:secret»";
 /// Number of hex characters taken from the BLAKE3 hash as the audit prefix.
 ///
 /// 12 hex digits = 6 bytes = 48 bits of correlation space. Not reversible to
-/// the secret but sufficient for audit cross-referencing.
-const HASH_PREFIX_LEN: usize = 12;
+/// the secret but sufficient for audit cross-referencing. Public so the
+/// resting-store audit (issue #244) emits hash prefixes with the exact same
+/// scheme [`redact_value`] uses in `<REDACTED:class:hash_prefix>` markers.
+pub const HASH_PREFIX_LEN: usize = 12;
 
 // ── Secret classes ─────────────────────────────────────────────────────────────
 
@@ -200,6 +202,21 @@ pub fn redact_value(value: &str) -> String {
     format!("<REDACTED:{}:{}>", class.as_str(), prefix)
 }
 
+/// Computes the BLAKE3 hash prefix used for audit correlation.
+///
+/// Takes the first [`HASH_PREFIX_LEN`] lowercase-hex characters of the BLAKE3
+/// hash of `value` — the exact scheme [`redact_value`] emits in
+/// `<REDACTED:class:hash_prefix>` markers, so an audit finding's `hash_prefix`
+/// correlates with the marker that would have replaced the value.
+///
+/// The prefix is safe to store and print: it cannot be reversed into the
+/// secret.
+#[must_use]
+pub fn hash_prefix(value: &str) -> String {
+    let hex = blake3::hash(value.as_bytes()).to_hex();
+    hex.as_str()[..HASH_PREFIX_LEN].to_owned()
+}
+
 /// Builds the `<REDACTED:class:hash_prefix>` marker for an already-located secret
 /// span whose [`SecretClass`] the caller obtained from [`detect_secret_span`].
 ///
@@ -268,6 +285,8 @@ pub(crate) const fn is_code_graph_kind(kind: NodeKind) -> bool {
             | NodeKind::DebtMarker
             | NodeKind::UnsafeSite
             | NodeKind::ScanCoverage
+            | NodeKind::HistoryReplayWindow
+            | NodeKind::HistoryReplayTip
             | NodeKind::Commit
             | NodeKind::Change
             | NodeKind::SemanticDrift

@@ -6,9 +6,10 @@
 use std::{fs, path::PathBuf};
 
 use aletheia_egregore::{
-    EdgeLabel, GraphRecord, NodeKind, SnapshotHead, SourceSnapshotPayload, SourceSpan,
-    TemporalMetadata,
+    EdgeLabel, GraphRecord, IdentitySource, NodeKind, RepositoryIdentityPayload, SnapshotHead,
+    SourceSnapshotPayload, SourceSpan, TemporalMetadata,
     ir::{Graph, stable_id},
+    scan_repository_at_with_override,
 };
 use assert_cmd::Command;
 
@@ -26,6 +27,8 @@ const fn span(start_line: usize) -> SourceSpan {
         end_byte: 40,
         start_line,
         end_line: start_line,
+        start_column: None,
+        end_column: None,
     }
 }
 
@@ -594,8 +597,255 @@ fn data_dir_query_is_read_only() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #444 — the inbound IMPORTS edge, end to end.
+//
+// `eg scan` must mint `File —IMPORTS→ Module|File` from the importing file to
+// the resolved import target (the core "inbound edge" acceptance criterion),
+// deterministically and byte-stably; the lane then reads that same graph.
+// ---------------------------------------------------------------------------
+
+/// The target-shaped `IMPORTS` edges the issue-#444 scan pass mints: an
+/// `IMPORTS` edge carrying the scan-time summary marker
+/// `"<importer> imports <target> (Rust import …)"`. The extractor's
+/// containment-shaped `File —IMPORTS→ Import` edges carry no such marker.
+fn target_import_edges(records: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+    records
+        .iter()
+        .filter(|record| {
+            record["record_type"] == "edge"
+                && record["label"] == "IMPORTS"
+                && record["summary"]
+                    .as_str()
+                    .is_some_and(|summary| summary.contains("(Rust import "))
+        })
+        .collect()
+}
+
+fn parse_jsonl_lines(text: &str) -> Vec<serde_json::Value> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("JSONL line should parse"))
+        .collect()
+}
+
+#[test]
+fn full_scan_mints_inbound_import_target_edge() {
+    // The issue's own repro: scan a workspace, confirm the inbound edge from
+    // the importing file to the imported module's File node.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("fixture src dir");
+    fs::write(repo.join("src/lib.rs"), "pub mod b;\n").expect("write lib.rs");
+    fs::write(repo.join("src/b.rs"), "pub fn f() {}\n").expect("write b.rs");
+    fs::write(repo.join("src/consumer.rs"), "use crate::b;\n").expect("write consumer.rs");
+
+    let repo_id = Some("who-imports-scan-fixture");
+    let fixed_time = "2026-02-01T00:00:00Z";
+    let first = scan_repository_at_with_override(&repo, fixed_time, repo_id)
+        .expect("scan should work")
+        .to_jsonl()
+        .expect("graph should serialize");
+    // Byte-stable: an unchanged tree re-scans byte-identically (issue #444:
+    // "deterministic and byte-stable").
+    let second = scan_repository_at_with_override(&repo, fixed_time, repo_id)
+        .expect("rescan should work")
+        .to_jsonl()
+        .expect("graph should serialize");
+    assert_eq!(
+        first, second,
+        "a scan minting import-target edges must be byte-stable"
+    );
+
+    let records = parse_jsonl_lines(&first);
+    let target_edges = target_import_edges(&records);
+    assert_eq!(
+        target_edges.len(),
+        1,
+        "the scan must mint exactly one import-target edge"
+    );
+    let edge = target_edges[0];
+    let by_id: std::collections::HashMap<&str, &serde_json::Value> = records
+        .iter()
+        .filter(|r| r["record_type"] == "node")
+        .filter_map(|r| Some((r["id"].as_str()?, r)))
+        .collect();
+    let source = by_id[edge["source"].as_str().expect("edge source")].clone();
+    let target = by_id[edge["target"].as_str().expect("edge target")].clone();
+    assert_eq!(
+        source["kind"], "File",
+        "edge sources from the importing file"
+    );
+    assert_eq!(
+        source["repo_relative_path"], "src/consumer.rs",
+        "edge sources from the importing file"
+    );
+    assert_eq!(target["kind"], "File", "edge targets the imported module");
+    assert_eq!(
+        target["repo_relative_path"], "src/b.rs",
+        "edge targets the imported module's file"
+    );
+
+    // The lane reads the same graph: the importer surfaces with its citation
+    // handles (record_id + repo-relative file/span).
+    let graph_path = temp.path().join("graph.jsonl");
+    fs::write(&graph_path, &first).expect("write graph");
+
+    // The emitted graph validates clean: the target-shaped edge is an accepted
+    // IMPORTS target kind (docs/cli/validate.md).
+    let validate_stdout = egregore()
+        .args(["validate", graph_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let validate_text = String::from_utf8(validate_stdout).expect("utf8");
+    let summary: serde_json::Value =
+        serde_json::from_str(validate_text.lines().last().expect("summary line"))
+            .expect("validate summary is JSON");
+    assert_eq!(
+        summary["ok"], true,
+        "scan output with the new edge must validate clean"
+    );
+    let (header, rows) = run_ok(&[
+        "query",
+        "who-imports",
+        "crate::b",
+        "--graph",
+        graph_path.to_str().unwrap(),
+    ]);
+    assert_eq!(header["ok"], true);
+    assert_eq!(header["total_importers"].as_u64(), Some(1));
+    assert_eq!(rows[0]["repo_relative_path"], "src/consumer.rs");
+    assert!(rows[0]["record_id"].as_str().is_some(), "record_id");
+    assert!(rows[0]["span"].is_object(), "span");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #444 — `--repo` honoring, end to end.
+//
+// A multi-repo store where both repositories import `foo::bar`: `--repo`
+// restricts the importer set to the selected repository only.
+// ---------------------------------------------------------------------------
+
+fn two_repo_store() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("two_repo.jsonl");
+    let mut graph = Graph::new();
+
+    for (repo_id, basename, file_path, import_name) in [
+        (
+            "codegraph:v1:repo-alpha",
+            "alpha",
+            "src/a.rs",
+            "foo::bar::A",
+        ),
+        ("codegraph:v1:repo-beta", "beta", "src/b.rs", "foo::bar::B"),
+    ] {
+        graph.push(
+            GraphRecord::node(
+                repo_id.to_owned(),
+                NodeKind::Repository,
+                None,
+                None,
+                Some(basename.to_owned()),
+                format!("repository {basename}"),
+            )
+            .with_repository_identity(RepositoryIdentityPayload {
+                identity_source: IdentitySource::OperatorOverride,
+                remote_url: None,
+                root_commit_sha: None,
+                canonical_path: None,
+                basename: basename.to_owned(),
+            }),
+        );
+        let fid = stable_id(&["node", "File", repo_id, file_path]);
+        graph.push(GraphRecord::node(
+            fid.clone(),
+            NodeKind::File,
+            Some(file_path.to_owned()),
+            None,
+            Some(file_path.to_owned()),
+            format!("file {file_path}"),
+        ));
+        graph.push(GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_id.to_owned(),
+            fid.clone(),
+            None,
+            format!("{repo_id} contains {file_path}"),
+        ));
+        // Import node + the extractor's containment-shaped edge, sourced from
+        // this fixture's File node so ownership climbs to the right
+        // repository.
+        let iid = stable_id(&["node", "import", repo_id, file_path, import_name]);
+        graph.push(GraphRecord::syntax_node(
+            iid.clone(),
+            NodeKind::Import,
+            file_path.to_owned(),
+            span(1),
+            import_name.to_owned(),
+            "rust",
+            format!("Rust import {import_name}"),
+        ));
+        graph.push(GraphRecord::edge(
+            EdgeLabel::Imports,
+            fid,
+            iid,
+            None,
+            format!("{file_path} imports {import_name}"),
+        ));
+    }
+
+    let jsonl = graph.to_jsonl().expect("serialize graph");
+    fs::write(&path, jsonl).expect("write fixture");
+    (temp, path)
+}
+
+#[test]
+fn repo_flag_scopes_importers_to_one_repository_end_to_end() {
+    let (_t, path) = two_repo_store();
+
+    let (header, rows) = run_ok(&[
+        "query",
+        "who-imports",
+        "foo::bar",
+        "--graph",
+        path.to_str().unwrap(),
+        "--repo",
+        "alpha",
+    ]);
+    assert_eq!(header["ok"], true);
+    assert_eq!(
+        header["total_importers"].as_u64(),
+        Some(1),
+        "--repo alpha must return only alpha's importer"
+    );
+    assert_eq!(rows[0]["repo_relative_path"], "src/a.rs");
+
+    let (header, rows) = run_ok(&[
+        "query",
+        "who-imports",
+        "foo::bar",
+        "--graph",
+        path.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        header["total_importers"].as_u64(),
+        Some(2),
+        "no --repo keeps both repositories' importers"
+    );
+    let paths: Vec<&str> = rows
+        .iter()
+        .map(|r| r["repo_relative_path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, vec!["src/a.rs", "src/b.rs"]);
+}
+
+// ---------------------------------------------------------------------------
 // Issue #427 — corpus-mode default (HEAD-anchored) vs opt-in union.
 //
+// who-imports has NO --at/--as-of selector, so there is no commit-pinned
 // who-imports has NO --at/--as-of selector, so there is no commit-pinned
 // corpus. Over a `scan-history` store carrying a `source_snapshot`, an unpinned
 // query now DEFAULTS to HEAD-anchored (imports current at each repository's

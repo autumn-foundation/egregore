@@ -766,8 +766,11 @@ fn query_freshness_stamps_override_repo_rows() {
     );
 }
 
-/// `query context` must omit the top-level freshness verdict when source facts
-/// span multiple repositories (PR #186, follow-up review).
+/// Issue #192: when the same symbol name resolves to distinct identities in
+/// different repositories, `query context` reports `ambiguous_symbol` instead
+/// of merging their facts (which is what PR #186's freshness-omission rule
+/// guarded against). Disambiguating with `--candidate` yields the single
+/// identity's context.
 #[test]
 fn query_context_omits_freshness_across_repositories() {
     let a = Fixture::committed();
@@ -787,13 +790,36 @@ fn query_context_omits_freshness_across_repositories() {
         .arg("--repo-path")
         .arg(a.repo())
         .assert()
+        .failure();
+    let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(report["ok"], Value::Bool(false));
+    assert_eq!(
+        report["error"]["code"],
+        Value::String("ambiguous_symbol".to_owned())
+    );
+    assert_eq!(
+        report["error"]["candidates"].as_array().unwrap().len(),
+        2,
+        "both repository identities must be enumerated: {report}"
+    );
+
+    // Disambiguating by record ID yields the single identity's context.
+    let candidate_id = report["error"]["candidates"][0]["record_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let out = eg()
+        .args(["query", "context", "hello"])
+        .arg("--candidate")
+        .arg(&candidate_id)
+        .arg("--graph")
+        .arg(&combined)
+        .arg("--repo-path")
+        .arg(a.repo())
+        .assert()
         .success();
     let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(report["ok"], Value::Bool(true));
-    assert!(
-        report.get("freshness").is_none(),
-        "context freshness must be omitted when facts span repositories: {report}"
-    );
 }
 
 /// E: scanning into the working tree a second time while the previous

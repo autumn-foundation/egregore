@@ -189,6 +189,55 @@ impl<'a> TemporalResolver<'a> {
         }
     }
 
+    /// Direct (one-hop) superseding records for `id`, as [`TemporalReference`]s
+    /// sorted by record ID.
+    ///
+    /// Unlike [`Self::resolve_status`]'s transitive heads, these are the
+    /// records that directly override `id` per author-written data (the
+    /// `superseded_by` field, a `SUPERSEDES` evidence link, or a `SUPERSEDES`
+    /// edge). The belief-timeline lane (issue #235) reports the immediate
+    /// overrider as the forward pointer, so each hop of a chain stays visible.
+    #[must_use]
+    pub fn immediate_superseders(&self, id: &str) -> Vec<TemporalReference> {
+        let mut refs: Vec<TemporalReference> = self
+            .superseded_by
+            .get(id)
+            .map(|ids| {
+                ids.iter()
+                    .map(|next| TemporalReference {
+                        record_id: (*next).to_owned(),
+                        handle: self.get_handle(next),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        refs.sort_by(|a, b| a.record_id.cmp(&b.record_id));
+        refs
+    }
+
+    /// Records in a live `CONTRADICTS` relationship with `id`, as
+    /// [`TemporalReference`]s sorted by record ID.
+    ///
+    /// The relationship is symmetric (a link either way disputes both ends),
+    /// matching [`Self::build`]'s bidirectional `contradicts` map.
+    #[must_use]
+    pub fn contradicting_records(&self, id: &str) -> Vec<TemporalReference> {
+        let mut refs: Vec<TemporalReference> = self
+            .contradicts
+            .get(id)
+            .map(|ids| {
+                ids.iter()
+                    .map(|other| TemporalReference {
+                        record_id: (*other).to_owned(),
+                        handle: self.get_handle(other),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        refs.sort_by(|a, b| a.record_id.cmp(&b.record_id));
+        refs
+    }
+
     /// Resolves the supersession heads for a record transitively.
     ///
     /// # Errors

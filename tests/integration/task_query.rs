@@ -21,6 +21,8 @@ const fn span(start_line: usize, end_line: usize) -> SourceSpan {
         end_byte: 100,
         start_line,
         end_line,
+        start_column: None,
+        end_column: None,
     }
 }
 
@@ -249,6 +251,49 @@ fn fixture_task_query_seeded() -> (tempfile::TempDir, PathBuf, String) {
         ]);
     }
 
+    // Agent Decision referencing Task (issue #191): must surface in the
+    // dedicated `decisions` section, never in `observations`.
+    let dec_id = agent_memory_stable_id(&["decision", "dec_1"]);
+    let mut dec = GraphRecord::node(
+        dec_id,
+        NodeKind::Decision,
+        None,
+        None,
+        None,
+        "Decision on task 1".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut decision_text,
+        ref mut rationale_summary,
+        ref mut agent_id,
+        ref mut session_id,
+        ref mut confidence,
+        ref mut schema_version,
+        ref mut evidence_links,
+        ..
+    } = dec
+    {
+        *decision_text = Some("Ship the resolver behind a feature flag".to_owned());
+        *rationale_summary = Some(
+            "the resolver changes query semantics; a flag lets us roll back without a revert"
+                .to_owned(),
+        );
+        *agent_id = Some("agent_1".to_owned());
+        *session_id = Some("sess_1".to_owned());
+        *confidence = Some("0.85".to_owned());
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(task_id.clone()),
+            target_domain: "project".to_owned(),
+            relation: "REFERENCES_TASK".to_owned(),
+            confidence: "0.85".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
     // Artifact referencing Task
     let art_id = agent_memory_stable_id(&["artifact", "art_1"]);
     let mut art = GraphRecord::node(
@@ -322,6 +367,7 @@ fn fixture_task_query_seeded() -> (tempfile::TempDir, PathBuf, String) {
     graph.push(file);
     graph.push(task_file_edge);
     graph.push(obs);
+    graph.push(dec);
     graph.push(art);
     graph.push(review);
     graph.push(review_edge);
@@ -375,6 +421,33 @@ fn query_task_by_canonical_id_returns_structured_json() {
     let observations = parsed["observations"].as_array().expect("obs");
     assert_eq!(observations.len(), 1);
     assert_eq!(observations[0]["agent_id"], "agent_1");
+
+    // Verify the decisions section (issue #191): the decision surfaces
+    // with its non-empty rationale and never inside observations.
+    let decisions = parsed["decisions"].as_array().expect("decisions");
+    assert_eq!(decisions.len(), 1);
+    let dec_id = agent_memory_stable_id(&["decision", "dec_1"]);
+    assert_eq!(decisions[0]["record_id"], dec_id);
+    assert!(
+        decisions[0]["rationale_summary"]
+            .as_str()
+            .is_some_and(|r| !r.is_empty()),
+        "every surfaced decision carries a non-empty rationale"
+    );
+    assert_eq!(
+        decisions[0]["evidence_handles"][0]["relation"], "REFERENCES_TASK",
+        "decision evidence resolves the REFERENCES_TASK handle"
+    );
+    assert_eq!(
+        decisions[0]["evidence_handles"][0]["target_record_id"],
+        task_id
+    );
+    for row in observations {
+        assert_ne!(
+            row["record_id"], dec_id,
+            "decision records never appear in observations"
+        );
+    }
 
     // Verify artifacts are populated
     let artifacts = parsed["artifacts"].as_array().expect("artifacts");
@@ -559,39 +632,40 @@ fn query_task_ambiguous_handle_exits_1_with_json_error() {
 /// plumbing rather than shared code, so it needs its own proof. Asserts the
 /// serialized envelope — the fields are non-`Option`, so a struct-level check
 /// would prove little while a future `skip_serializing_if` would still compile.
-#[test]
-fn query_task_labels_every_record_with_a_trust_class() {
-    /// The closed `trust` vocabulary, mirrored from `crate::query::TrustClass`.
-    const TRUST_VOCABULARY: &[&str] = &[
-        "source_derived",
-        "verification_evidence",
-        "agent_verified",
-        "agent_unverified",
-        "agent_contradicted",
-        "project_state",
-        "artifact",
-        "runtime_observation",
-        "other",
-    ];
+/// The closed `trust` vocabulary, mirrored from `crate::query::TrustClass`.
+const TRUST_VOCABULARY: &[&str] = &[
+    "source_derived",
+    "verification_evidence",
+    "agent_verified",
+    "agent_unverified",
+    "agent_contradicted",
+    "project_state",
+    "artifact",
+    "runtime_observation",
+    "other",
+];
 
-    let (_temp, graph, task_id) = fixture_task_query_seeded();
-
+fn query_task_parsed(graph: &std::path::Path, task_id: &str) -> serde_json::Value {
     let output = egregore()
-        .args(["query", "task", &task_id, "--graph"])
-        .arg(&graph)
+        .args(["query", "task", task_id, "--graph"])
+        .arg(graph)
         .assert()
         .success()
         .get_output()
         .stdout
         .clone();
-    let parsed: serde_json::Value =
-        serde_json::from_str(String::from_utf8(output).expect("utf8").trim()).expect("valid JSON");
+    serde_json::from_str(String::from_utf8(output).expect("utf8").trim()).expect("valid JSON")
+}
 
+/// Every populated section labels each row with a class from the closed
+/// vocabulary.
+fn assert_trust_vocabulary(parsed: &serde_json::Value) {
     let sections = [
         "tasks",
         "acceptance_criteria",
         "source_facts",
         "observations",
+        "decisions",
         "artifacts",
         "verification_evidence",
         "reviews",
@@ -612,8 +686,10 @@ fn query_task_labels_every_record_with_a_trust_class() {
             );
         }
     }
+}
 
-    // Classification, per section.
+/// Each section's rows carry the expected derived class.
+fn assert_section_classification(parsed: &serde_json::Value) {
     for section in ["tasks", "acceptance_criteria", "reviews"] {
         for row in parsed[section].as_array().expect("array") {
             assert_eq!(
@@ -640,9 +716,45 @@ fn query_task_labels_every_record_with_a_trust_class() {
             "an agent-authored row was labelled non-agent: {row}"
         );
     }
+}
 
-    // The nested `verification_record` inlined on a verified acceptance
-    // criterion is a record too, and carries its own label.
+/// Decisions are agent-authored too (issue #191): same vocabulary check,
+/// every surfaced decision carries a non-empty rationale, and none may leak
+/// into observations.
+fn assert_decision_rows(parsed: &serde_json::Value) {
+    let decision_ids: Vec<&str> = parsed["decisions"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|row| {
+            assert!(
+                row["trust"].as_str().unwrap_or("").starts_with("agent_"),
+                "a decision row was labelled non-agent: {row}"
+            );
+            assert!(
+                row["rationale_summary"]
+                    .as_str()
+                    .is_some_and(|r| !r.is_empty()),
+                "every surfaced decision carries a non-empty rationale: {row}"
+            );
+            row["record_id"].as_str().expect("decision record_id")
+        })
+        .collect();
+    assert!(
+        !decision_ids.is_empty(),
+        "decisions section must be populated"
+    );
+    for row in parsed["observations"].as_array().expect("array") {
+        assert!(
+            !decision_ids.contains(&row["record_id"].as_str().unwrap_or("")),
+            "decision record leaked into observations: {row}"
+        );
+    }
+}
+
+/// The nested `verification_record` inlined on a verified acceptance
+/// criterion is a record too, and carries its own label.
+fn assert_nested_verification_record(parsed: &serde_json::Value) {
     let ac_1_id = project_stable_id(&["acceptance_criterion", "ac_1"]);
     let ac1 = parsed["acceptance_criteria"]
         .as_array()
@@ -655,4 +767,14 @@ fn query_task_labels_every_record_with_a_trust_class() {
         Some("verification_evidence"),
         "the inlined verification record carries the derived class: {ac1}"
     );
+}
+
+#[test]
+fn query_task_labels_every_record_with_a_trust_class() {
+    let (_temp, graph, task_id) = fixture_task_query_seeded();
+    let parsed = query_task_parsed(&graph, &task_id);
+    assert_trust_vocabulary(&parsed);
+    assert_section_classification(&parsed);
+    assert_decision_rows(&parsed);
+    assert_nested_verification_record(&parsed);
 }

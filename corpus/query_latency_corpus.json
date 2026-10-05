@@ -1,0 +1,13 @@
+{
+  "budget_p50_ms": 2000,
+  "corpus_name": "query-latency-reference",
+  "corpus_version": "1",
+  "description": "Pinned reference corpus for the cold query-latency budget (issue #255): a snapshot of Egregore's own src/query/ subsystem (51 Rust files) plus a minimal Cargo.toml, scanned with a pinned transaction time and repository identity. Representative of a small crate's code graph; the benchmark records the actual record count in every report so corpus size stays auditable even as the extractor evolves.",
+  "query_symbol": "RepositoryIndex",
+  "reference_machine_class": "GitHub Actions ubuntu-latest runner (the CI gate). Local runs on a 2-CPU sandbox VM measured p50 ~0.5s (graph) unloaded; expect wide margin on the reference class.",
+  "reference_record_count": 10344,
+  "repository_id_override": "query-latency-fixture",
+  "samples": 11,
+  "scan_time": "2026-01-01T00:00:00Z",
+  "source_dir": "query_latency_corpus"
+}

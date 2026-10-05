@@ -5,62 +5,116 @@ Query an existing graph JSONL for symbols, files, who last changed a symbol, sem
 ## Synopsis
 
 ```text
-eg query symbol   <NAME>  --graph <PATH>    [--at <COMMIT>] [--repo <SELECTOR>] [--package <NAME>] [--repo-path <DIR>] [--format json|text]
-eg query symbol   <NAME>  --data-dir <DIR>  [--at <COMMIT>] [--repo <SELECTOR>] [--package <NAME>] [--repo-path <DIR>] [--format json|text]
+eg query symbol   <NAME>  --graph <PATH>    [--at <COMMIT>] [--repo <SELECTOR>] [--package <NAME>] [--role all|production|test] [--repo-path <DIR>] [--format json|text]
+eg query symbol   <NAME>  --data-dir <DIR>  [--at <COMMIT>] [--repo <SELECTOR>] [--package <NAME>] [--role all|production|test] [--repo-path <DIR>] [--format json|text]
 eg query symbols  <PATTERN> --graph <PATH>  [--case-insensitive] [--repo <SELECTOR>] [--package <NAME>] [--format json|text]
 eg query symbols  <PATTERN> --data-dir <DIR> [--case-insensitive] [--repo <SELECTOR>] [--package <NAME>] [--format json|text]
-eg query file     <PATH>  --graph <PATH>    [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
-eg query file     <PATH>  --data-dir <DIR>  [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
+eg query file     <PATH>  --graph <PATH>    [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--role all|production|test] [--repo-path <DIR>] [--format json|text]
+eg query file     <PATH>  --data-dir <DIR>  [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--role all|production|test] [--repo-path <DIR>] [--format json|text]
 eg query who      <NAME>  --graph <PATH>    [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
 eg query who      <NAME>  --data-dir <DIR>  [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
 eg query drift            --graph <PATH>    [--limit N] [--repo <SELECTOR>] [--format json|text]
 eg query drift            --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--format json|text]
-eg query semantic <QUERY> --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--under <PREFIX>] [--format json|text]
+eg query semantic <QUERY> --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--under <PREFIX>] [--embed-model <MODEL>] [--format json|text]
 eg query semantic-context <QUERY> --data-dir <DIR> [--limit N] [--min-score F] [--repo <SELECTOR>]
 eg query semantic-memory <QUERY> --data-dir <DIR> [--limit N] [--repo <SELECTOR>] [--verified-only] [--format json|text]
+eg query semantic-memory <QUERY> --data-dir <DIR> [--collapse] [--collapse-mode auto|embedding-cosine|normalized-text] [--similarity-threshold F] [--limit N] [--repo <SELECTOR>] [--verified-only] [--format json|text]
+eg query similar <HANDLE> --data-dir <DIR>  [--limit N] [--format json|text]
 eg query implementors <TRAIT> --graph <PATH>   [--at <COMMIT>] [--as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
 eg query implementors <TRAIT> --data-dir <DIR> [--at <COMMIT>] [--as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
-eg query context  <NAME>  --graph <PATH>    [--repo-path <DIR>]
+eg query context  <NAME>  --graph <PATH>    [--repo-path <DIR>] [--max-records N] [--candidate <RECORD_ID|FILE:SPAN>] [--max-tokens N | --max-bytes N]
 eg query task     <HANDLE> --graph <PATH>
-eg query memory   <HANDLE> --graph <PATH>   [--verified-only]
-eg query failures <HANDLE> --graph <PATH>   [--repo <SELECTOR>]
-eg query change-impact <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--depth N]
+eg query task-ready       --graph <PATH>    [--format json|text]
+eg query task-ready       --data-dir <DIR>  [--format json|text]
+eg query task-overlap     --graph <PATH>    [--format json|text] [--status <LIST>]
+eg query task-overlap     --data-dir <DIR>  [--format json|text] [--status <LIST>]
+eg query task-evidence-gate <HANDLE> --graph <PATH>    [--format json|text]
+eg query task-evidence-gate <HANDLE> --data-dir <DIR>  [--format json|text]
+eg query task-list            --graph <PATH>    [--format json|text] [--status <FILTER>]
+eg query task-list            --data-dir <DIR>  [--format json|text] [--status <FILTER>]
+eg query memory   <HANDLE> --graph <PATH>   [--verified-only] [--max-records N]
+eg query failures <HANDLE> --graph <PATH>   [--repo <SELECTOR>] [--max-records N]
+eg query change-impact <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--depth N] [--max-records N]
 eg query transitive-callers <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--max-depth N] [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
 eg query transitive-callees <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--max-depth N] [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
+eg query tests <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--max-depth N] [--at <COMMIT> | --as-of <RFC3339>] [--daemon --data-dir <DIR>] [--format json|text]
+eg query diagram <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--depth N] [--max-nodes N] [--at <COMMIT> | --as-of <RFC3339>] [--format mermaid|dot|json|text]
 eg query deps     <HANDLE> --graph <PATH>   [--repo <SELECTOR>] [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
 eg query deltas   <BASE> <HEAD> --graph <PATH> [--repo <SELECTOR>]
 eg query coupling <PATH>  --graph <PATH>    [--repo <SELECTOR>] [--base <COMMIT> --head <COMMIT> | --at <COMMIT> | --as-of <RFC3339>] [--min-support N] [--limit N] [--format json|text]
 eg query lifeline <SYMBOL> --graph <PATH>   [--repo <SELECTOR>] [--format json|text]
+eg query origin   <SYMBOL> --graph <PATH>   [--repo <SELECTOR>] [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
 eg query public-api       --graph <PATH>   [--repo <SELECTOR>]
 eg query undocumented     --graph <PATH>   [--repo <SELECTOR>] [--limit N] [--include-private] [--format json|text]
 eg query ownership [PATH] --graph <PATH>   [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--threshold <PERCENT>] [--limit N] [--format json|text]
 eg query unreferenced     --graph <PATH>   [--repo <SELECTOR>]
+eg query dead-code        --graph <PATH>   [--repo <SELECTOR>] [--limit N] [--format json|text]
+eg query deprecated-symbols --graph <PATH> [--repo <SELECTOR>] [--file <PATH>] [--format json|text]
+eg query redaction-audit --graph <PATH> [--repo <SELECTOR>] [--format json|text]
+eg query blind-spots      --graph <PATH>   [--repo <SELECTOR>] [--kind symbol|file] [--format json|text]
+eg query track-record     --graph <PATH>   [--repo <SELECTOR>] [--format json|text]
+eg query trust-audit      --graph <PATH>   [--format json|text]
+eg query session <ID>     --graph <PATH>   [--format json|text]
 eg query cycles   [SCOPE] --graph <PATH>   [--repo <SELECTOR>] [--format json|text]
 
 eg query at       <PATH>:<LINE> --graph <PATH> [--at <COMMIT>] [--repo <SELECTOR>]
 eg query locate   <PATH>:<LINE> --graph <PATH> [--at <COMMIT> | --as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
+eg query locate   <PATH>:<LINE> --data-dir <DIR> [--daemon] [--at <COMMIT> | --as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
+eg query cost             --graph <PATH> [--task <HANDLE>] [--session <ID>] [--verification verified|failed] [--limit N] [--format json|text]
+eg query resolve  <RECORD_ID> --graph <PATH>    [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
+eg query resolve  <RECORD_ID> --data-dir <DIR>  [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
+eg query resolve  <RECORD_ID> --data-dir <DIR>  --daemon [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
 eg query manifest-deps    --graph <PATH>   [--name <CRATE>] [--repo <SELECTOR>] [--format json|text]
 eg query churn            --graph <PATH>    [--repo <SELECTOR>] [--limit N] [--format json|text]
 eg query churn            --data-dir <DIR>  [--repo <SELECTOR>] [--limit N] [--format json|text]
+eg query clones           --graph <PATH>    [--repo <SELECTOR>] [--min-size N] [--limit N] [--format json|text]
+eg query clones           --data-dir <DIR>  [--repo <SELECTOR>] [--min-size N] [--limit N] [--format json|text]
+eg query complexity       --graph <PATH>    [--repo <SELECTOR>] [--limit N] [--format json|text]
+eg query complexity       --data-dir <DIR>  [--repo <SELECTOR>] [--limit N] [--format json|text]
+eg query conflicts <SCOPE> --graph <PATH>   [--repo <SELECTOR>] [--include-resolved] [--format json|text]
+eg query conflicts <SCOPE> --data-dir <DIR> [--repo <SELECTOR>] [--include-resolved] [--format json|text]
 eg query producer-drift   --graph <PATH>   [--repo <SELECTOR>] [--format json|text]
+eg query since --tx-after <RFC3339> --graph <PATH> [--domain <DOMAIN>]... [--repo <SELECTOR>] [--limit N] [--format json|text]
+eg query since --tx-after <RFC3339> --data-dir <DIR> [--domain <DOMAIN>]... [--repo <SELECTOR>] [--limit N] [--format json|text]
 ```
 
 Evidence-backed audit subcommands have their own pages:
 
 - `eg query context` — evidence-backed context for a **symbol** (issue #38).
+- `eg query since` — transaction-time **delta feed** for resuming and swarm agents ([since.md](since.md), issue #197).
 - `eg query semantic-context` — **natural-language query → evidence-backed
   context** for the top-N semantic matches in one call
   ([semantic-search-guidance.md](semantic-search-guidance.md), issue #90).
 - `eg query task` — evidence for a **task** ([task-queries.md](task-queries.md), issue #48).
+- `eg query bench` — the latest captured criterion **benchmark run** for a
+  benchmark id, symbol, or file, with a citable handle
+  ([query-bench.md](query-bench.md), issue #237).
 - `eg query memory` — audit the evidence behind one **agent-authored memory
   claim** ([memory-audit.md](memory-audit.md), issue #64).
 - `eg query semantic-memory` — recall prior **agent memory by meaning** with
   provenance, trust-separated from code
   ([semantic-memory-recall.md](semantic-memory-recall.md), issue #91). Supports
   recall-time filtering of superseded and contradicted memories
-  ([recall-supersession.md](recall-supersession.md), issue #92).
+  ([recall-supersession.md](recall-supersession.md), issue #92), and
+  recall-time collapse of near-duplicate observations via `--collapse`
+  (issue #163).
 - `eg query failures` — **prior failed attempts** linked to a code or task
   handle ([failure-history.md](failure-history.md), issue #63).
+- `eg query failure-hotspots` — **code targets ranked by repeated
+  agent-failure density** across all imported runs, the store-wide complement
+  to `eg query failures` ([failure-hotspots.md](failure-hotspots.md), issue
+  #254).
+- `eg query belief-timeline` — the **agent-belief timeline for one code
+  target**: every live agent-authored `Observation`/`Decision`/`Failure`
+  citing it, oldest to newest, each carrying a machine-readable status
+  (`current` | `superseded` | `contradicted`) and its forward
+  record — statuses replayed from author-written supersession/contradiction
+  data, never a judgment about which belief is true
+  ([belief-timeline.md](belief-timeline.md), issue #235).
+- `eg query diagnostics` — **extractor-coverage-gap diagnostics** — the
+  extractor's self-declared blind spots (unsupported macro invocations,
+  unresolved call/dispatch stubs) as citable `Diagnostic` rows, one per gap,
+  with no scan or recompute ([diagnostics.md](diagnostics.md), issue #246).
 - `eg query change-impact` — **graph-derived impact leads** grouped by relation
   for a symbol or file handle, for blast-radius triage before editing
   ([change-impact.md](change-impact.md), issue #76).
@@ -69,6 +123,12 @@ Evidence-backed audit subcommands have their own pages:
   `--max-depth`, deterministic under cycles, honoring `--at`/`--as-of`
   temporal views, with `CALLS` resolution labels propagated along each path
   ([transitive-callers.md](transitive-callers.md), issue #139).
+- `eg query tests` — the **tests that exercise a symbol**: walks inbound
+  `CALLS` edges and reports every extractor-stamped test symbol that can reach
+  the target — `direct` when the test calls it itself, `transitive` when it
+  reaches it through other callers (non-test callers are traversed but never
+  reported). Rows are reachability leads, not proof of coverage
+  ([tests.md](tests.md), issue #126).
 - `eg query transitive-callees` — the **transitive outbound-reachable set** of a
   symbol (its callees/dependencies) with one concrete connecting dependency
   path per row, bounded by `--max-depth`, deterministic under cycles, honoring
@@ -76,6 +136,13 @@ Evidence-backed audit subcommands have their own pages:
   `CALLS` resolution labels propagated along each path — the outbound mirror of
   `eg query transitive-callers` ([transitive-callees.md](transitive-callees.md),
   issue #253).
+- `eg query diagram` — a symbol's **local call neighborhood as a citable
+  diagram** (Mermaid by default, or Graphviz DOT): direct callers, direct
+  callees, and the containing file/module over the closed
+  `CALLS`/`DEFINES`/`CONTAINS`/`IMPORTS` vocabulary, bounded by `--depth` and
+  `--max-nodes`, with explicit truncation diagnostics, deterministic ordering,
+  and a stable-record-ID legend — honoring `--at`/`--as-of` temporal views
+  ([diagram.md](diagram.md), issue #228).
 - `eg query deps` — the **direct outbound dependencies** of a symbol — what it
   calls, implements, imports, and references — labeled by edge type, with
   unresolved targets as an explicit category, honoring `--at`/`--as-of`
@@ -91,6 +158,12 @@ Evidence-backed audit subcommands have their own pages:
   history: introduced, each modifying commit with its drift record, removal
   and reintroduction, as newline-delimited JSON events
   ([lifeline.md](lifeline.md), issues #96, #215).
+- `eg query origin` — **the commit that introduced one symbol, plus the
+  project-graph PR / issue / review records whose `merge_commit_sha`
+  byte-equals that commit**: deterministic SHA-equality linking only, no
+  fuzzy matching, no live GitHub calls; degrades to a commit-only answer
+  with a `github_import_absent` note when the store has no GitHub import
+  ([origin.md](origin.md), issue #159).
 - `eg query public-api` — the crate's **externally-reachable public API
   surface** from recorded visibility and module containment, re-exports
   included, trapped `pub` items excluded
@@ -107,9 +180,65 @@ Evidence-backed audit subcommands have their own pages:
 - `eg query unreferenced` — symbols with **no recorded inbound reference
   edges**, as prune-triage leads with citable handles — never proof of dead
   code ([unreferenced.md](unreferenced.md), issue #113).
+- `eg query dead-code` — **dead-code triage candidates**: symbols with **zero
+  incoming `CALLS` edges** (plus one-hop dead clusters), excluding recognized
+  non-call entry points (`#[test]`/`#[bench]`, `#[no_mangle]`/`#[export_name]`,
+  binary `fn main`) and the externally-reachable public surface — every row
+  labeled `candidate` with the soundness boundary in the response metadata
+  ([dead-code.md](dead-code.md), issue #240).
+- `eg query deprecated-symbols` — **`#[deprecated]` symbols with their
+  still-resolvable `CALLS` call sites** as a migration worklist: verbatim
+  bounded `deprecated_since`/`deprecated_note` payloads, citable handles on every row and call
+  site, unresolved call edges cited under a coverage field, code facts only
+  ([deprecated-symbols.md](deprecated-symbols.md), issue #249).
+- `eg query redaction-audit` — resting-store **secret sweep**: every persisted
+  queryable string field across all domains (including code-graph symbol
+  bodies, which the write gate never sees) checked against known token
+  patterns plus a documented Shannon-entropy + length threshold;
+  advisory findings citing (`record_id`, `field_path`,
+  `classification`, `hash_prefix`) — never raw values; exit 3 on findings,
+  0 clean ([redaction-audit.md](redaction-audit.md), issue #244).
+- `eg query trust-audit` — producer **trust-class audit**: every persisted
+  node, edge, and tombstone checked against the node-kind → producer-trust-class
+  contract — deterministic code-fact kinds may only be written by deterministic
+  producers, agent-authored kinds only by agent producers; each violation is a
+  citable JSON record (`record_id`, `kind`, `producer_kind`, handle/span, the
+  broken rule), a clean store is an explicit `ok:true` with counted totals;
+  exit 0 either way ([trust-audit.md](trust-audit.md), issue #236).
+- `eg query blind-spots` — code targets (symbols and/or files) with **zero
+  cross-domain evidence** into the agent-memory, verification, or project
+  domains, ranked riskiest-first by inbound structural reference count —
+  the inverse question: which code does the graph know nothing about
+  ([blind-spots.md](blind-spots.md), issue #265).
+- `eg query track-record` (alias `eg query agents`) — **per-agent track
+  record** over the downstream fate of agent-authored observations:
+  observations written, promotion outcomes by terminal verdict,
+  superseded observations, and linked verification outcomes — deterministic,
+  trust-separated, every nonzero bucket citing resolvable handles
+  ([agent-track-record.md](agent-track-record.md), issue #262).
 - `eg query churn` — rank Git-tracked files by **change frequency** across the
   commit history captured by `eg scan-history`, for hotspot triage
   ([churn.md](churn.md), issue #128).
+- `eg query clones` — group **exact-duplicate Rust symbol bodies** into citable
+  clone classes by normalized-body content hash, so a fix or extraction lands
+  on every copy of duplicated logic ([clones.md](clones.md), issue #216).
+- `eg query complexity` — rank Rust callable symbols by **deterministic
+  structural complexity** (`1 + decision points` in the item's own body),
+  highest first, for hotspot triage. A source-derived code fact, never agent
+  confidence; the complexity half of the CodeScene-style hotspot pair whose
+  other half is churn ([complexity.md](complexity.md), issue #162).
+- `eg query conflicts` — surface **recorded contradicting observations on a
+  shared code target**: the pairs of agent claims, verification executions,
+  and user-context records joined by `CONTRADICTS` edges within a symbol /
+  file / subsystem scope. Code facts are never a party; superseded conflicts
+  are marked `resolved` and excluded unless `--include-resolved` is passed
+  ([conflicts.md](conflicts.md), issue #232).
+- `eg query session` — **retrace one agent session's** deterministic footprint
+  (files/symbols touched), agent-authored claims (observations, failures),
+  produced artifacts, and linked verification evidence, with a
+  `verification_status` derived only from verification-domain evidence — never
+  from agent prose. No footprint found is not evidence the run did nothing
+  ([session-retrospective.md](session-retrospective.md), issue #259).
 - `eg query producer-drift` — **producer-identity drift** between stored
   records and the running binary: which records a re-extraction with the
   installed grammar/extractor versions could change, grouped by producer
@@ -141,7 +270,7 @@ Most subcommands accept exactly one input source:
 - `--graph <PATH>` — read from a JSONL file produced by `eg scan` or `eg scan-history`.
 - `--data-dir <DIR>` — read from an embedded `AletheiaDB` store populated by `eg ingest --adapter embedded`. Requires the `embedded-aletheiadb` feature (enabled by default). Providing both `--graph` and `--data-dir` is an error.
 
-`eg query semantic`, `eg query semantic-context`, and `eg query semantic-memory` accept **only** `--data-dir`. The store must additionally have been populated with the `--embed` flag (`eg ingest --adapter embedded --data-dir <DIR> --embed`); a store without embeddings returns no results. `eg query semantic` returns only deterministic **code** hits; `eg query semantic-memory` returns only **agent-authored** memory hits — the two are never blended (issue #91). `eg query semantic-context` follows the `eg query context` no-match convention: on no semantic hit clearing `--min-score` it prints `{"ok":false,"error":{"code":"no_match",...}}` to **stdout** and exits `2`.
+`eg query semantic`, `eg query semantic-context`, `eg query semantic-memory`, and `eg query similar` accept **only** `--data-dir`. The store must additionally have been populated with the `--embed` flag (`eg ingest --adapter embedded --data-dir <DIR> --embed`); a store without embeddings returns no results — except `eg query semantic-memory --collapse`, which degrades to normalized-text equality clustering over every recallable memory record without loading a model (issue #163). `eg query semantic` returns only deterministic **code** hits; `eg query semantic-memory` returns only **agent-authored** memory hits — the two are never blended (issue #91). `eg query similar` returns only **code** hits (symbol/file nodes) ranked against the anchor's stored embedding — it never loads a model and never embeds the handle (issue #154). `eg query semantic-context` follows the `eg query context` no-match convention: on no semantic hit clearing `--min-score` it prints `{"ok":false,"error":{"code":"no_match",...}}` to **stdout** and exits `2`.
 
 ### Subsystem scoping — `eg query semantic --under <PREFIX>` (issue #198)
 
@@ -181,13 +310,166 @@ Outcomes:
   embeddings` message so an agent can tell "nothing under this prefix" apart from
   "this store has no semantic index".
 
+### Recall-time observation collapse — `eg query semantic-memory --collapse` (issue #163)
+
+`eg query semantic-memory --collapse` groups near-duplicate observations into
+clusters and returns **one representative row per cluster** instead of every
+row, so a session that re-learned the same lesson five times costs one row
+instead of five. The answer starts with a JSON envelope naming the requested
+mode, the actual mode, the similarity threshold, and the source/representative
+counts, followed by one compact row per representative.
+
+- **Flag**: `--collapse`. Without it the recall answer is byte-for-byte
+  unchanged (existing exit-2 contract preserved).
+- **Eligibility** (conservative): agent-authored observation-class records
+  (`Observation`/`Decision`/`Failure`) sharing the **same primary cited code
+  target** — the deterministically resolved `OBSERVES` / `MENTIONS_SYMBOL`
+  target, honoring both inline evidence links and standalone outgoing edges.
+  `as_of_commit` is part of the target identity, so the same record cited at
+  two commits never merges. A record citing no code target is always its own
+  singleton; an agent-authored observation never merges with a deterministic
+  code fact.
+- **Modes** (`--collapse-mode auto|embedding-cosine|normalized-text`):
+  `embedding-cosine` reuses the **stored** vectors (cosine similarity, no
+  re-embedding; a missing vector fails closed to singleton behavior);
+  `normalized-text` clusters on case-folded, whitespace-collapsed equality of
+  the stored (redacted) body text and never loads a model. `auto` (default)
+  picks `embedding-cosine` when the store has a loaded vector index and
+  degrades to `normalized-text` when the store was never embedded — so
+  `--collapse` works on a store without embeddings while plain recall still
+  exits 2 there. An unreadable (damaged) index is refused, not degraded over.
+- **Threshold** (`--similarity-threshold <F>`, `[0.0, 1.0]`, pinned default
+  `0.85`, echoed in the envelope; ignored by normalized-text equality).
+  Raising it monotonically refines the partition — clusters only split, never
+  merge; lowering it monotonically coarsens it.
+- **Representative order** (total): highest confidence, then earliest
+  `observed_at`, then lexicographically smallest record ID — the documented
+  total order for issue #163. The representative is a real stored record with
+  its provenance (`agent_id`, `session_id`, `observed_at`, `confidence`,
+  `evidence_links`) intact.
+- **Member fields**: every representative row carries `cluster_size`, the
+  complete `member_ids` list (representative first, the rest in
+  representative order), `cluster_observed_at_min` /
+  `cluster_observed_at_max`, and a `trust_spread` histogram over the #114
+  trust classes of its members. Collapsing happens **before** `--limit` is
+  applied, so the limit bounds representatives, not source rows.
+- **Read-only**: nothing is rewritten, merged, or deleted; the store
+  fingerprint is identical before and after.
+
+This is recall-time presentation, not persistence. It differs from the three
+adjacent dedupe surfaces on purpose:
+
+- **#94** (composition-health measurement) *measures* the store's
+  composition health and explicitly never collapses anything; `--collapse`
+  groups recalled observations without measuring the store.
+- **#131** (budget-fit packing) fits an answer to a token budget but
+  collapses nothing — a budget filled with restatements is still wasted
+  tokens; `--collapse` is the upstream pre-pass that makes a budgeted pack
+  go further, and it never enforces a token ceiling itself.
+- **#92** (supersession flagging via `--supersession` /
+  [recall-supersession.md](recall-supersession.md)) flags superseded or
+  contradicted records and filters *which* records are recalled;
+  `--collapse` groups the recalled ones. A cluster may mix trust classes
+  and reports that mix in `trust_spread`.
+
+### Similar-symbol search — `eg query similar <HANDLE>` (issue #154)
+
+`eg query similar` answers "which code does the same thing as this symbol?"
+— the reuse lookup. It ranks the symbol/file nodes most similar to an
+existing symbol by cosine similarity of **stored** embeddings and returns the
+top `--limit` (default 10) as `SemanticResult` rows.
+
+- **Handle**: a qualified symbol name (`nested::Widget::new`) or a
+  `record_id` (`codegraph:v1:…`). An exact `record_id` wins over a name; a
+  name shared by several live nodes is an error listing every candidate
+  `record_id` (`ambiguous_symbol_handle`) — never a guess.
+- **No model, no re-scan**: the anchor's already-stored embedding is the
+  query vector. The lane never loads an embedding model, never touches the
+  network, and never re-embeds the corpus — so there is no model-identity
+  gate (unlike `eg query semantic`, issue #104).
+- **Never self**: the anchor is always excluded from its own answer.
+- **Floor**: only candidates scoring strictly above `0.0` cosine count as
+  similar; orthogonal or opposed vectors are not reuse candidates.
+- **Order** (total, issue #199): score descending, then `record_id`
+  ascending — byte-stable across repeated runs on an unchanged store.
+- **Rows** follow the semantic-result citation contract: `record_id`,
+  `name`, `repo_relative_path`, `span`, `score` (plus repository
+  attribution and the confidence band).
+- **Exit codes**: `0` — at least one similar node; `1` — malformed,
+  unresolvable, or ambiguous handle, anchor without a stored embedding
+  (`anchor_not_embedded`), or a store ingested without `--embed`
+  (`semantic_index_absent`); `2` — the anchor resolved and is embedded, but
+  no other node scored above the floor (`no_similar_matches`, stderr only,
+  stdout empty).
+
+```text
+eg query similar nested::Widget::new --data-dir .egregore --limit 5
+```
+
+## Capability manifest (`eg query lanes`, issue #251)
+
+`eg query lanes [--format json|text]` emits the machine-readable capability
+manifest: a deterministic JSON catalog of every public query lane (stable id,
+one-line purpose, required inputs, store mode, answer trust classes,
+citation-handle flag, freshness semantics). Local and pure — no network, no
+ingested store, no project config. See [query-lanes.md](query-lanes.md).
+
 ## Exit codes
 
 | Code | Meaning |
 |------|---------|
 | `0` | At least one result was found and printed. |
 | `1` | An error occurred (missing file, malformed JSONL, ambiguous commit prefix, unknown/ambiguous repository selector, ambiguous unscoped repository collision). A single-line message is written to stderr. No partial JSON appears on stdout. |
-| `2` | No match found. A single-line message is written to stderr. Stdout is empty. |
+| `2` | No match found. A single-line message is written to stderr. Stdout is empty. (Exception: `eg query resolve` reports a dangling handle as a structured `dangling_handle` JSON envelope on stdout — see the read-back citation contract below.) |
+
+## Read-back citation contract (`eg query resolve`, issue #160)
+
+Query lanes that emit `record_id` handles (`query symbol`, `query file`,
+`query semantic`, …) make a promise: the handle dereferences back to its
+record. `eg query resolve` is the read half of that promise. It is read-only:
+it never writes the store, never heals a handle, and never guesses.
+
+### Verdicts (closed vocabulary)
+
+| Verdict | Meaning |
+|---------|---------|
+| `valid` | The handle names a live record. With no temporal selector the answer's `repo_relative_path` and `span` are byte-identical to the cited row at the same commit. |
+| `drifted` | The record exists at the pinned `--at`/`--as-of` snapshot but its cited coordinates or content differ from the current view — or it is gone there. Still a successful dereference: exit 0, with `current_repo_relative_path` / `current_span` disclosing where it lives now (absent when it is gone). |
+| `dangling` | No record matches the id in the requested view. A structured `{"ok": false, "error": {"code": "dangling_handle", …}}` envelope on stdout, exit 2 — never a silent empty answer, never a fuzzy nearest-match guess. |
+
+### What `drifted` compares
+
+The verdict compares the identity-adjacent stored fields —
+`repo_relative_path`, `span`, `signature`, `content_signature` — between the
+pinned snapshot's record and the current view's record for the same id. The
+stable id itself is deliberately excluded: symbol identity
+([ADR-0004](../adr/0004-symbol-identity.md)) excludes span and content
+precisely so an id survives coordinate/content changes, so comparing the
+recomputed id would always agree with itself and could never report drift.
+
+### Scope and errors
+
+- Codegraph ids only (`codegraph:v<N>:<suffix>`). A malformed handle exits 1
+  with a `malformed_handle` envelope; a well-formed handle from another id
+  domain (`agent_memory:v1:…`, …) exits 1 with `unsupported_handle_domain`
+  — refused explicitly, never misread as dangling. Out of scope: fuzzy
+  recovery, migration/auto-healing, cross-store identity recovery.
+- `--at` and `--as-of` are mutually exclusive; an ambiguous commit prefix or
+  a malformed RFC 3339 instant exits 1. Both selectors reuse the
+  `query symbol` temporal rules: the prefix-ambiguity check is
+  repository-wide (never a guess), and `--as-of` picks the greatest valid
+  time at or before the instant, skipping records without a parseable valid
+  time.
+- `--daemon` resolves through the daemon's `resolve_record` query verb, which
+  computes the verdict server-side with the same selection and tombstone
+  rules as the local lanes — including `--at`/`--as-of`. No client-side
+  store copy is needed.
+- Forget tombstones suppress the current view unless the record carries a
+  temporal block (issue #231); repository-eviction tombstones suppress
+  everywhere, including temporal snapshots (issue #472).
+- The answer is deterministic: the same invocation against the same store
+  bytes produces byte-identical output (covered by a round-trip test in
+  `tests/integration/record_resolve.rs`).
 
 ## Output format
 
@@ -198,6 +480,154 @@ One JSON object per line (JSONL). Field names are stable across releases. Machin
 ### `--format text`
 
 One human-readable line per result for terminal use. The exact format is not stable and must not be parsed by scripts.
+
+---
+
+## Answer completeness signal (issue #121)
+
+Every `eg query` JSON answer carries a stable completeness signal on each
+result row, so a machine consumer can tell a complete answer from one a cap or
+a single-winner selection silently truncated.
+
+| Field | Type | Always present | Description |
+|-------|------|----------------|-------------|
+| `result_complete` | boolean | yes | `true` when the printed row set is the complete match set — no cap or selection hid further rows. |
+| `total_matches` | number | only when narrowed | Candidate count before the cap or selection narrowed the set. |
+| `applied_limit` | number | only when narrowed | The cap that narrowed the set: the `--limit` value, or `1` for a single-winner selection. |
+
+The rule is uniform across lanes: `result_complete` is `true` exactly when the
+printed rows ARE the full match set. `total_matches` and `applied_limit` are
+reported if and only if a cap or selection actually narrowed the set — their
+presence is equivalent to `result_complete == false`. When the answer is
+complete they are omitted; `result_complete` is the authoritative "more
+available" signal, not the absence of the totals.
+
+Lane semantics:
+
+- `query drift --limit N`, `query semantic --limit N`, `query similar
+  --limit N`: top-N cuts. `total_matches` counts the candidates before the
+  cut (after repository scoping), `applied_limit` echoes the effective limit.
+- `query symbol --at`, `query symbol --as-of`: single-winner selections. One
+  row is kept from `total_matches` candidates; `applied_limit` is `1`.
+- `query file`, uncapped `query symbol`, `query symbols`: exhaustive
+  listings — `result_complete: true`, totals omitted.
+
+The exit-2 no-match path prints no JSON answer at all (a single-line message
+goes to stderr), so it cannot contradict the signal: a no-match outcome is
+definitionally complete with zero total matches.
+
+Over `--daemon`, the signal is stamped client-side from the pre-truncate pool
+the daemon reports in the verb `page` envelope. A daemon predating this
+signal reports no pool — then the rows carry no stamp rather than a guess.
+
+Field names are stable across releases. Machine consumers should depend only
+on the fields documented here; additional fields may be added later.
+
+---
+
+## Record budget (`--max-records`, issue #211)
+
+The composite evidence answers — `eg query context`, `eg query memory`,
+`eg query failures`, and `eg query change-impact` — accept `--max-records N`
+to cap the total number of evidence records across every section of the
+answer. This is a record budget, not a token budget: it bounds rows, and it
+never re-ranks or paginates.
+
+**Allocation.** Sections fill sequentially in envelope order (the order the
+sections appear in the JSON envelope). Each section keeps the top-ranked
+prefix of its already-deterministic ordering — `min(section length, remaining
+budget)` — and the remainder flows to the next section. For `N >= 1`, an
+evidence-bearing answer keeps at least one record; for `N = 0` every section
+is emptied but the omissions are still reported.
+
+**Omission accounting.** A section that keeps everything renders as the bare
+record array, byte-identical to the un-budgeted answer. A section that loses
+records renders as an object with the counts:
+
+```json
+"source_facts": {
+  "returned": 2,
+  "total": 5,
+  "records": [ "...", "..." ]
+}
+```
+
+`returned` is the kept prefix length, `total` is the section's natural
+length, and `records` holds the kept rows. No record is ever silently
+dropped. A naturally-empty section keeps its old shape (omitted when the
+field is `skip_serializing_if`-gated); a non-empty section budgeted to zero
+renders `{"returned": 0, "total": N, "records": []}`, which is
+distinguishable from true absence.
+
+**Envelope counts.** For envelopes that already carry `page` (`memory`,
+`failures`, `change-impact`), the top-level `page.returned` is the number of
+records kept across all sections, and `page.has_more` is `true` when the
+budget omitted anything. (`context` has no `page` envelope; its sections
+report their own `returned`/`total`.) Budgeting never changes found/no-match
+status or exit codes: a match with all records budgeted away still exits `0`,
+and a no-match still exits `2`.
+
+Omitted for brevity: `eg query change-impact` reports its separate per-group
+row cap in the `truncations` ledger independently of the record budget; the
+budget divides what that cap leaves.
+
+---
+
+## Store coverage (`store_coverage`, issue #196)
+
+The composite evidence answers — `eg query context` and `eg query task` —
+carry a top-level `store_coverage` map on every successful answer:
+
+```json
+"store_coverage": {
+  "code_graph": true,
+  "agent_memory": false,
+  "project": false,
+  "artifact": false,
+  "verification": false
+}
+```
+
+Each boolean states whether the store contains at least one record in that
+trust-section domain. It resolves the ambiguity of an empty section: an
+empty `observations` array with `"agent_memory": false` means the
+agent-memory domain was never ingested into this store (domain-absent);
+the same empty array with `"agent_memory": true` means the domain is present
+but this entity genuinely has no linked records there (entity-absent).
+
+Shortest workflow that produces the signal:
+
+```sh
+eg scan ./my-repo --out graph.jsonl
+eg query context my_symbol --graph graph.jsonl
+```
+
+A scan-only store reports `code_graph: true` and every other domain
+`false` — that is the expected, honest shape of a structural-only store, not
+a failure. Populate the other domains (`eg write observation`, `eg write
+artifact`, `eg write verification`, `eg import-local-tasks`, …) and the
+flags flip as each domain's first record lands.
+
+Interpretation rules:
+
+- `false` + empty section → "domain not present in this store". Never read it
+  as "untested", "no failures", "safe", or "correct" — the signal is
+  structural only. A store with no verification records cannot tell you
+  anything about whether the code was tested; it tells you only that no
+  verification records were ingested.
+- `true` + empty section → "domain present, no records for this entity".
+- The flags are tombstone-naive: they answer "was this domain ever ingested",
+  not "does a live record exist right now". Forgetting every record of a
+  domain does not flip its flag back to `false`.
+- Error envelopes (`no_match`, `ambiguous_handle`, `unsupported_handle`)
+  never carry `store_coverage` — the signal exists only on successful
+  answers.
+- Five consecutive queries over an unchanged store render byte-identical
+  `store_coverage` within each lane. The CLI (`--graph` / `--data-dir`)
+  serializes the map in the fixed declaration order (`code_graph`,
+  `agent_memory`, `project`, `artifact`, `verification`); the MCP and daemon
+  lanes serialize the same five values with alphabetical key order. The
+  boolean values are identical across all lanes for the same store.
 
 ---
 
@@ -354,7 +784,12 @@ Several **single-domain** lanes already emit a top-level `trust` field with a
 | `change-impact` | `impact_lead` | the row is a lead to inspect, not a fact |
 | `deps`, `transitive-callees` | `dependency_lead` | ” |
 | `path`, `transitive-callers` | `reachability_lead` | ” |
+| `tests` | `reachability_lead` | the row is a test symbol with a `CALLS` path to the target — a lead to run, not proof the test covers it |
 | `coupling` | `historical_co_change_lead` | ” |
+| `task-ready` | `eligibility_lead` | the row is a dispatch-eligibility lead — every declared dependency is `closed_completed` — not a safety or correctness claim |
+| `task-overlap` | `inspection_lead` | the row is a footprint-overlap inspection lead — two in-flight tasks name the same code-graph handle(s) — never proof of edit conflict, correctness, or verification |
+| `task-evidence-gate` | `evidence_gate` | the row is a completion-gating lead — every acceptance criterion has a live passing verification record — not a claim the task is correct, safe, or complete |
+| `task-list` | `status_lead` | the row is an imported-intent status lead — the source system says this work is in this status — never proof the code changed, the criteria hold, or any verification passed |
 
 Those lanes return rows from **one** domain, so there is nothing to
 disambiguate: their `trust` names the kind of answer the whole lane gives. The
@@ -440,6 +875,55 @@ Egregore guarantees cross-platform and cross-producer byte-for-byte stable scans
 
 ---
 
+## Result ordering contract (issue #199)
+
+The sections above pin determinism on the **write** side. This section pins it
+on the **read** side: the same query against an unchanged store returns rows in
+a stable, reproducible order on every run, on every machine, so answers can be
+cached, asserted on in regression tests, and reproduced elsewhere without the
+ranking quietly reshuffling.
+
+**The guarantee.** Every query lane emits its rows in a documented canonical
+total order, and the order is decided **before** any `--limit` truncation — so
+both the row sequence and the set of rows kept at the truncation boundary are
+stable:
+
+| Lane | Canonical order (total — no two distinct rows ever swap) |
+|---|---|
+| `eg query semantic`, `semantic-memory`, `semantic-context` (embedded and `--daemon`) | score **descending**, then `record_id` **ascending** |
+| `eg query symbol` (pattern) | `repo_relative_path`, then span start line, then `record_id` |
+| `eg query symbol --at` | `record_id` |
+| `eg query file` | span start line, then `record_id` |
+| `eg query drift` | drift score **descending**, then `record_id` |
+
+**The tiebreaker is observable.** When two or more rows share an identical
+score, the secondary key (`record_id`, a stable content-derived ID printed on
+every row) decides their order — you can see the tiebreak in the output, and
+re-running the query reproduces it exactly. Float scores compare with
+`total_cmp`, so even NaN takes a deterministic position instead of collapsing
+to "equal".
+
+**What is (and is not) promised.**
+
+- Re-running the identical invocation against an **unchanged store** yields
+  byte-identical ordered `record_id` lists — 20/20 on the fixture corpus.
+  This covers the semantic path too: the vector index is approximate (HNSW),
+  and equal-score hits arrive in an unstable raw order, so the canonical
+  sort is applied to the full candidate pool *before* the top-N cut.
+- The contract governs **order stability, not ranking quality**: whether the
+  ranking is *good* is calibrated separately (issues #58/#106). A model
+  change is expected to change scores (issues #167/#104).
+- The contract assumes an **unchanged store snapshot** (concurrent-writer
+  visibility is owned by #197) and covers whatever subset `--limit` /
+  `--max-records` returns — the subset itself is stably ordered.
+- **Across independently built stores** (same JSONL ingested twice, or two
+  OS targets): identical score multisets produce identical orders. The
+  approximate vector index may, in rare cases, return a marginally different
+  candidate *set* at the truncation boundary across independent builds;
+  that residual ANN divergence is explicitly out of contract.
+
+---
+
 ## Owning-package scope (`--package`, issue #117)
 
 Every code fact carries `crate_attribution` — the owning Cargo package's name
@@ -476,6 +960,72 @@ Attribution is nearest-enclosing-manifest **directory containment**, never proof
 the file is compiled into that package. Full contract, including the closed
 unattributed-reason set and every documented limit, in
 [`crate-attribution.md`](crate-attribution.md).
+
+## Test-vs-production role (`--role`, issue #238)
+
+Every Rust `Symbol` and `File` record carries a deterministic `role` —
+`"test"` or `"production"` — derived from source signals only:
+
+- a `#[test]`-family attribute (`#[test]`, `#[tokio::test]`, `#[bench]`, …),
+- lexical membership under a `#[cfg(test)]` module (inline or out-of-line),
+- a file rooted under `tests/` or `benches/`.
+
+Anything else is production. The role is **additive metadata, never an identity
+input**: it does not contribute to stable record IDs.
+
+`eg query symbol` and `eg query file` accept `--role all|production|test`
+(default `all`) and expose `role` on every row in JSON and text. `--role all`
+returns every row, including records from graphs that predate issue #238 whose
+role is unknown; `--role production` / `--role test` keep only rows carrying
+that explicit role. An absent `role` key means the record predates issue #238
+— unknown, never fabricated as `"production"`. In `--format text` an absent
+field prints nothing.
+
+A scoped query that matches nothing exits **2** (`no match found`); the filter
+is order-preserving, so a scoped answer is always a subsequence of the
+unscoped one. On `--daemon` the filter applies client-side. Full contract,
+including the closed signal set and the out-of-line propagation rule, in
+[`test-production-roles.md`](test-production-roles.md).
+
+## Conditional-compilation gates (`cfg`, issue #190)
+
+Every Rust `Symbol`, `Module`, and `File` record carries a deterministic `cfg`
+gate chain — the normalized `#[cfg(...)]` / `#[cfg_attr(...)]` predicates
+lexically gating the item — derived from source signals only. Each entry is the
+predicate **exactly as written** (interior whitespace collapsed), e.g.
+`"feature = \"embedded-aletheiadb\""`; predicates are recorded, never
+evaluated, satisfied, or expanded.
+
+Composition rule — outermost gate first:
+1. the file's `#![cfg(...)]` / `#![cfg_attr(...)]` inner attributes,
+2. every enclosing gated item or module, outermost first (an inline module's
+   own `#![cfg(...)]` body attributes gate the module, so they travel with
+   its outer attributes),
+3. the item's own `#[cfg(...)]` / `#[cfg_attr(...)]` attributes, in source order.
+
+The item's effective compilation gate is the conjunction of the `#[cfg(...)]`
+entries. A `#[cfg_attr(predicate, …)]` entry records the predicate gating that
+attribute's application — not the item's compilation — so
+conditional-compilation facts are never silently dropped.
+
+Out-of-line modules: a `#[cfg(...)] mod x;` declaration's full chain is
+prepended to every `File` / `Symbol` / `Module` record of the target file by a
+repo-wide pass (transitive — gates accumulate through chains of gated
+declarations). If any declaration loading the file is ungated, the file
+inherits no gates: it compiles without them. When several gated declarations
+load one file, the target inherits the union of their chains.
+
+The chain is **additive metadata, never an identity input**: it does not
+contribute to stable record IDs. An absent `cfg` key means the record predates
+issue #190 or the item is ungated — unknown-or-absent, never a fabricated
+gate. In `--format text` an absent field prints nothing; a present chain
+renders as `cfg: <gate> && <gate>` (the JSON array is authoritative).
+
+`eg query symbol` and `eg query file` expose `cfg` on every row in JSON and
+text, including the `--at` / `--as-of` temporal lanes and daemon records.
+Only the AST is read: comments, string literals, and doc text never mint
+gates. Out of scope: evaluating feature sets or target semantics, Cargo
+feature graphs, temporal cfg diffs, and cfg linting.
 
 ## Repository scope (`--repo`, issue #67)
 
@@ -579,8 +1129,8 @@ observations, project state, artifacts, verification evidence, semantic drift,
 runtime error signatures, and unresolved evidence links.
 
 ```text
-eg query subsystem <PREFIX> --graph <PATH> [--format json|text]
-eg query subsystem <PREFIX> --data-dir <DIR> [--format json|text]
+eg query subsystem <PREFIX> --graph <PATH> [--format json|text] [--agent <AGENT_ID>] [--not-agent <AGENT_ID>]
+eg query subsystem <PREFIX> --data-dir <DIR> [--format json|text] [--agent <AGENT_ID>] [--not-agent <AGENT_ID>]
 ```
 
 ### Arguments
@@ -591,6 +1141,8 @@ eg query subsystem <PREFIX> --data-dir <DIR> [--format json|text]
 | `--graph <PATH>` | one of `--graph` / `--data-dir` | Graph JSONL produced by `eg scan`, `eg scan-history`, `eg scan-logs`, and/or `eg resolve-frames`, concatenated. |
 | `--data-dir <DIR>` | one of `--graph` / `--data-dir` | Embedded store directory (transaction-time-current view). |
 | `--format` | no | `json` (default) or `text`. |
+| `--agent <AGENT_ID>` | no | Restrict the `observations` section to memories authored by this agent identity (see "Author scoping"). |
+| `--not-agent <AGENT_ID>` | no | Exclude observations authored by this agent identity (see "Author scoping"). |
 
 ### Prefix matching
 
@@ -613,6 +1165,50 @@ The JSON envelope carries `ok`, `prefix`, and the trust-separated sections
 `verification_evidence`, `semantic_drift`, `log_signatures`, `unresolved`, and
 `excluded`. `log_signatures` and `unresolved` are **always present** (`[]` when
 empty); `topology_edges` and `excluded` are omitted when empty.
+
+### Policy (issue #169)
+
+Policy is **not folded** into this lane. The #169 policy fold is anchored to a
+single symbol/file identity (scope auto-derived from the anchor's own facts);
+a subsystem answer aggregates a whole subtree, so there is no single anchor to
+attribute policy to. To see the policy governing a specific symbol under the
+prefix, call `eg query context <NAME>` instead. See
+[`docs/cli/policy-context.md`](policy-context.md) for the lane matrix.
+
+### Author scoping (issue #195)
+
+`--agent <AGENT_ID>` restricts the `observations` section to memories authored
+by that agent; `--not-agent <AGENT_ID>` excludes that agent's memories. Both
+may be given (an observation must satisfy both; when both name the same agent
+the exclusion wins). With no selector the answer is unscoped (default behavior
+unchanged).
+
+- Each observation row already carries its author as first-class fields
+  **`agent_id`** and **`session_id`** — never buried inside raw provenance.
+- The selector applies to the agent-authored `observations` section only.
+  Deterministic code-graph facts (the `source_facts` section) carry no
+  `agent_id` and are never presented as author-scoped memory.
+- Matching is exact, case-sensitive equality on the `agent_id` handle.
+- When the selector is active the envelope carries an `author_scope` section
+  documenting the applied filter, so an empty `observations` array is an
+  explicit empty result — not an error and not a silent fallback to unscoped
+  recall:
+
+```json
+{
+  "author_scope": {
+    "agent": "agent_9",
+    "author_field": "agent_id",
+    "observations_matched": 0,
+    "observations_total": 3
+  }
+}
+```
+
+`author_field` names the observation field carrying the author; `agent` /
+`not_agent` echo the selectors spelled on the command line
+(`--agent` / `--not-agent`); `observations_matched` / `observations_total`
+count the section after / before the filter.
 
 ### `log_signatures` (issue #325)
 
@@ -668,6 +1264,167 @@ error's neighborhood.
 
 ---
 
+## eg query context
+
+Evidence-backed context for a **symbol** (issue #38), trust-separated into
+`source_facts`, `topology_edges`, `observations`, `project_state`, `artifacts`,
+`verification_evidence`, `drift_history`, and `unresolved` (see
+[The context bundle](#the-context-bundle)).
+
+### Policy section (issue #169)
+
+Every symbol context also folds active approved user-context policy into a
+`policy` section: the durable `Preference` / `WorkflowRule` /
+`NamingDecision` / `Constraint` records whose scope applies to the symbol's
+own facts (owning repository, repo-relative path, language) — no
+caller-supplied filter. Each row cites its approval-decision handle and
+activation time; pending, rejected, deferred, superseded, and revoked
+records never surface. Always present, possibly empty. See
+[`docs/cli/policy-context.md`](policy-context.md) for the scope semantics,
+lane matrix, and the offline approve-then-ask workflow.
+
+```text
+eg query context <NAME> --graph <PATH> [--repo-path <DIR>] [--max-records N] [--candidate <RECORD_ID|FILE:SPAN>] [--max-tokens N | --max-bytes N]
+```
+
+### Budgeted context packs (issue #131)
+
+Pass `--max-tokens N` or `--max-bytes N` to fit the context bundle into a
+caller-supplied size ceiling instead of printing the full answer. The pack is
+assembled from the same resolved context, trust index, supersession, corpus,
+freshness, and section builders as the un-budgeted answer — only the
+rendering changes.
+
+- `--max-tokens N` counts with the pinned deterministic `word-punct-v1`
+  method (issue #84); `--max-bytes N` counts the rendered JSON's UTF-8
+  bytes. The two are mutually exclusive — pick one ceiling.
+- Both are mutually exclusive with `--max-records`: a pack's sections are
+  bare arrays (see below), so the #211 truncated-section accounting cannot
+  render inside one, and exclusivity avoids a new silent-omission class.
+- The pack prints as **compact** JSON: the budget counts rendered bytes, so
+  the printed text is exactly what was measured — stdout carries no
+  trailing newline, so `budget.measured` in byte mode equals the stdout
+  byte length.
+
+The envelope keeps the un-budgeted answer's shape — `ok`, `symbol_name`,
+`freshness`, the ten sections as bare arrays (an empty `topology_edges`
+section is omitted, exactly as the un-budgeted answer omits it),
+`excluded`, `corpus_mode`/`corpus_mode_source`/`corpus_disclaimer`,
+`store_coverage` — plus a `budget` accounting block:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `budget.mode` | string | `"tokens"` or `"bytes"`. |
+| `budget.budget` | number | The caller-supplied ceiling. |
+| `budget.measured` | number | Measured size of the printed pack in the budget's units. Never exceeds `budget`. |
+| `budget.result_complete` | boolean | `true` when nothing was shed. |
+| `budget.token_count_method` | string | `"word-punct-v1"` in token mode; absent in byte mode. |
+| `budget.drop_account` | object | Present only when `result_complete` is `false`. |
+
+The drop account is explicit, never silent:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `drop_account.dropped_count` | number | How many ROWS the budget shed (not unique IDs — see below). |
+| `drop_account.dropped_record_ids` | string[] | The shed rows' stable IDs, lowest-priority first (worst-first shed order). |
+
+**Drop-account identity.** `dropped_count` counts shed rows. Each entry in
+`dropped_record_ids` is the shed row's stable ID. For unresolved rows the ID
+is the `source_record_id`: this may duplicate the ID of a kept source-fact
+row, because the unresolved entry is a separate row (a dangling reference)
+from the source fact itself. The duplication is honest — the source fact was
+kept, the unresolved reference was shed.
+
+**AC8 projection.** The pack projects rows for citability, not raw payloads.
+The raw `text` field (transcript/command-output/patch body) is stripped from
+observation rows in the pack. The summary, provenance handles, and evidence
+links remain — they are the citable handles. This projection applies to the
+budgeted pack only; the un-budgeted `query context` output is unchanged. A
+complete pack (nothing shed) is therefore identical to the un-budgeted
+answer's sections except for the AC8 `text` redaction.
+
+**Fill priority (deterministic).** Records shed worst-first; a record is
+never split — rows are kept or dropped whole, in their original section
+order. The assembler evaluates every nonempty prefix in priority order and
+keeps the largest one that fits. Pack size is not monotonic in the prefix
+length (shedding a row removes its bytes but adds its ID to the drop
+account), so greedy shedding could miss a fitting pack; exhaustive prefix
+evaluation cannot. Priority is a total order:
+
+1. Trust class, highest first: `source_derived`, `verification_evidence`,
+   `agent_verified`, `project_state`, `artifact`, `runtime_observation`,
+   `agent_unverified`, `agent_contradicted`, `other` (the stable wire
+   strings from the `trust` field). Deterministic code
+   facts always outrank every agent-authored class, so budget pressure can
+   never promote a guess into source truth.
+2. Within one trust class, section relevance: source facts, topology edges,
+   verification evidence, decisions, project state, artifacts, drift
+   history, unresolved references, policy, and agent observations last.
+3. Ties break on record ID, then original row position.
+
+**Complete pack.** When everything fits, `result_complete` is `true`, there
+is no `drop_account`, and every section is identical to the un-budgeted
+answer's — the pack is the same answer plus the `budget` block.
+
+**Too-small budget.** A budget that cannot hold even one whole record —
+measured against the fixed envelope plus the single highest-priority
+record — fails instead of returning a half-record. The command prints a
+stable machine-readable envelope to stdout and exits `3`:
+
+```json
+{"ok":false,"error":{"code":"budget_too_small","symbol_name":"Widget",
+ "budget_mode":"tokens","budget":1,"first_record_cost":183,
+ "message":"budget of 1 tokens cannot hold even one whole record; the smallest possible pack costs 183 tokens"}}
+```
+
+`first_record_cost` is the minimum budget that could succeed. The envelope
+is deterministic: identical inputs produce identical bytes.
+
+Budgeted queries are read-only — the graph file is never modified — and
+deterministic: five runs of the same query produce byte-identical output.
+
+### Ambiguous names (issue #192)
+
+A name shared by two or more **distinct** symbols (e.g. `Foo::new` and
+`Bar::new`) is never merged into one blended answer — that would attribute one
+symbol's history, decisions, and evidence to another. Instead the command
+prints a disambiguation envelope to stdout and exits `1`:
+
+```json
+{"ok":false,"error":{"code":"ambiguous_symbol","symbol_name":"new",
+ "message":"the name matches more than one distinct symbol; re-run with --candidate <record_id|file:span handle>",
+ "candidates":[
+   {"record_id":"codegraph:v4:...","symbol_name":"new",
+    "repo_relative_path":"src/bar.rs","span":{...},
+    "file_span_handle":"src/bar.rs:30-35"},
+   {"record_id":"codegraph:v4:...","symbol_name":"new",
+    "repo_relative_path":"src/foo.rs","span":{...},
+    "file_span_handle":"src/foo.rs:10-15"}]}}
+```
+
+One entry per distinct symbol identity (distinct stable record IDs, ADR 0004),
+deterministically ordered by repo-relative path, then span start line, then
+record ID. Tombstoned symbols and historical (temporal) snapshots follow the
+usual current-state vs history rules — only the identities a plain recall
+would have merged count toward ambiguity.
+
+Re-run with `--candidate` holding one candidate's `record_id` or
+`file:span` handle (`path:start_line-end_line`) for context scoped to exactly
+that symbol — zero records belonging to a sibling symbol appear in any
+section. An unresolvable `--candidate` is a `no_match` (exit `2`), never a
+guess.
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Context printed (single match, or `--candidate` re-query). |
+| `1` | `ambiguous_symbol` — the name matches more than one distinct symbol; the envelope lists the candidates. |
+| `2` | `no_match` — no symbol carries the name (or the `--candidate` selector resolved to nothing). |
+| `3` | `budget_too_small` — the `--max-tokens`/`--max-bytes` budget cannot hold even one whole record; the envelope carries `first_record_cost`. |
+
+---
+
 ## eg query symbol
 
 Find `Symbol` nodes by name.
@@ -684,6 +1441,7 @@ eg query symbol <NAME> --graph <PATH> [--at <COMMIT>] [--format json|text]
 | `--graph <PATH>` | yes | Graph JSONL produced by `eg scan` or `eg scan-history`. |
 | `--at <COMMIT>` | no | Restrict to the single best record whose `git_commit` starts with this SHA prefix. Exit `1` with `error: ambiguous commit prefix` when the prefix matches more than one distinct commit SHA. Requires a history graph. |
 | `--repo <SELECTOR>` | no | Restrict results to one repository (see [Repository scope](#repository-scope---repo-issue-67)). |
+| `--role <ROLE>` | no | `all` (default), `production`, or `test`: keep only rows whose test-vs-production role matches (see [Test-vs-production role](#test-vs-production-role---role-issue-238)). |
 | `--format` | no | `json` (default) or `text`. |
 
 ### JSON output fields
@@ -699,9 +1457,13 @@ eg query symbol <NAME> --graph <PATH> [--at <COMMIT>] [--format json|text]
 | `visibility` | string | Rust declaration-surface symbols | Declaration visibility class from the closed set `public` / `crate` / `restricted` / `private`, derived from the source `pub` modifier (`pub(in path)` and `pub(super)` map to `restricted`; `pub(self)` and no modifier map to `private`). Present on Rust `fn` / method / `struct` / `enum` / `trait` / type-alias / `const` / `static` symbols extracted at issue #124 or later; absent on `impl` symbols and records from older graphs. |
 | `signature` | string | Rust declaration-surface symbols | Normalized declaration header: item keyword through the end of the parameter list / return type / where-clause for callables (or the item header for type-defining items), body excluded, interior whitespace collapsed deterministically. Same presence rules as `visibility`. |
 | `doc` | string | when the item has a doc comment | Doc-comment text (`///` or `/** */`) after redaction policy v1 (see [`docs/schema/redaction.md`](../schema/redaction.md)); a secret-shaped value is replaced by a `<REDACTED:class:hash>` marker. Omitted entirely when the item has no doc comment — never an empty string. |
+| `role` | string | records extracted at issue #238 or later | Test-vs-production role: `"test"` or `"production"` (see [Test-vs-production role](#test-vs-production-role---role-issue-238)). Omitted on records from older graphs — unknown, never fabricated. |
 | `git_commit` | string | only in history graphs | Full commit SHA for history-backed records. |
 | `repository_id` | string | when attributable | Stable `Repository` record ID owning the row. Absent only for legacy graphs without repository topology. |
 | `repository` | string | when attributable | Human-usable repository identity handle, e.g. `acme/widget`. |
+| `result_complete` | boolean | yes | Completeness signal (issue #121): `true` for the full name lookup; `false` when `--at` / `--as-of` picked a single winner from several candidates. |
+| `total_matches` | number | only when narrowed | Candidate count before the `--at` / `--as-of` single-winner selection. |
+| `applied_limit` | number | only when narrowed | `1` for the single-winner selection. |
 
 ### Example
 
@@ -804,7 +1566,7 @@ routing.
 List all `Symbol` nodes defined in a file, resolved through `DEFINES` edges.
 
 ```text
-eg query file <PATH> --graph <PATH> [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
+eg query file <PATH> --graph <PATH> [--at <COMMIT> | --as-of <RFC3339>] [--role all|production|test] [--format json|text]
 ```
 
 ### Arguments
@@ -817,6 +1579,7 @@ eg query file <PATH> --graph <PATH> [--at <COMMIT> | --as-of <RFC3339>] [--forma
 | `--as-of <RFC3339>` | no | Pin the listing to the file's recorded state at the most recent commit at or before this instant (valid-time axis). Mutually exclusive with `--at`. |
 | `--tx-as-of <RFC3339>` | no | Reserved for `query file`: always returns a `not_implemented` error envelope and exit `1`, never a silently coerced result. Transaction time currently covers `query symbol` only (issue #66). |
 | `--repo <SELECTOR>` | no | Restrict results to one repository. A matching path in another repository is excluded and reported only through the `excluded_other_repositories` stderr diagnostic. |
+| `--role <ROLE>` | no | `all` (default), `production`, or `test`: keep only symbol rows whose test-vs-production role matches (see [Test-vs-production role](#test-vs-production-role---role-issue-238)). |
 | `--format` | no | `json` (default) or `text`. |
 
 ### JSON output fields
@@ -871,7 +1634,8 @@ envelope** (not JSONL rows), byte-identical across repeated runs:
       "repo_relative_path": "src/parser.rs",
       "span": { "start_byte": 0, "end_byte": 30, "start_line": 1, "end_line": 1 },
       "commit": "<resolved full SHA>",
-      "valid_time": "2026-01-01T00:00:00Z"
+      "valid_time": "2026-01-01T00:00:00Z",
+      "role": "production"
     }
   ],
   "returned": 1,
@@ -884,7 +1648,11 @@ resolved as-of the point (module-level symbols without a span carry a
 documented `absent_span_reason`), and the envelope records the resolved
 commit/instant it was computed against. Output is bounded and redaction-safe:
 record IDs, commit handles, paths, spans, and counts only — never raw source
-text, patch hunks, or commit-message bodies.
+text, patch hunks, or commit-message bodies. Each symbol row also carries its
+test-vs-production `role` (issue #238; omitted on rows whose record predates
+it), and `--role` narrows the reconstructed set — a filter that empties a
+non-empty set is reported as an `empty_role_set` diagnostic, not a silent
+empty answer.
 
 Not-found is never conflated with empty: a file that existed at the point but
 defined zero symbols returns `ok: true` with an explicit `empty_symbol_set`
@@ -926,6 +1694,9 @@ fabricated symbol, never an empty success:
   want that one symbol's state at a point.
 - **`eg query lifeline` (issue #96)** — one symbol's full lifecycle across all
   history, not a per-file snapshot.
+- **`eg query origin` (issue #159)** — the commit that *introduced* one
+  symbol, plus the PR / issue / review whose `merge_commit_sha` equals it;
+  not a timeline and not line blame.
 - **`eg query deltas <BASE> <HEAD>` (issue #118)** — what changed *between* two
   commits, not what existed *at* one.
 - **`eg query symbol --tx-as-of` (issue #66)** — what the *store* knew at a
@@ -1054,10 +1825,73 @@ eg query drift --graph <PATH> [--limit N] [--format json|text]
 | `name` | string or null | when resolvable | Name of the drift target. |
 | `repository_id` | string | when attributable | Stable `Repository` record ID of the drift target's repository. |
 | `repository` | string | when attributable | Human-usable repository identity handle. |
+| `result_complete` | boolean | yes | Completeness signal (issue #121): `false` when the `--limit` cap narrowed the ranked pool. |
+| `total_matches` | number | only when narrowed | Drift candidate count before the `--limit` cut (after repository scoping). |
+| `applied_limit` | number | only when narrowed | The effective `--limit` that narrowed the answer. |
 
 Ties in `score` are broken by `record_id` ascending. Drift records from
 different repositories are never merged: each row carries its own repository
 identity.
+
+---
+
+## eg query cost
+
+Per-run agent cost rollup from imported trajectory `CostUsage` records
+(issue #132).
+
+```text
+eg query cost --graph <PATH> [--task <HANDLE>] [--session <ID>] [--verification verified|failed] [--limit N] [--format json|text]
+eg query cost --data-dir <DIR> [--task <HANDLE>] [--session <ID>] [--verification verified|failed] [--limit N] [--format json|text]
+```
+
+One row per `AgentRun` whose source trajectory `info` block carried any
+cost, token, or duration field. Values are verbatim from the transcript;
+absent values are `null` (unknown), never zero. Cost figures are
+transcript-derived claims, never deterministic code facts: every row carries
+`derivation: "transcript_derived"` and `trust_class: "other"`, and the
+envelope carries the epistemic disclaimer verbatim.
+
+### Arguments
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--graph <PATH>` | yes (one of) | Graph JSONL, e.g. from a `.traj` import. |
+| `--data-dir <DIR>` | yes (one of) | Embedded `AletheiaDB` data directory. |
+| `--task <HANDLE>` | no | Restrict to runs whose task handle starts with this prefix. The handle is the BLAKE3 hash of the trajectory's task text; copy it from a previous `eg query cost` row. |
+| `--session <ID>` | no | Restrict to the session with this ID (exact or leading prefix). |
+| `--verification verified\|failed` | no | Restrict by the run's recorded verification outcome. |
+| `--limit N` | no | Maximum rows returned (default `100`, max `1000`). Totals always cover the full filtered set; `totals.rows_truncated` reports truncation. |
+| `--format` | no | `json` (default) or `text`. |
+
+### JSON output fields
+
+| Field | Type | Always present | Description |
+|-------|------|----------------|-------------|
+| `ok` | boolean | yes | `true` on success. |
+| `lane` | string | yes | `"cost"`. |
+| `disclaimer` | string | yes | The standing epistemic disclaimer, verbatim. |
+| `rows` | array | yes | Per-run rows, sorted by `record_id` ascending, truncated to `--limit`. |
+| `totals` | object | yes | Aggregate sums over the full filtered set (pre-limit). |
+| `diagnostics` | array | yes | Non-fatal diagnostics, sorted by `record_id`. |
+
+Row fields: `record_id`, `run_id` (resolved via the `AuthoredBy` edge),
+`session_id`, `source_handle` (`path:blake3`), `model_name`,
+`task_handle`, `verification_outcome`, `actual_cost_usd`, `total_cost_usd`,
+`baseline_cost_usd`, `baseline_cost_model`, `prompt_tokens`,
+`cache_read_tokens`, `completion_tokens`, `duration_secs`,
+`derivation` (`"transcript_derived"`), `trust_class` (`"other"`).
+
+`totals` fields: `matching_rows` (filtered rows before `--limit`),
+`rows_truncated`, and sums `actual_cost_usd`, `total_cost_usd`,
+`baseline_cost_usd`, `prompt_tokens`, `cache_read_tokens`,
+`completion_tokens`, `duration_secs`. A sum is `null` when no matching row
+carries that measurement — an empty or all-unknown set never sums to zero.
+
+`CostUsage` records whose `text` is not the canonical transcript-derived
+payload (e.g. the per-turn Codex/Claude-Code shapes from issue #21) are
+excluded from rows and reported as `unrecognized_cost_payload` diagnostics —
+never silently dropped and never misread as run-level cost.
 
 ---
 
@@ -1069,7 +1903,7 @@ Find code nodes by natural-language similarity using dense vector embeddings.
 eg query semantic <QUERY> --data-dir <DIR> [--limit N] [--format json|text]
 ```
 
-The query string is embedded with the same model used during ingest and compared against stored vectors using cosine similarity. Results are returned in descending similarity order.
+The query string is embedded with the same model used during ingest and compared against stored vectors using cosine similarity. Results are returned in the canonical total order — score descending, then `record_id` ascending — applied to the full candidate pool before the `--limit` cut, so tied rows never swap positions across runs. See [Result ordering contract (issue #199)](#result-ordering-contract-issue-199).
 
 The embedded store **must** have been populated with `eg ingest --embed`. A store created without `--embed` contains no embedding vectors and returns no results.
 
@@ -1089,10 +1923,12 @@ would let a model swap, cache change, or version bump produce a cosine ranking
 computed **across incompatible vector spaces** and return it as a confident
 answer.
 
-When the identities match, results are returned **exactly as before**: the check
-adds no change to ranking, scores, ordering, or the output schema. When they do
-not, the query is refused with a stable machine-readable envelope on stdout and a
-distinct nonzero exit code — never a ranked result list:
+When the identities match, ranking, scores, ordering, and the `SemanticResult`
+row fields are unchanged by the check — but every answer now starts with the
+[embedding-provenance envelope](#embedding-provenance-envelope-issue-243)
+(issue #243), which is additive and appears once per answer, not per row. When
+they do not match, the query is refused with a stable machine-readable envelope
+on stdout and a distinct nonzero exit code — never a ranked result list:
 
 | Exit | `code` | Condition |
 |------|--------|-----------|
@@ -1117,6 +1953,7 @@ envelope shape, and the re-ingest workflow are documented in
 | `--data-dir <DIR>` | yes | Embedded `AletheiaDB` store created by `eg ingest --adapter embedded --embed`. `--graph` is not accepted by this subcommand. |
 | `--limit N` | no | Maximum number of results (default `10`). Bounds the scoped result set when `--repo` is supplied. |
 | `--repo <SELECTOR>` | no | Restrict retrieval leads to one repository. |
+| `--embed-model <MODEL>` | no | Model used to vectorize the query text: a local model directory, or a Hugging Face id from the local cache only (never downloaded; issue #167). Defaults to the built-in model. The store's #104 identity must match the resolved model — e.g. after `eg re-embed --model <m>`, query with `--embed-model <m>`. Conflicts with `--daemon`. |
 | `--format` | no | `json` (default) or `text`. |
 
 ### JSON output fields
@@ -1132,8 +1969,79 @@ One JSON object per line (JSONL). The default output format is `json`. Field nam
 | `span` | object | when available | Source span: `start_byte`, `end_byte`, `start_line`, `end_line` (all integers). Absent when the record has no span. |
 | `repository_id` | string | when attributable | Stable `Repository` record ID owning the row. |
 | `repository` | string | when attributable | Human-usable repository identity handle. |
+| `confidence_band` | string | yes | Per-row confidence band (issue #263): `\"strong\"` when `score >= 0.39`, else `\"weak\"`. A pure deterministic function of `score`. |
+| `selection_threshold` | number | yes | The calibrated confident threshold (`0.39`) this row was judged against. |
+| `selection_basis` | string | yes | How the threshold was set: `\"corpus_calibrated_confidence_floor\"`; mirrors drift's `selection_basis`. |
+| `result_complete` | boolean | yes | Completeness signal (issue #121): `false` when the `--limit` top-k cut narrowed the candidate pool. |
+| `total_matches` | number | only when narrowed | Candidate count before the `--limit` cut (after repository scoping). |
+| `applied_limit` | number | only when narrowed | The effective `--limit` that narrowed the answer. |
+
+Every non-empty JSON answer additionally carries a top-level `{"confidence": {...}}` answer line between the embedding-provenance envelope and the result rows — the calibrated answer-level verdict (issues #263, #221). It is a separate JSONL line, not a row field; see "Confidence verdicts" below for its contract.
 
 Machine consumers must depend only on the fields listed above. Additional fields may be added in future releases; removing or renaming any of the fields above constitutes a breaking contract change and requires a version bump.
+
+### Embedding-provenance envelope (issue #243)
+
+Every `eg query semantic` answer starts with one embedding-provenance envelope,
+printed exactly once ahead of the confidence verdict line and result rows (or
+ahead of nothing on a no-result answer). The envelope names the
+model that embedded the query and the model identity recorded when the vector
+index was built, so a score is never silently incomparable across embedding
+spaces. `SemanticResult` row fields are unchanged; the envelope is additive.
+
+JSON answers keep their JSONL contract: the first line is a single-key object,
+followed by one `SemanticResult` object per line:
+
+```json
+{"embedding_provenance":{"query_model":{"provider":"aletheiadb_re_export","name":"sentence-transformers/all-MiniLM-L6-v2","version":"0.1.0","dim":384,"content_hash":"unknown"},"index_model":{"provider":"aletheiadb_re_export","name":"sentence-transformers/all-MiniLM-L6-v2","version":"0.1.0","dim":384,"content_hash":"unknown"},"metric":"cosine","index_fingerprint":"9f2c…","model_match":true,"mismatch_fields":[]}}
+{"record_id":"codegraph:v1:abc123","name":"…","score":0.9231,…}
+```
+
+Text answers start with one header line instead:
+
+```text
+embedding_provenance: provider=aletheiadb_re_export name=sentence-transformers/all-MiniLM-L6-v2 version=0.1.0 dim=384 metric=cosine index_fingerprint=9f2c… model_match=true mismatch_fields=none index_model=[name=sentence-transformers/all-MiniLM-L6-v2 version=0.1.0 dim=384]
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `query_model` | object | Identity of the model that produced the query vector: `provider`, `name`, `version`, `dim`, `content_hash`. Derived from the actual embedded query, not from configuration. |
+| `index_model` | object or `null` | Identity recorded when the vector index was built. `null` when the store carries no vector index (never `--embed`ed). |
+| `metric` | string | Similarity metric the ranking used: always `"cosine"`. The `score` on every row is a cosine similarity. |
+| `index_fingerprint` | string | BLAKE3 fingerprint (64 lowercase hex chars) of the index-producing model identity, or of the literal marker `absent` when the store has no vector index. |
+| `model_match` | boolean | Whether the query model identity matches the index identity exactly. A mismatch is reported here explicitly — never as silently incomparable scores. (When the mismatch is one the compatibility gate refuses, the query is still refused with exits `7`–`11` before any answer is produced; see below.) |
+| `mismatch_fields` | string[] | Fields where the query and index identities differ (`provider`, `name`, `version`, `dim`, `content_hash`), in declaration order. Empty on match, and empty when there is no index identity to compare against. |
+
+The envelope is emitted on **every** answer shape, including the no-result
+(exit `2`) and never-embedded-store (exit `2`) answers, where `index_model`
+is `null` and `model_match` is `false`. Re-running an identical query against
+an unchanged store with the same model reproduces the envelope byte-for-byte:
+field order is fixed and no timestamps or paths are included.
+
+#### Drift detection via field comparison
+
+No new CLI verb is needed to detect model drift; compare the envelope fields
+across runs:
+
+1. Capture the envelope line: `eg query semantic "…" --data-dir <DIR> | head -n 1`.
+2. Compare `index_fingerprint` between runs. A changed fingerprint means the
+   index was rebuilt under a different model identity — that is the drift
+   signal. Two stores embedded with the same model share a fingerprint; it is
+   an index-*identity* fingerprint, not a store-content fingerprint, and it
+   deliberately contains no filesystem paths, so it stays comparable across
+   machines and data-dir renames.
+3. For the details behind a changed fingerprint, compare `index_model`
+   field-by-field (`name`, `version`, `dim`, …) and read `model_match` /
+   `mismatch_fields` for the query-vs-index verdict on the latest run.
+
+The `--daemon` lane prints the same envelope: the daemon's `semantic_search`
+verb result carries `embedding_provenance`, built from the same store/index
+that produced the ranking, and the CLI re-serializes it through the identical
+printer, so the bytes match the embedded lane field-for-field. (The daemon
+assumes the query vector came from the default local embedder — the CLI is
+currently the only producer of these vectors.) There is not yet a
+semantic-search MCP tool (that is issue #181); when it lands on the daemon
+verb it will inherit this envelope unchanged.
 
 ### No-result and missing-embedding behavior
 
@@ -1154,6 +2062,12 @@ Exit code `2` is also returned when the query produced no cosine-similar results
 scan_repository score=0.9500 @ src/lib.rs:51
 ```
 
+A non-empty text answer opens with the embedding-provenance header line and
+then prints the confidence verdict on its own line —
+`confidence: confident (best score 0.6191; confident threshold 0.39; weak
+threshold 0.34; 42 candidates; basis corpus_calibrated_confidence_floor)` —
+before the result rows (see "Confidence verdicts").
+
 The exact format of `--format text` output is **not stable** and must not be parsed by scripts or agents. Use `--format json` for machine-readable output with stable field names.
 
 ### Example
@@ -1168,6 +2082,85 @@ eg query semantic "write nodes to database storage" --data-dir .egregore-semanti
 ```
 
 The `record_id` is stable across re-scans of the same commit and can be cited in agent-memory records. The `repo_relative_path` and `span` together give a file and line-range handle that agents can pass directly to editor tools or other `eg` commands.
+
+### Confidence verdicts (issues #263, #221)
+
+Every non-empty `eg query semantic` answer is stamped with a top-level
+confidence verdict — a calibrated, deterministic judgment of whether the
+ranked rows are trustworthy. The verdict is a pure function of the best
+row's score, so identical store + query + model yields a byte-identical
+verdict on every run and on both transports (embedded CLI and
+`--daemon`).
+
+JSON answers print the verdict as the first line after the
+`embedding_provenance` line:
+
+```json
+{"confidence":{"verdict":"confident","best_score":0.6191,"total_candidates":42,"confident_threshold":0.39,"weak_threshold":0.34,"selection_basis":"corpus_calibrated_confidence_floor"}}
+```
+
+Text answers print one leading line: `confidence: confident (best score
+0.6191; confident threshold 0.39; weak threshold 0.34; 42 candidates; basis
+corpus_calibrated_confidence_floor)`.
+
+| Verdict | Meaning |
+|---------|---------|
+| `confident` | Best score `>= 0.39`. The answer is trusted. |
+| `weak` | Best score in `[0.34, 0.39)`. A candidate lead the caller must treat as unverified. |
+| `abstain` | Best score `< 0.34`. No trustworthy signal; the rows are low-confidence leads only. |
+
+| Field | Meaning |
+|-------|---------|
+| `verdict` | One of `confident` / `weak` / `abstain`. |
+| `best_score` | Highest score among the ranked candidates — the verdict's input. |
+| `total_candidates` | Full scoped candidate count **before** `--limit` truncation. |
+| `confident_threshold` | The bar for `confident` (`0.39`). |
+| `weak_threshold` | The floor for `weak` (`0.34`); below is `abstain`. |
+| `selection_basis` | `"corpus_calibrated_confidence_floor"` — how the thresholds were set. |
+
+**Rows are never dropped for low confidence.** A below-threshold non-empty
+answer returns its rows — each flagged per-row as `weak` — under an explicit
+`weak`/`abstain` verdict, instead of the old behavior of suppressing them.
+An empty result (no semantic index, or the scope matched zero records) is
+still a clean no-match exiting `2`; that is distinct from `abstain`, which
+means "candidates exist but none is trustworthy".
+
+Every JSON row also carries three per-row confidence fields:
+
+| Field | Meaning |
+|-------|---------|
+| `score` | Raw cosine similarity (0.0–1.0). |
+| `confidence_band` | `"strong"` if `score >= 0.39`, else `"weak"`. A pure deterministic function of `score`. |
+| `selection_threshold` | The calibrated threshold (`0.39`) this row was judged against. |
+| `selection_basis` | `"corpus_calibrated_confidence_floor"` — how the threshold was set; mirrors drift's `selection_basis`. |
+
+**Derivation.** The `0.39` bar is the issue #263 selection floor, retained by
+the issue #221 recalibration: it sits `0.05` above the `eg eval-semantic`
+`--fp-threshold` default (`0.34`) — the cosine score at which the offline eval
+starts counting an ambiguous-query retrieval as a false positive — giving a
+conservative margin over `corpus/semantic_relevance_corpus.json`'s 5 ambiguous
+queries (`q026`, `q027`, `q029`, `q031`, `q032`), which define the "no confident
+match" case. The `0.34` weak floor is that same eval default: below it there is
+not even a candidate signal; between the two bars is a candidate the answer
+refuses to trust. The issue #221 acceptance gate measures both bars against
+the corpus — ≥90% of the 20 unanswerable queries (the 5 ambiguous plus the 15
+held-out queries in `corpus/semantic_confidence_unanswerable.json`) must land
+in `abstain`|`weak`, and ≥85% of the 27 answerable corpus queries must land in
+`confident`. The fixed-methodology re-run (2026-09-23, full-repo graph, 15,098
+File/Symbol candidates) confirms the bars: 24/27 answerable (88.9%)
+`confident`, 19/20 unanswerable (95.0%) `weak`|`abstain` — superseding the
+flawed 2026-09-22 run, which embedded every node with non-empty text (4,501
+nodes, including `Diagnostics`/`PanicRiskSites` nodes that are never retrieval
+candidates) and omitted `src/cli/mod.rs`. The procedure and the measured run
+live in `calibration/README.md`, `calibration/calibrate.py`, and
+`calibration/py_calibrate_fixed.py` (the fixed-population script). The values
+are pinned by `corpus/semantic_confidence_fixture.json` (see its
+`derivation` note) and verified by integration tests; they cannot drift
+silently.
+
+The verdict is deterministic: repeated identical queries produce
+byte-identical verdict objects after canonical ordering (score descending,
+record ID ascending).
 
 ---
 
@@ -1204,8 +2197,10 @@ eg query at <PATH>:<LINE> --data-dir <DIR> [--at <COMMIT>] [--repo <SELECTOR>]
   `impl` inside a module), the primary `symbol` is the one with the narrowest
   containing span (line width, then byte width, then record ID — all
   ascending). The full enclosing chain of containing `Module` and `Symbol`
-  nodes is also reported, ordered **outermost → innermost**; the last chain
-  entry is always the primary symbol.
+  nodes is also reported, ordered **outermost → innermost**; the chain's
+  innermost entry is the primary `symbol` whenever the innermost containing
+  node is a `Symbol` (a `Module` nested inside a function body can be the
+  innermost entry while the primary answer is the enclosing `Symbol`).
 - **Absence is the answer.** A line outside every symbol span (blank line,
   file-level `use`/attribute, inter-item whitespace — even inside a module)
   yields the typed `no_enclosing_symbol` error, never a nearest-neighbor
@@ -1233,7 +2228,7 @@ for identical inputs and store state:
 | `path` | string | yes | Queried repo-relative path, echoed back. |
 | `line` | number | yes | Queried 1-based line, echoed back. |
 | `symbol` | object | yes | The smallest enclosing `Symbol` node. |
-| `enclosing_chain` | array | yes | Containing `Module`/`Symbol` nodes, outermost → innermost. The innermost entry is the primary `symbol`. |
+| `enclosing_chain` | array | yes | Containing `Module`/`Symbol` nodes, outermost → innermost. The innermost entry is the primary `symbol` whenever it is a `Symbol`; a `Module` nested inside a function body can be the innermost entry while the primary answer is the enclosing `Symbol`. |
 | `repository_id` | string | when attributable | Stable `Repository` record ID owning the answer. |
 | `repository` | string | when attributable | Human-usable repository identity handle. |
 
@@ -1317,7 +2312,7 @@ original store stays byte-for-byte untouched. Rust extraction only.
 
 ```text
 eg query locate <PATH>:<LINE> --graph <PATH>   [--at <COMMIT> | --as-of <INSTANT>] [--repo <SELECTOR>] [--supersession <MODE>] [--format json|text]
-eg query locate <PATH>:<LINE> --data-dir <DIR> [--at <COMMIT> | --as-of <INSTANT>] [--repo <SELECTOR>] [--supersession <MODE>] [--format json|text]
+eg query locate <PATH>:<LINE> --data-dir <DIR> [--at <COMMIT> | --as-of <INSTANT>] [--repo <SELECTOR>] [--supersession <MODE>] [--format json|text] [--daemon]
 ```
 
 ### Arguments
@@ -1327,6 +2322,7 @@ eg query locate <PATH>:<LINE> --data-dir <DIR> [--at <COMMIT> | --as-of <INSTANT
 | `<PATH>:<LINE>` | yes | Repo-relative path and 1-based line, e.g. `src/lib.rs:42`. The line is taken after the **last** `:`. |
 | `--graph <PATH>` | one of | Graph JSONL produced by `eg scan` or `eg scan-history`. |
 | `--data-dir <DIR>` | one of | Embedded `AletheiaDB` store. Structural records only — no `--embed` required. |
+| `--daemon` | no | Route the query through the running daemon for `--data-dir` (requires `--data-dir`, conflicts with `--graph`). The daemon `locate` verb returns the same full envelope; typed positional errors keep their codes and the cold path's exit codes. |
 | `--at <COMMIT>` | no | Temporal pin: resolve the position against symbol spans **as they existed at this commit** (full SHA or unique prefix). Requires a history-bearing store. Mutually exclusive with `--as-of`. |
 | `--as-of <INSTANT>` | no | Temporal pin: resolve against the most recent commit **at or before** this RFC 3339 instant. Mutually exclusive with `--at`. |
 | `--repo <SELECTOR>` | no | Restrict resolution to one repository (see [Repository scope](#repository-scope---repo-issue-67)). |
@@ -1363,13 +2359,15 @@ unscoped cross-repository path collision fails closed. Two absence answers are
 distinguished:
 
 - `no_enclosing_symbol` — the line sits in a gap inside the file (blank line,
-  file-level `use`, comment, inter-item whitespace).
-- `line_out_of_range` — the line is **beyond the file's last recorded
-  structural span**. `File` nodes carry no span, so the file's true line count
-  is not stored; the recorded extent (`max_known_line`) is the deterministic
-  upper bound, and a line past it is reported as out of range rather than
-  guessed. Both are typed answers carrying the resolved `file_record_id`; a
-  nearest-neighbor symbol is never returned.
+  file-level `use`, comment, inter-item whitespace, or trailing lines after
+  the last symbol).
+- `line_out_of_range` — the line is **beyond the file's actual last line**.
+  The `File` node carries a whole-file span recording the file's true line
+  count (`str::lines` semantics: a trailing newline adds no extra line), so
+  `max_known_line` cites that count. Graphs whose `File` nodes predate
+  whole-file spans carry no `File` span and fall back to the last recorded
+  structural span, as before. Both are typed answers carrying the resolved
+  `file_record_id`; a nearest-neighbor symbol is never returned.
 
 ### Exit codes and error envelopes
 
@@ -1388,7 +2386,7 @@ Errors are one-line `{"ok":false,"error":{...}}` envelopes on stdout (repository
 | `2` | `missing_commit` | `--at` commit is absent from the store's history. |
 | `2` | `no_commit_at_or_before` | No commit exists at or before the `--as-of` instant. |
 | `2` | `no_enclosing_symbol` | The path is known but no symbol span contains the line. Carries `file_record_id`. |
-| `2` | `line_out_of_range` | The line is beyond the file's last recorded structural span. Carries `max_known_line` and `file_record_id`. |
+| `2` | `line_out_of_range` | The line is beyond the file's actual last line. Carries `max_known_line` (the file's true line count, or the last recorded structural span for graphs predating whole-file `File` spans) and `file_record_id`. |
 
 ### Example
 
@@ -1839,3 +2837,159 @@ edge labels, paths, spans, counts, and basis strings escape), and byte-identical
 across runs. A witness path proves a live evidence-edge chain connects two
 records; it is not proof the cited code still matches current source. See
 `docs/cli/evidence-path.md`.
+
+## eg query uses
+
+Find **every usage site of an external dependency symbol before upgrade**
+(issue #258): given a fully or partially qualified path such as
+`tokio::spawn` or `aletheiadb`, return each call site the repo-wide resolver
+could *not* bind to an in-repo definition — i.e. each place the dependency
+symbol is actually called. Answers *"if I bump this crate, what breaks?"*
+without hand-reading every file.
+
+```sh
+eg query uses tokio::spawn --graph graph.jsonl                 # exit 0 on ≥ 1 site
+eg query uses aletheiadb --data-dir .egregore --format text    # partial path, human-readable
+eg query uses tokio::spawn --graph graph.jsonl --repo my-repo  # one repo in a multi-repo store
+eg query uses tokio::spawn --data-dir .egregore --at <sha>     # pin a commit
+eg query uses tokio::spawn --data-dir .egregore --as-of <ts>   # pin an instant
+```
+
+The lane reads two AST-derived relations only: `CALLS` edges whose
+`resolution` is `unresolved`, and each file's `IMPORTS` edges. Every written
+callee is resolved against the file's `use` declarations, so the lane is
+**alias-aware**: `use a::b::c as d; d(...)` reports under `a::b::c`, and a bare
+`spawn` imported via `use tokio::spawn;` reports under `tokio::spawn`.
+Matching is **segment-aware**: `aletheiadb` matches `aletheiadb::Store::open`
+but `tokio::spaw` never matches `tokio::spawn`. An ambiguous alias (two
+imports binding the same name in one file) resolves to nothing — resolution
+stays conservative rather than guessing.
+
+Because every row is backed by a parsed call site, **comments and string
+literals can never produce rows**: a `// tokio::spawn` comment or a
+`"aletheiadb::Store"` string is invisible to this lane by construction.
+
+Each JSON row carries `record_id`, `schema_version`, `repo_relative_path`,
+`span` (the first site for that written callee in the file — repeated callers
+of the same callee collapse to one row), `callee` (as written), `import_path`
+(the alias-resolved path), `external` (the external-vs-internal boolean), and
+`trust`. Rows whose path falls inside the repository's own crate namespace
+(`crate::…`, or a `use` path rooted at the repo's own crate) are reported with
+`external: false` and a `hint` pointing at `eg query transitive-callers` —
+a resolved-in-repo symbol's callers are that lane's job, not this one's.
+Out of scope by design: resolved internal `CALLS` edges, `UnresolvedDispatch`
+trait markers, and `MENTIONS` (no general extractor relation exists under that
+label, issue #442).
+
+Exit codes: `0` when at least one usage site is found; `2` for a
+well-formed path with zero sites (`no_match`) or a temporal pin against a
+graph with no commits (`empty_history`, exactly like `who-constructs`); `1`
+for a malformed path (`malformed_path`) or an unsupported corpus/temporal
+combination. Supports `--repo`, `--at`, `--as-of`,
+`--at-head` / `--all-history` (the issue #427 corpus selectors, mirroring
+`who-constructs`), and `--format json|text`. Output is deterministic:
+`(repo_relative_path, span start, callee, import_path)`.
+
+**Boring-substitute comparison.** `rg 'tokio::spawn'` finds the text but also
+every comment, string literal, and doc mention — and misses every
+`use tokio::spawn; … spawn(...)` alias site, which is usually the majority.
+rust-analyzer "find references" needs a fully-resolved workspace and gives up
+exactly where this lane starts (unresolved external paths). Sourcegraph code
+search is text search with the same alias blindness. `cargo outdated` /
+`cargo-geiger` tell you a dependency *is* stale, not *where* it is used.
+`eg query uses` is the narrow tool for the pre-upgrade question: the complete,
+alias-resolved, false-positive-free usage list, as JSON your agent can act on.
+
+## eg query failure-hotspots
+
+Rank **code targets by repeated agent-failure density** (issue #254): the
+store-wide complement to `eg query failures`. Where the per-handle lane
+answers "did anyone fail HERE?", this lane answers the operator's question
+*before* dispatching the next agent — *"which code targets burned the most
+agent attempts?"* — with no caller-supplied handle.
+
+```sh
+eg query failure-hotspots --graph graph.jsonl                  # exit 0 on ≥ 1 failure record
+eg query failure-hotspots --data-dir .egregore --limit 5       # top 5, truncation signaled
+eg query failure-hotspots --graph graph.jsonl --since 2026-09-01T00:00:00Z  # last week
+```
+
+Every live agent-authored `Failure` record resolves to its code
+(`Symbol`/`File`) targets through the failure-link relations, and targets are
+ranked by **distinct failing-run count** (`session_id` provenance; a failure
+with none counts as its own run), with **total failure count** as the
+documented tie-break and `target_record_id` as the final tie-break for
+byte-identical rankings across repeated runs. Each row carries a citable
+handle — the target `record_id` + `repo_relative_path`/span — and the list of
+contributing `Failure` `record_id`s with their run/session handles, so no row
+is a bare count with no evidence. Failures that resolve to no code target are
+reported in an explicit `unresolved` section (`task_only` / `no_code_target`),
+never silently dropped.
+
+Exit codes: `0` when at least one live `Failure` record is in scope; `2` for a
+store with zero live failures (`no_match`); `1` for an invalid `--limit` or a
+malformed `--as-of`/`--since` instant. `--limit N` caps rows and the header
+signals truncation (`truncated`, `total_hotspots` vs `returned_hotspots`).
+`--as-of`/`--since` scope the aggregation to failures observed within the
+window (undated failures are excluded when a selector is active). Supports
+`--format json|text`. Tombstoned failures are excluded entirely.
+
+**Boring-substitute comparison.** The per-handle lanes (`eg query failures`)
+require a suspect; `git log -S` / churn hotspots (issue #128) and CodeScene
+rank by *source change frequency* — a stable file that silently defeats every
+agent shows up in neither. Issue trackers know task status, not
+code-target-level agent attempts. Nothing else aggregates per-run failures
+into a ranked, evidence-cited map of where agents keep drowning.
+
+## eg query diagnostics
+
+List persisted **extractor-coverage-gap `Diagnostic` graph nodes** (issue
+#246): the extractor's self-declared blind spots — where it flagged something
+it could not parse or resolve — as citable rows, with no scan or recompute.
+Each row carries the stable `record_id`, `repo_relative_path`, the complete
+byte/line `span` (which slices the cited source), the diagnostic
+`name`/subject, and the human `summary` (e.g. `unsupported macro invocation
+println!`).
+
+```sh
+eg query diagnostics --graph graph.jsonl                    # all gap markers
+eg query diagnostics --graph graph.jsonl --file src/main.rs # one file
+eg query diagnostics --data-dir .egregore --repo owner/name # one repository
+```
+
+The closed set is `Diagnostic` nodes carrying **both** a repo-relative path
+and a span. Source-authored markers (TODO/FIXME `DebtMarker`s,
+`.unwrap()`/`.expect()` `PanicRiskSite`s) are different node kinds and can
+never match — the lane never reclassifies them. Span-less `Diagnostic` nodes
+(skipped-manifest holes) and path-less importer diagnostics are excluded by
+construction. Rows are ordered deterministically (`repo_relative_path`,
+`span.start_byte`, `git_commit`, `record_id`), so repeated runs over an
+unchanged store are byte-identical. Supports `--repo`, `--file`,
+`--at-head`/`--all-history` corpus selectors, and `--format json|text`. See
+[diagnostics.md](diagnostics.md) for the full field table.
+
+Exit codes: `0` with NDJSON rows when gaps exist; `0` with an explicit
+`{"ok":true,"lane":"diagnostics","diagnostics":[],"empty_reason":"no_gaps_in_scope"}`
+marker when the scope is clean (a citable positive fact, distinct from error);
+`2` when `--file` names nothing in the store (`unknown_file`); `1` for an
+unknown/ambiguous `--repo` selector.
+
+"No extraction-gap diagnostics in scope" is not proof the code is fully
+understood for any other purpose — only that the extractor flagged nothing it
+could not parse.
+
+## eg brief (working-tree-diff-scoped evidence briefing)
+
+`eg brief` is a standalone top-level command (issue #214), not a `query`
+subcommand: it computes the uncommitted working-tree diff at `repo_path`,
+resolves the changed files and the symbols whose recorded spans intersect the
+changed hunks, and returns one trust-separated JSON object with prior failures
+(runtime vs agent-authored), source facts, observations, decisions, in-flight
+tasks, verification evidence, and drift warnings — plus a `store_coverage` map
+and the store-freshness staleness marker. Strictly read-only; a clean working
+tree exits `0` with empty but well-formed sections. See [brief.md](brief.md) for
+the full contract.
+
+```sh
+eg brief [repo_path] (--graph <path> | --data-dir <dir>) [--repo <id>] [--staged-only] [--format json|text]
+```

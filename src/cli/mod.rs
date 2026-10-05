@@ -5,20 +5,37 @@
 mod as_of;
 mod at;
 mod audit;
+mod belief_timeline;
+mod brief;
 mod bundle;
 mod candidates;
+mod capture_bench;
+mod capture_coverage;
+mod capture_lanes;
+mod capture_proof;
 mod capture_tests;
 mod change_impact;
 mod changes;
 mod churn;
+mod clones;
+mod completeness;
+mod complexity;
+mod config;
+mod conflicts;
 mod context;
+mod context_pack;
+mod cost;
 mod coupling;
 mod cycles;
 mod daemon;
+mod dead_code;
 mod debt_markers;
 mod decide;
 mod deltas;
+mod dep_usage;
+mod deprecated_symbols;
 mod deps;
+mod diagnostics;
 mod doctor;
 mod drift;
 mod error_context;
@@ -28,6 +45,7 @@ mod evidence_freshness;
 mod evidence_path;
 mod export;
 mod failure_history;
+mod failure_hotspots;
 mod file_at_point;
 mod forget;
 mod freshness_cmd;
@@ -35,15 +53,21 @@ mod implementors;
 mod import;
 mod index;
 mod ingest;
+#[cfg(feature = "embedded-aletheiadb")]
+mod init;
 mod inspect;
+#[cfg(feature = "embedded-aletheiadb")]
+mod keygen;
+mod lanes;
 mod lifeline;
 mod link_logs;
-mod locate;
+pub(crate) mod locate;
 mod log_deltas;
 mod manifest_deps;
 mod memory;
 mod memory_audit;
 mod orientation;
+mod origin;
 mod output;
 mod ownership;
 mod policy;
@@ -51,20 +75,42 @@ mod producer_drift;
 mod protected;
 mod public_api;
 mod public_api_deltas;
+mod query_bench;
 mod recency;
+mod record_budget;
 mod records;
+mod redaction_audit;
+#[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
+mod reembed_cmd;
 mod repair_cmd;
+mod repos;
+mod resolve;
 mod resolve_frames;
+mod retire;
+mod risk_markers;
 mod scan;
 mod scan_logs;
+mod schema;
 mod schema_constraints;
-mod semantic;
+pub(crate) mod semantic;
 mod subsystem;
 mod symbols;
 mod task;
+mod task_ready;
+// Appended (issue #150); kept at the end of the module list to minimize
+// cross-lane merge conflicts.
+mod task_overlap;
+// Appended (issue #147); kept at the end of the module list to minimize
+// cross-lane merge conflicts.
+pub(crate) mod covering_tests;
+mod task_evidence_gate;
+// Appended (issue #119); kept at the end of the module list to minimize
+// cross-lane merge conflicts.
+mod task_list;
 mod transaction_time;
 mod transitive_callees;
 mod transitive_callers;
+mod tx_delta;
 mod undocumented;
 mod unreferenced;
 mod unsafe_sites;
@@ -84,23 +130,50 @@ mod who_constructs;
 mod forget_repo;
 // Appended (issue #112); kept at the end to minimize cross-lane merge conflicts.
 mod sessions;
+// Appended (issue #265); kept at the end to minimize cross-lane merge conflicts.
+mod blind_spots;
+// Appended (issue #262); kept at the end to minimize cross-lane merge conflicts.
+mod track_record;
+// Appended (issue #259); kept at the end to minimize cross-lane merge conflicts.
+mod session_retrospective;
+// Appended (issue #239); kept at the end to minimize cross-lane merge conflicts.
+mod verify_scan;
+// Appended (issue #236); kept at the end to minimize cross-lane merge conflicts.
+mod trust_audit;
+// Appended (issue #228); kept at the end to minimize cross-lane merge conflicts.
+mod diagram;
+// Appended (issue #227); kept at the end to minimize cross-lane merge conflicts.
+mod suppressions;
+// Appended (issue #154); kept at the end to minimize cross-lane merge conflicts.
+mod similar;
 
 pub(crate) use as_of::*;
 pub(crate) use at::*;
 pub(crate) use audit::*;
+pub(crate) use belief_timeline::*;
+pub(crate) use brief::*;
 pub(crate) use bundle::*;
 pub(crate) use candidates::*;
+pub(crate) use capture_bench::*;
 pub(crate) use change_impact::*;
 pub(crate) use changes::*;
 pub(crate) use churn::*;
+pub(crate) use clones::*;
+pub(crate) use completeness::*;
+pub(crate) use complexity::*;
+pub(crate) use config::*;
+pub(crate) use conflicts::*;
 pub(crate) use context::*;
+pub(crate) use cost::*;
 pub(crate) use coupling::*;
 pub(crate) use cycles::*;
 pub(crate) use daemon::*;
+pub(crate) use dead_code::*;
 pub(crate) use debt_markers::*;
 pub(crate) use decide::*;
 pub(crate) use deltas::*;
 pub(crate) use deps::*;
+pub(crate) use diagnostics::*;
 pub(crate) use doctor::*;
 pub(crate) use drift::*;
 pub(crate) use error_context::*;
@@ -110,6 +183,7 @@ pub(crate) use evidence_freshness::*;
 pub(crate) use evidence_path::*;
 pub(crate) use export::*;
 pub(crate) use failure_history::*;
+pub(crate) use failure_hotspots::*;
 pub(crate) use file_at_point::*;
 pub(crate) use forget::*;
 pub(crate) use freshness_cmd::*;
@@ -117,7 +191,12 @@ pub(crate) use implementors::*;
 pub(crate) use import::*;
 pub(crate) use index::*;
 pub(crate) use ingest::*;
+#[cfg(feature = "embedded-aletheiadb")]
+pub(crate) use init::*;
 pub(crate) use inspect::*;
+#[cfg(feature = "embedded-aletheiadb")]
+pub(crate) use keygen::*;
+pub(crate) use lanes::*;
 pub(crate) use lifeline::*;
 pub(crate) use link_logs::*;
 pub(crate) use locate::*;
@@ -126,6 +205,7 @@ pub(crate) use manifest_deps::*;
 pub(crate) use memory::*;
 pub(crate) use memory_audit::*;
 pub(crate) use orientation::*;
+pub(crate) use origin::*;
 pub(crate) use output::*;
 pub(crate) use ownership::*;
 pub(crate) use policy::*;
@@ -133,20 +213,36 @@ pub(crate) use producer_drift::*;
 pub(crate) use protected::*;
 pub(crate) use public_api::*;
 pub(crate) use public_api_deltas::*;
+pub(crate) use query_bench::*;
 pub(crate) use recency::*;
 pub(crate) use records::*;
+pub(crate) use redaction_audit::*;
 pub(crate) use repair_cmd::*;
+pub(crate) use repos::*;
+pub(crate) use resolve::*;
 pub(crate) use resolve_frames::*;
+pub(crate) use retire::*;
+pub(crate) use risk_markers::*;
 pub(crate) use scan::*;
 pub(crate) use scan_logs::*;
+pub(crate) use schema::*;
 pub(crate) use schema_constraints::*;
 pub(crate) use semantic::*;
 pub(crate) use subsystem::*;
 pub(crate) use symbols::*;
 pub(crate) use task::*;
+pub(crate) use task_ready::*;
+// Appended (issue #150).
+pub(crate) use task_overlap::*;
+// Appended (issue #147).
+pub(crate) use covering_tests::*;
+pub(crate) use task_evidence_gate::*;
+// Appended (issue #119).
+pub(crate) use task_list::*;
 pub(crate) use transaction_time::*;
 pub(crate) use transitive_callees::*;
 pub(crate) use transitive_callers::*;
+pub(crate) use tx_delta::*;
 pub(crate) use undocumented::*;
 pub(crate) use unreferenced::*;
 pub(crate) use unsafe_sites::*;
@@ -166,6 +262,24 @@ pub(crate) use who_constructs::*;
 pub(crate) use forget_repo::*;
 // Appended (issue #112); kept at the end to minimize cross-lane merge conflicts.
 pub(crate) use sessions::*;
+// Appended (issue #265); kept at the end to minimize cross-lane merge conflicts.
+pub(crate) use blind_spots::*;
+// Appended (issue #262); kept at the end to minimize cross-lane merge conflicts.
+pub(crate) use track_record::*;
+// Appended (issue #259); kept at the end to minimize cross-lane merge conflicts.
+pub(crate) use session_retrospective::*;
+// Appended (issue #258); kept at the end to minimize cross-lane merge conflicts.
+pub(crate) use dep_usage::*;
+// Appended (issue #249); kept at the end to minimize cross-lane merge conflicts.
+pub(crate) use deprecated_symbols::*;
+// Appended (issue #239); kept at the end to minimize cross-lane merge conflicts.
+pub(crate) use verify_scan::*;
+// Appended (issue #236); kept at the end to minimize cross-lane merge conflicts.
+pub(crate) use trust_audit::*;
+// Appended (issue #228); kept at the end to minimize cross-lane merge conflicts.
+pub(crate) use diagram::*;
+// Appended (issue #227); kept at the end to minimize cross-lane merge conflicts.
+pub(crate) use suppressions::*;
 
 use std::{
     collections::BTreeMap,
@@ -178,21 +292,28 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
+use self::record_budget::BudgetedSection;
 use crate::{
-    adapters::{DryRunSink, ingest_records, records_from_jsonl},
+    adapters::{
+        DanglingCitationPolicy, DryRunSink, ingest_records, ingest_records_with_policy,
+        records_from_jsonl,
+    },
     evidence::{
-        ArtifactRequest, CommandEvidenceRequest, EvidenceProvenance, ObservationRequest,
-        VerificationRequest, build_artifact_records, build_command_evidence_records,
-        build_observation_records, build_verification_records,
+        ArtifactRequest, CommandEvidenceRequest, EvidenceProvenance, FailureRequest,
+        ObservationRequest, VerificationRequest, build_artifact_records,
+        build_command_evidence_records, build_failure_records, build_observation_records,
+        build_verification_records,
     },
     freshness::{self, Freshness},
+    history::HistoryWindow,
     identity,
     ir::{
         CallResolution, EdgeLabel, EmbeddingModel, EvidenceLink, Graph, GraphRecord, NodeKind,
         SnapshotHead, SourceSpan,
     },
     link_evidence::{self, LinkOptions},
-    local_project, query, scan_repository_history_with_override, scan_repository_with_exclusions,
+    local_project, query, scan_repository_history_with_override,
+    scan_repository_history_with_window, scan_repository_with_exclusions,
     schema_version::{RecordVersion, record_version},
     traj::{self, ImportOptions},
 };
@@ -264,6 +385,35 @@ pub(crate) enum Commands {
         /// Keep source-embedded secrets in raw form instead of redacting them.
         #[arg(long)]
         raw_literals: bool,
+        /// Replay only the N most-recent commits reachable from HEAD.
+        ///
+        /// Kept as a raw string so a non-integer value becomes the
+        /// single-line JSON `invalid_window` diagnostic (issue #256), not
+        /// Clap usage prose.
+        #[arg(long)]
+        max_commits: Option<String>,
+        /// Replay commits committed at or after this RFC 3339 instant.
+        #[arg(long)]
+        since: Option<String>,
+        /// Start of a `<from>..<to>` revision range (`from` excluded).
+        /// Defaults the end to HEAD when `--to` is absent.
+        #[arg(long)]
+        from: Option<String>,
+        /// End of a `<from>..<to>` revision range (`to` included). Without
+        /// `--from`, replays everything reachable from this revision.
+        #[arg(long)]
+        to: Option<String>,
+        /// Resume from a prior full `scan-history` frontier instead of
+        /// replaying every commit (issue #224).
+        ///
+        /// Reads the history-replay tip recorded in `<path>`, replays only
+        /// the commits that landed after it, and merges them with the
+        /// frontier's records. The output is byte-identical to a fresh full
+        /// replay. Cannot be combined with any window flag (`--max-commits`,
+        /// `--since`, `--from`, `--to`): a windowed store is not a valid
+        /// resume frontier.
+        #[arg(long)]
+        resume_from: Option<PathBuf>,
     },
     /// Extract runtime log signatures from a captured log file (issues #319 / #320).
     ///
@@ -311,6 +461,170 @@ pub(crate) enum Commands {
         /// time. Not part of the handle identity.
         #[arg(long)]
         captured_at: Option<String>,
+    },
+    /// Re-scan a repository twice and verify byte-for-byte stability (issue #239).
+    ///
+    /// Scans the target twice within one invocation, pinning the transaction
+    /// time and repository identity for both scans so wall-clock and
+    /// checkout-directory differences never cause a false mismatch, then
+    /// reports whether the two canonical JSONL outputs are byte-for-byte
+    /// identical. Exits 0 with `stable: true` on a deterministic repository;
+    /// exits 1 with `stable: false` plus the differing record handle(s),
+    /// first differing field, and first differing JSONL line when the scans
+    /// disagree.
+    ///
+    /// Determinism is guaranteed only relative to a fixed producer (this
+    /// binary) plus the pinned time and identity; cross-version extraction
+    /// drift is the complementary `eg query producer-drift` check (#234).
+    /// See `docs/cli/verify-scan.md`.
+    VerifyScan {
+        /// Repository path to scan.
+        repo_path: PathBuf,
+        /// Override the auto-detected repository identity.
+        ///
+        /// Forces `identity_source = operator_override`. Recommended when the
+        /// two scans being compared run in different checkout directories
+        /// (e.g. CRLF vs LF checkouts of the same commit), where
+        /// path-derived identity would otherwise differ.
+        #[arg(long)]
+        repo_id_override: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Inspect the checked-in project configuration (issue #261).
+    ///
+    /// `eg config show` prints the effective resolved configuration as JSON:
+    /// the discovered `egregore.toml` (found by walking up from the working
+    /// directory, or `null`), every value, and where each value came from
+    /// (`"config"` or `"default"`). An agent or CI step runs this to verify —
+    /// and cite — exactly what governed a run. See `docs/cli/config.md`.
+    Config {
+        /// Config action.
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+    /// Capture a criterion benchmark run as citable verification-domain
+    /// `BenchmarkRun` records (issue #237).
+    ///
+    /// CAPTURE-ONLY: never executes a benchmark runner. The caller runs the
+    /// benchmarks; criterion's own `*/new/estimates.json` files (plus optional
+    /// `*/base/estimates.json` saved baselines) are handed here via `--input`
+    /// and parsed into one redaction-safe `BenchmarkRun` node per benchmark
+    /// (verification domain, `benchmark_run` kind). Each record carries the
+    /// benchmark id, the central estimate (`mean`, nanoseconds) and its
+    /// confidence interval, the baseline verdict (`regression | improvement |
+    /// unchanged | no_baseline`) plus the percentage delta, the captured
+    /// commit, and a `source_artifact_path`/`source_artifact_hash` pinning the
+    /// raw criterion artifact for later re-parsing. With `--graph` (a code
+    /// graph from `eg scan`) each benchmark whose final `/`-segment resolves
+    /// to exactly one `Symbol` mints `MENTIONS_SYMBOL` / `TOUCHED_FILE` edges;
+    /// zero or two-plus matches mint a `Diagnostic` and join the envelope's
+    /// `unresolved` section instead of a wrong edge. Re-capturing identical
+    /// input is a byte-identical no-op (issue #130).
+    ///
+    /// Exit codes: 0 success; 1 usage/provenance error; 4 empty input
+    /// (no `*/new/estimates.json` found); 5 unparseable estimates. See
+    /// `docs/cli/capture-bench.md`.
+    CaptureBench {
+        /// Path to the criterion output directory (`target/criterion`
+        /// shape: `<benchmark-id>/new/estimates.json`). Stored, never run.
+        #[arg(long)]
+        input: PathBuf,
+        /// Output JSONL path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Stable session identity (part of the record ID).
+        #[arg(long)]
+        session_id: String,
+        /// Commit handle / external identifier (part of the record ID).
+        #[arg(long)]
+        commit: String,
+        /// Suite name (part of the record ID and the node name).
+        #[arg(long)]
+        suite: String,
+        /// The exact command that produced the criterion output. Stored, never
+        /// executed.
+        #[arg(long)]
+        command: Option<String>,
+        /// Caller-supplied RFC 3339 timestamp. Validated.
+        #[arg(long)]
+        executed_at: String,
+        /// Optional repository identity (reserved for scoping).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Optional code graph (from `eg scan`) to resolve benchmark ids to
+        /// Symbol/File.
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Input format. Only `criterion-estimates` (the default) is accepted.
+        #[arg(long, default_value = "criterion-estimates")]
+        format: String,
+    },
+    /// Capture a local Verus proof run as citable verification-domain records
+    /// (issue #69).
+    ///
+    /// EXECUTES the verifier: runs the local `verus` binary on `--target` and
+    /// records the outcome as a `ProofResult` node (normalized proof summary in
+    /// `stdout_handle`) plus a `CommandRun` node (exact argv, exit code,
+    /// redacted stdout/stderr handles), the proof linked to the command via an
+    /// `evidence_links` `HAS_EVIDENCE` citation. Proof statuses are `pass`,
+    /// `fail`, `timeout`, and `error` (fail-closed: unrecognized verifier
+    /// output is never a silent pass).
+    ///
+    /// Exit codes: 0 captured (any proof status — a failing PROOF is still a
+    /// successful CAPTURE); 1 usage error; 2 pre-execution failure (missing /
+    /// non-executable verifier binary, unsupported verifier version, or
+    /// missing / stale / ambiguous proof target — a stable diagnostic is
+    /// written to `--out`, never a `ProofResult`); 3 protected-store I/O
+    /// failure. See `docs/cli/capture-proof.md`.
+    CaptureProof {
+        /// Path to the local `verus` binary. A bare name is resolved against
+        /// PATH; the operator must have a real Verus installed.
+        #[arg(long, default_value = "verus")]
+        verus_bin: PathBuf,
+        /// Extra argument passed to the verifier before the target.
+        /// Repeatable.
+        #[arg(long = "verus-arg")]
+        verus_arg: Vec<String>,
+        /// Proof target file to verify.
+        #[arg(long)]
+        target: PathBuf,
+        /// Output JSONL path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Stable session identity (part of the record ID).
+        #[arg(long)]
+        session: String,
+        /// Commit SHA the target is evaluated at (part of the record ID).
+        #[arg(long)]
+        commit: String,
+        /// Caller-supplied RFC 3339 timestamp. Validated. This is what makes
+        /// the capture deterministic: no wall clock enters the record IDs.
+        #[arg(long)]
+        executed_at: String,
+        /// Skip the `verus --version` probe and use this version string.
+        #[arg(long)]
+        verifier_version: Option<String>,
+        /// Repository identity label (stored on the records).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Wall-clock budget in seconds for the verifier run.
+        #[arg(long, default_value_t = 600)]
+        timeout_secs: u64,
+        /// Wall-clock budget in seconds for the `verus --version` probe.
+        #[arg(long, default_value_t = 30)]
+        probe_timeout_secs: u64,
+        /// Also store the raw (unredacted) verifier stdout/stderr in the
+        /// protected store for audit. Requires --protected-store and --producer.
+        #[arg(long)]
+        protected_raw_artifacts: bool,
+        /// Protected store directory for raw artifacts.
+        #[arg(long)]
+        protected_store: Option<PathBuf>,
+        /// Producer identity for protected-store writes.
+        #[arg(long)]
+        producer: Option<String>,
     },
     /// Capture a `cargo test` / libtest JSON run as a citable verification-domain
     /// `TestRun` record (issue #165).
@@ -368,6 +682,82 @@ pub(crate) enum Commands {
         graph: Option<PathBuf>,
         /// Input format. Only `libtest-json` (the default) is accepted.
         #[arg(long, default_value = "libtest-json")]
+        format: String,
+        /// Capture the raw input bytes into the protected store (issue #60).
+        /// Requires `--protected-store` and `--producer`.
+        #[arg(long)]
+        protected_raw_artifacts: bool,
+        /// Protected store directory (required with `--protected-raw-artifacts`).
+        #[arg(long)]
+        protected_store: Option<PathBuf>,
+        /// Producer identity for the captured blob (required with `--protected-raw-artifacts`).
+        #[arg(long)]
+        producer: Option<String>,
+    },
+    /// Capture a `cargo llvm-cov` run as a citable verification-domain
+    /// `CoverageReport` record (issue #230).
+    ///
+    /// CAPTURE-ONLY: never executes a coverage tool. The caller runs the
+    /// coverage tool, captures its machine-readable artefact (`cargo llvm-cov
+    /// --json` or `--lcov`) to a file, and hands that file plus the run
+    /// metadata here. Parses it into a redaction-safe `CoverageReport` node
+    /// (verification domain, `coverage_report` kind) with overall and per-file
+    /// line coverage (branch/region/function figures when the artefact has
+    /// them); raw report text never enters the graph. With `--graph` (a code
+    /// graph from `eg scan`) each measured file that resolves to a `File`
+    /// mints a `TOUCHED_FILE` edge, and each named function (LCOV) whose final
+    /// `::`-segment resolves to exactly one `Symbol` mints a
+    /// `MENTIONS_SYMBOL` edge; files that do not resolve join a distinct
+    /// `unresolved` set with a `Diagnostic` instead of a wrong edge.
+    ///
+    /// Exit codes: 0 success; 1 usage/provenance error; 3 protected-store I/O
+    /// failure; 4 empty input; 5 unparseable input or missing coverage tool (a
+    /// `coverage_tool_missing` diagnostic when the artefact carries the tool's
+    /// own not-installed error text). A captured coverage number is a recorded
+    /// observation of one run — lines executed by some test, never proof the
+    /// behavior is correct. See `docs/cli/capture-coverage.md`.
+    CaptureCoverage {
+        /// Path to the file holding the coverage artefact (stored, never run).
+        #[arg(long)]
+        input: PathBuf,
+        /// Output JSONL path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Stable session identity (part of the record ID).
+        #[arg(long)]
+        session_id: String,
+        /// Commit handle / external identifier (part of the record ID).
+        #[arg(long)]
+        commit: String,
+        /// Optional suite/target name (node `name`; not part of the record ID).
+        #[arg(long)]
+        suite: Option<String>,
+        /// The exact command that produced the artefact. Stored, never executed.
+        #[arg(long)]
+        command: String,
+        /// The coverage command's exit status.
+        #[arg(long)]
+        exit_code: i64,
+        /// Caller-supplied RFC 3339 timestamp. Validated.
+        #[arg(long)]
+        executed_at: String,
+        /// Coverage tool identity (part of the record ID).
+        #[arg(long, default_value = "cargo-llvm-cov")]
+        tool: String,
+        /// Optional coverage tool version.
+        #[arg(long)]
+        tool_version: Option<String>,
+        /// Optional repository identity (reserved for scoping).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Optional repository root used to relativize absolute artefact paths.
+        #[arg(long)]
+        repo_root: Option<PathBuf>,
+        /// Optional code graph (from `eg scan`) to resolve files/functions to File/Symbol.
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Input format. `llvm-cov-json` (the default) or `llvm-cov-lcov`.
+        #[arg(long, default_value = "llvm-cov-json")]
         format: String,
         /// Capture the raw input bytes into the protected store (issue #60).
         /// Requires `--protected-store` and `--producer`.
@@ -468,7 +858,7 @@ pub(crate) enum Commands {
     /// verification) completely untouched.
     ///
     /// Shortest workflow (`docs/cli/refresh.md`):
-    ///   1. `eg scan <repo> --out g.jsonl && eg ingest g.jsonl --adapter embedded --data-dir .egregore`
+    ///   1. `eg init <repo> --data-dir .egregore`
     ///   2. (edit source files …)
     ///   3. `eg refresh <repo> --data-dir .egregore`
     ///   4. `eg query symbol <name> --data-dir .egregore`
@@ -482,8 +872,10 @@ pub(crate) enum Commands {
         /// Repository path to scan.
         repo_path: PathBuf,
         /// Embedded `AletheiaDB` data directory.
-        #[arg(long, default_value = ".egregore")]
-        data_dir: PathBuf,
+        ///
+        /// Defaults to the `data_dir` pinned in `egregore.toml`, else `.egregore`.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
         /// Incremental scan cache path.
         /// Defaults to `<data-dir>/codegraph-cache.json`.
         #[arg(long)]
@@ -499,9 +891,52 @@ pub(crate) enum Commands {
         #[cfg(feature = "embeddings")]
         #[arg(long)]
         embed: bool,
+        /// Embedding model identifier for `--embed`.
+        ///
+        /// Precedence: `--embed-model` \> `[embeddings].model` in `egregore.toml`
+        /// \> built-in default. The resolved model is what the embedder loads
+        /// and what the store's vector-index identity records; writing into an
+        /// index built by a different model is refused rather than blending
+        /// two vector spaces (issue #104).
+        #[cfg(feature = "embeddings")]
+        #[arg(long)]
+        embed_model: Option<String>,
         /// Keep source-embedded secrets in raw form instead of redacting them.
         #[arg(long)]
         raw_literals: bool,
+    },
+    /// Re-embed an `--embed` store under a different local embedding model
+    /// without re-scanning sources (issue #167).
+    ///
+    /// Every node that already carries a persisted `embedding` vector is
+    /// re-embedded with the target model; the `#104` vector-index identity
+    /// record is superseded in the same transaction, and the vector index is
+    /// rebuilt when the dimension changes. No source scan, no graph
+    /// re-extraction, no remote embedding service: the target model must
+    /// already be available locally (a local directory, or a Hugging Face id
+    /// present in the local HF cache) — it is never downloaded.
+    ///
+    /// Machine-readable report on `--format json` (`candidates`,
+    /// `reembedded`, `skipped`, `failed` counts); exit `12` when the model is
+    /// not available locally, `13` for `--dry-run` with work remaining, `14`
+    /// when the store has nothing to migrate. See `docs/cli/re-embed.md`.
+    #[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
+    #[command(name = "re-embed")]
+    Reembed {
+        /// Embedded `AletheiaDB` data directory holding the `--embed` store.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Re-embed target model: a local model directory, or a Hugging Face
+        /// model id resolved from the local HF cache only (never downloaded).
+        #[arg(long)]
+        model: String,
+        /// Output format for the re-embed report.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+        /// Plan without mutating: prints the candidate count and target model,
+        /// exits `13` while work remains, leaves the store byte-identical.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Inspect a graph JSONL file, an embedded store, or a running daemon.
     ///
@@ -529,6 +964,66 @@ pub(crate) enum Commands {
         /// newline-delimited `json` for embedded `--data-dir` inspection.
         #[arg(long)]
         format: Option<OutputFormat>,
+    },
+    /// Catalog a store's repositories with the selectors that scope repository-scoped queries (issue #193).
+    ///
+    /// Reads an embedded `--data-dir` store directly — no daemon, no network,
+    /// no embeddings — and lists every live repository with its stable record
+    /// ID, its `identity_source`, the human-usable scope selector the `--repo`
+    /// query lanes accept verbatim, a node count, and a recency hint. The
+    /// read is strictly read-only and the output is byte-identical across
+    /// runs on an unchanged store. When two repositories share a human
+    /// selector, the collision is surfaced with each repository's distinct
+    /// stable ID rather than silently de-duplicated. An empty store reports
+    /// an explicit empty roster with the stable `empty_repository_roster`
+    /// diagnostic. See `docs/cli/repos.md` for the documented JSON contract.
+    Repos {
+        /// Graph JSONL path to catalog.
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory.
+        #[arg(long, conflicts_with = "graph")]
+        data_dir: Option<PathBuf>,
+        /// Output format: newline-delimited `json` (default) or `text`.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+        format: OutputFormat,
+    },
+    /// Brief an agent on graph evidence scoped to the working-tree diff (issue #214).
+    ///
+    /// Resolves the uncommitted working-tree diff at `repo_path` (staged +
+    /// unstaged, or staged-only with `--staged-only`) into `File` and `Symbol`
+    /// handles and returns one JSON object with trust-separated sections:
+    /// `source_facts`, `prior_failures` (runtime vs agent-authored),
+    /// `observations`, `decisions`, `in_flight_tasks`,
+    /// `verification_evidence`, `drift_warnings`, and a `store_coverage` map.
+    /// Also carries the store-freshness staleness marker shared with
+    /// `eg freshness`: a briefing over a dirty tree reads `stale_dirty`
+    /// instead of failing or silently returning partial data.
+    ///
+    /// Strictly read-only: the diff is computed with read-only Git plumbing
+    /// (`GIT_OPTIONAL_LOCKS=0`; no checkout, stash, or index refresh) and the
+    /// store is only read, never re-scanned or mutated. Clean working trees
+    /// return `ok: true` with empty but well-formed sections. See
+    /// `docs/cli/brief.md`.
+    Brief {
+        /// Repository working-tree path to diff (defaults to the current directory).
+        #[arg(default_value = ".")]
+        repo_path: PathBuf,
+        /// Graph JSONL store to read (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory to read (mutually exclusive with --graph).
+        #[arg(long, conflicts_with = "graph")]
+        data_dir: Option<PathBuf>,
+        /// Restrict graph resolution to one stored repository by its identity ID.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Only consider staged (index vs HEAD) changes; unstaged working-tree
+        /// changes and untracked files are excluded.
+        #[arg(long = "staged-only", visible_alias = "staged")]
+        staged_only: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
     },
     /// Report whether a store still matches the current working tree (issue #82).
     ///
@@ -601,6 +1096,59 @@ pub(crate) enum Commands {
         /// Graph JSONL path to index.
         graph: PathBuf,
     },
+    /// Bootstrap a repository into an embedded store in one command (issue #229).
+    ///
+    /// Runs the current-tree scan, embedded ingest with semantic embeddings
+    /// (on by default; pass `--no-embed` to skip loudly), Git history replay,
+    /// and history ingest end-to-end into a single embedded `AletheiaDB` data
+    /// directory, then prints a machine-readable bootstrap report. This is
+    /// the one-command equivalent of the manual onboarding sequence:
+    /// `eg scan` → `eg ingest --embed` → `eg scan-history` → `eg ingest`.
+    /// Fully offline except for the one-time embedding-model download.
+    ///
+    /// History replay reads Git objects read-only and never mutates the
+    /// working tree or Git state. Intermediate graph JSONL lives in a system
+    /// temporary directory, never in the repository being bootstrapped.
+    ///
+    /// Idempotent: a second `init` on an unchanged repository converges to a
+    /// no-op, exits with code 3, and reports `status: "already_current"`.
+    /// Optional stages (embeddings, history) may be skipped or partially
+    /// fail — the report names every stage and the store stays non-corrupt —
+    /// while required-stage failures print the report before exiting 1.
+    /// A refusal before any write (capacity preflight, embedding-index
+    /// identity conflict) exits 2 and leaves the store untouched.
+    ///
+    /// See `docs/cli/init.md`.
+    Init {
+        /// Working-tree path of the repository to bootstrap.
+        #[arg(default_value = ".")]
+        repo_path: PathBuf,
+        /// Embedded `AletheiaDB` data directory to bootstrap into.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output format for the bootstrap report.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+        /// Skip semantic embedding generation (loudly reported in the report).
+        #[cfg(feature = "embeddings")]
+        #[arg(long)]
+        no_embed: bool,
+        /// Embedding model identifier.
+        ///
+        /// Precedence: `--embed-model` \> `[embeddings].model` in
+        /// `egregore.toml` \> built-in default. The resolved model is recorded
+        /// in the store's vector-index identity; a store whose index was
+        /// built by a different model refuses the bootstrap (issue #104).
+        #[cfg(feature = "embeddings")]
+        #[arg(long)]
+        embed_model: Option<String>,
+        /// Override the auto-detected repository identity.
+        #[arg(long)]
+        repo_id_override: Option<String>,
+        /// Include raw literal values in scanned records.
+        #[arg(long)]
+        raw_literals: bool,
+    },
     /// Ingest graph JSONL through a storage adapter.
     Ingest {
         /// Graph JSONL path to ingest.
@@ -611,6 +1159,30 @@ pub(crate) enum Commands {
         /// Embedded `AletheiaDB` data directory.
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Create the store with encrypted-at-rest mode (issue #54).
+        ///
+        /// Creation-time opt-in only: requires a fresh `--data-dir` and
+        /// `--key-file`. There is no live migration of an existing plaintext
+        /// store, and the flags are redundant (ignored) when the store is
+        /// already encrypted — the pinned store marker governs afterwards.
+        #[cfg(feature = "embedded-aletheiadb")]
+        #[arg(long)]
+        encrypted: bool,
+        /// Key file for `--encrypted` (created with `eg keygen`).
+        ///
+        /// Without `--passphrase-env` this must be a raw 32-byte key file;
+        /// with `--passphrase-env` it must be the passphrase-wrapped AEKF file
+        /// whose passphrase lives in the named env var.
+        #[cfg(feature = "embedded-aletheiadb")]
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+        /// Env var holding the passphrase for a passphrase-wrapped key file.
+        ///
+        /// Only meaningful with `--encrypted --key-file`. The passphrase is
+        /// read from the environment, never from the command line.
+        #[cfg(feature = "embedded-aletheiadb")]
+        #[arg(long)]
+        passphrase_env: Option<String>,
         /// Agent ID for daemon-backed writes.
         #[arg(long, default_value = "egregore-cli")]
         agent_id: String,
@@ -624,6 +1196,15 @@ pub(crate) enum Commands {
         #[cfg(feature = "embeddings")]
         #[arg(long)]
         embed: bool,
+        /// Embedding model identifier for `--embed`.
+        ///
+        /// Precedence: `--embed-model` \> `[embeddings].model` in `egregore.toml`
+        /// \> built-in default. The resolved model is recorded in the store's
+        /// vector-index identity, so `eg query semantic` can prove the query
+        /// embedder shares the index's vector space (issue #261).
+        #[cfg(feature = "embeddings")]
+        #[arg(long)]
+        embed_model: Option<String>,
         /// Bypass the ingest capacity preflight (issue #439). The preflight
         /// refuses fast when a graph is estimated to overflow the configured
         /// `AletheiaDB` string-interner cap (10M since the 0.2.0 upgrade);
@@ -632,6 +1213,13 @@ pub(crate) enum Commands {
         #[cfg(feature = "embedded-aletheiadb")]
         #[arg(long)]
         force: bool,
+        /// Dangling cross-domain evidence citation policy (issue #241):
+        /// `quarantine` (default) skips records whose evidence citations cite
+        /// no live node and ingests the rest of the batch; `reject-batch`
+        /// writes nothing when any citation dangles. For `--adapter daemon`
+        /// the policy is forwarded to the daemon in the ingest request.
+        #[arg(long, value_enum, default_value_t = DanglingCitationPolicy::Quarantine)]
+        dangling_citation_policy: DanglingCitationPolicy,
     },
     /// Export every persisted record from an embedded store as canonical JSONL.
     ///
@@ -849,6 +1437,24 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// Generate a key file for encrypted local store mode (issue #54).
+    ///
+    /// Writes a raw 32-byte key file (0600) for `eg ingest --encrypted
+    /// --key-file`, or — with `--passphrase-env` — a passphrase-wrapped AEKF
+    /// file (Argon2id) whose passphrase is read from the named env var.
+    /// Refuses to overwrite an existing file. Never prints key material.
+    #[cfg(feature = "embedded-aletheiadb")]
+    Keygen {
+        /// Output path for the key file.
+        #[arg(long)]
+        out: PathBuf,
+        /// Env var holding the passphrase for a passphrase-wrapped key file.
+        ///
+        /// When set, the passphrase is read from this env var (never the
+        /// command line) and the output is an AEKF file instead of a raw key.
+        #[arg(long)]
+        passphrase_env: Option<String>,
+    },
     /// Record an operator decision for a promotion candidate.
     Decide {
         /// Candidate ID to decide on.
@@ -948,6 +1554,93 @@ pub(crate) enum Commands {
         /// dry-run that mutates nothing.
         #[arg(long)]
         confirm: bool,
+    },
+    /// Retire an agent-memory record from recall without erasing its history
+    /// (issue #156).
+    ///
+    /// Appends a `RetirementReceipt` node recording who retired the record,
+    /// when, and why; the target record and its provenance are never mutated.
+    /// The retired record is excluded from default `eg query semantic-memory`
+    /// recall until reinstated. Retiring an already-retired record is an
+    /// idempotent success returning the existing receipt.
+    ///
+    /// Only observation-class agent-memory records (Observation, Decision,
+    /// Failure) are retireable. Deterministic code-graph facts are refused
+    /// with a machine-readable error and zero writes.
+    ///
+    /// Reasons: `superseded` (requires `--superseded-by` naming a live,
+    /// active, observation-class record; also writes a normal `SUPERSEDES`
+    /// edge), `drifted` (requires `--evidence-handle` naming an evidence
+    /// handle the target cited that no longer resolves), `contradicted`
+    /// (optional `--evidence-handle` naming a live record), and
+    /// `operator-decision` (no evidence required).
+    ///
+    /// Success prints a JSON envelope on stdout and exits 0. Failures print a
+    /// machine-readable JSON envelope on stderr and exit 1 (refused or
+    /// malformed) or 2 (handle not found). See `docs/cli/retire.md`.
+    #[cfg(feature = "embedded-aletheiadb")]
+    Retire {
+        /// Stable record ID of the record to retire.
+        handle: String,
+        /// Graph JSONL file to append the receipt to (offline mode; mutually
+        /// exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with
+        /// --graph; defaults to `.egregore`).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Typed retirement reason: `superseded`, `drifted`, `contradicted`,
+        /// or `operator-decision` (`operator_decision` is also accepted).
+        #[arg(long)]
+        reason: String,
+        /// Superseding record (required for `superseded`).
+        #[arg(long)]
+        superseded_by: Option<String>,
+        /// Evidence handle (required for `drifted`; optional for
+        /// `contradicted` and `operator-decision`).
+        #[arg(long)]
+        evidence_handle: Option<String>,
+        /// Operator handle recorded as the retiring actor.
+        #[arg(long, default_value = "operator")]
+        retired_by: String,
+        /// Fixed RFC 3339 transaction time for deterministic output (useful for
+        /// tests). Defaults to the current wall-clock instant.
+        #[arg(long)]
+        transaction_time: Option<String>,
+    },
+    /// Reinstate a retired agent-memory record to active recall (issue #156).
+    ///
+    /// Appends a `ReinstatementReceipt` node; the retirement receipt stays in
+    /// history and the record returns to default recall because the
+    /// reinstatement is the newest receipt. Reinstating a record that is not
+    /// retired is a refusal, not a silent no-op.
+    ///
+    /// Success prints a JSON envelope on stdout and exits 0. Failures print a
+    /// machine-readable JSON envelope on stderr and exit 1 (refused or
+    /// malformed) or 2 (handle not found). See `docs/cli/retire.md`.
+    #[cfg(feature = "embedded-aletheiadb")]
+    Reinstate {
+        /// Stable record ID of the record to reinstate.
+        handle: String,
+        /// Graph JSONL file to append the receipt to (offline mode; mutually
+        /// exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with
+        /// --graph; defaults to `.egregore`).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Free-text reason for the reinstatement, recorded on the receipt.
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// Operator handle recorded as the reinstating actor.
+        #[arg(long, default_value = "operator")]
+        reinstated_by: String,
+        /// Fixed RFC 3339 transaction time for deterministic output (useful for
+        /// tests). Defaults to the current wall-clock instant.
+        #[arg(long)]
+        transaction_time: Option<String>,
     },
     /// Offline repair workflow for Egregore stores.
     ///
@@ -1076,6 +1769,23 @@ pub(crate) enum Commands {
         #[arg(long)]
         embed: bool,
     },
+    /// Emit JSON Schemas for the persisted graph record contracts (issue #226).
+    ///
+    /// `eg schema export` prints draft 2020-12 documents derived from the Rust
+    /// types in `src/ir.rs`, one per addressable `(domain, kind,
+    /// schema_version)` tuple. `eg schema list` lists the addressable tuples.
+    /// See `docs/cli/schema.md`.
+    ///
+    /// Exit codes:
+    ///   0 — schemas emitted.
+    ///   1 — I/O error writing `--out` files.
+    ///   2 — unknown domain/kind/version tuple (machine-readable JSON error on
+    ///       stderr).
+    Schema {
+        /// Schema action.
+        #[command(subcommand)]
+        action: SchemaAction,
+    },
 }
 
 /// Subcommands for `import`.
@@ -1115,6 +1825,35 @@ pub(crate) enum ImportSource {
         #[arg(long, hide = true)]
         no_backoff: bool,
     },
+    /// Import repo-local design docs (ADR/PRD/Plan markdown) as artifact-domain
+    /// records (issue #149).
+    ///
+    /// Deterministic and filesystem-local: scans the documented doc roots
+    /// (`docs/adr/`, `docs/prd/`, `docs/plans/`), emits one node per markdown
+    /// doc plus `RELATES_TO` / `MENTIONS_SYMBOL` edges only for explicit
+    /// literal references resolved against a supplied code graph. Any
+    /// diagnostic (empty doc, unknown root, unresolved reference, zero
+    /// resolvable references, …) exits 2 with stable machine-readable JSON
+    /// diagnostics on stderr; output carries no raw body text.
+    Docs {
+        /// Repo root containing the doc roots (defaults to `.`).
+        #[arg(long)]
+        repo_root: Option<PathBuf>,
+        /// Doc roots to scan, relative to the repo root. Repeatable.
+        /// Defaults to `docs/adr`, `docs/prd`, `docs/plans`.
+        #[arg(long)]
+        root: Vec<String>,
+        /// Seeded code-graph JSONL (from `scan`) for reference resolution.
+        /// Without it every reference is an `unresolved_reference` diagnostic.
+        #[arg(long)]
+        code_graph: Option<PathBuf>,
+        /// Output JSONL path (default: stdout).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Fixed RFC 3339 transaction time for deterministic output (tests).
+        #[arg(long)]
+        transaction_time: Option<String>,
+    },
 }
 
 /// Output format for query results.
@@ -1125,6 +1864,127 @@ pub(crate) enum OutputFormat {
     Json,
     /// Human-readable one-line-per-result form.
     Text,
+}
+
+/// Collapse clustering mode for `eg query semantic-memory --collapse`
+/// (issue #163).
+///
+/// Only used by the `embeddings`-gated `SemanticMemory` subcommand, so the
+/// enum is gated the same way: without the feature it would be dead code.
+#[cfg(feature = "embeddings")]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, clap::ValueEnum, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum CollapseModeArg {
+    /// Use embedding-cosine similarity when the store has a loaded vector
+    /// index; degrade to normalized-text equality clustering when the store
+    /// was never embedded. An unreadable index is refused, not degraded over.
+    #[default]
+    Auto,
+    /// Cosine similarity over stored vectors; refused without a loaded
+    /// vector index (no silent fallback).
+    #[value(name = "embedding-cosine")]
+    EmbeddingCosine,
+    /// Normalized-text equality clustering over the stored (redacted) body
+    /// text; works without embeddings and never loads a model.
+    #[value(name = "normalized-text")]
+    NormalizedText,
+}
+
+/// Test-vs-production role selector for the scopable code lanes
+/// (`query symbol`, `query file`; issue #238).
+///
+/// Filters rows by the deterministic `role` stamped on each `Symbol` record
+/// at scan time. `All` (the default) is a no-op: rows whose record predates
+/// issue #238 (role unknown) are returned only under `All` — they match
+/// neither `Production` nor `Test`, because an unknown role is not a
+/// `Production` fact.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, clap::ValueEnum)]
+pub(crate) enum RoleFilter {
+    /// Return test and production rows (default); the only selector that
+    /// returns rows whose role is unknown (pre-#238 records).
+    #[default]
+    All,
+    /// Return only rows stamped `production`.
+    Production,
+    /// Return only rows stamped `test`.
+    Test,
+}
+
+impl RoleFilter {
+    /// Whether a row carrying `role` survives this selector. A `None` role
+    /// (record predates issue #238) survives only [`RoleFilter::All`].
+    pub(crate) fn matches(self, role: Option<crate::ir::SymbolRole>) -> bool {
+        match self {
+            Self::All => true,
+            Self::Production => role == Some(crate::ir::SymbolRole::Production),
+            Self::Test => role == Some(crate::ir::SymbolRole::Test),
+        }
+    }
+
+    /// The stable CLI spelling: `"all"`, `"production"`, or `"test"`.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Production => "production",
+            Self::Test => "test",
+        }
+    }
+}
+
+/// Which input sources `eg audit query-latency` measures (issue #255).
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, clap::ValueEnum)]
+pub(crate) enum LatencySource {
+    /// Measure only `--graph <JSONL>`.
+    Graph,
+    /// Measure only `--data-dir <embedded store>`.
+    DataDir,
+    /// Measure both sources (default).
+    #[default]
+    Both,
+}
+
+/// Subcommands for `config` (issue #261).
+#[derive(Debug, Subcommand)]
+pub(crate) enum ConfigAction {
+    /// Print the effective resolved configuration as JSON: the discovered
+    /// `egregore.toml` (or `null` when absent), every value, and where each
+    /// value came from (`"config"` or `"default"`). See `docs/cli/config.md`.
+    Show,
+}
+
+/// Subcommands for `schema` (issue #226).
+#[derive(Debug, Subcommand)]
+pub(crate) enum SchemaAction {
+    /// Emit JSON Schema (draft 2020-12) documents for persisted record contracts.
+    ///
+    /// With `--domain`/`--kind`/`--schema-version`, emits only the matching
+    /// contracts; a single matching document prints as one JSON object,
+    /// several print as a JSON array. Without filters, emits every
+    /// addressable `(domain, kind, schema_version)` tuple as a JSON array.
+    /// With `--out <dir>`, writes one
+    /// `<domain>.<record_type>.<kind>.v<version>.schema.json` file per tuple
+    /// and prints a JSON summary instead of the documents.
+    Export {
+        /// Restrict to one domain (e.g. `codegraph`).
+        #[arg(long)]
+        domain: Option<String>,
+        /// Restrict to one node kind or edge label (e.g. `Symbol`, `CALLS`).
+        /// `"Tombstone"` selects tombstone contracts.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Restrict to one schema version.
+        #[arg(long)]
+        schema_version: Option<u32>,
+        /// Write one file per tuple into this directory instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// List every addressable `(domain, kind, schema_version)` contract as JSON.
+    List {
+        /// Restrict to one domain.
+        #[arg(long)]
+        domain: Option<String>,
+    },
 }
 
 /// Subcommands for `query`.
@@ -1199,6 +2059,11 @@ pub(crate) enum QuerySubcommand {
         /// runtime with an `unsupported_combination` envelope).
         #[arg(long)]
         all_history: bool,
+        /// Scope results by test-vs-production role (issue #238): `all`
+        /// (default), `production`, or `test`. Rows whose record predates
+        /// issue #238 carry no role and appear only under `all`.
+        #[arg(long, default_value = "all")]
+        role: RoleFilter,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -1323,6 +2188,11 @@ pub(crate) enum QuerySubcommand {
         /// no freshness field. See `eg query symbol --help`.
         #[arg(long)]
         repo_path: Option<PathBuf>,
+        /// Scope results by test-vs-production role (issue #238): `all`
+        /// (default), `production`, or `test`. Rows whose record predates
+        /// issue #238 carry no role and appear only under `all`.
+        #[arg(long, default_value = "all")]
+        role: RoleFilter,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -1344,6 +2214,47 @@ pub(crate) enum QuerySubcommand {
         repo: Option<String>,
         /// Maximum number of results (default 10).
         #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Group exact-duplicate Rust symbol bodies into citable clone classes (issue #216).
+    ///
+    /// A clone class is the set of live `Symbol` records sharing one
+    /// normalized-body content hash (`blake3:` over the comment-stripped,
+    /// whitespace-collapsed body), reported with citable handles only
+    /// (record ID, repo-relative path, span, qualified name) — never raw
+    /// source. Classes order by size descending, then hash; the answer is
+    /// byte-stable across repeated runs on an unchanged store.
+    ///
+    /// Exit codes:
+    ///   0 — report returned (an empty class list is a well-formed
+    ///       `no_clone_classes` answer, not an error).
+    ///   1 — load error, invalid --limit/--min-size, unknown/ambiguous --repo selector.
+    ///
+    /// Documented in `docs/cli/clones.md`.
+    Clones {
+        /// Graph JSONL path (mutually exclusive with --data-dir / --daemon).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Route the query through the running daemon (requires --data-dir, conflicts with --graph).
+        #[cfg(feature = "embedded-aletheiadb")]
+        #[arg(long, requires = "data_dir", conflicts_with = "graph")]
+        daemon: bool,
+        /// Restrict results to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Minimum clone-class size: only classes with at least N members are
+        /// reported (default 2).
+        #[arg(long, default_value_t = query::CLONES_DEFAULT_MIN_SIZE)]
+        min_size: usize,
+        /// Maximum clone classes returned (default 50, max 500); excess
+        /// classes are truncated with an explicit `truncated` signal.
+        #[arg(long, default_value_t = query::CLONES_DEFAULT_LIMIT)]
         limit: usize,
         /// Output format.
         #[arg(long, default_value = "json")]
@@ -1373,6 +2284,53 @@ pub(crate) enum QuerySubcommand {
         #[arg(long, conflicts_with = "daemon")]
         under: Option<String>,
         /// Maximum number of results (default 10).
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+        /// Embedding model used to vectorize the query text: a local model
+        /// directory, or a Hugging Face model id resolved from the local HF
+        /// cache only (never downloaded; issue #167).
+        ///
+        /// Defaults to the built-in model. The store's `#104` vector-index
+        /// identity must match the resolved model; otherwise the query is
+        /// refused — e.g. after `eg re-embed --model <m>`, query with
+        /// `--embed-model <m>`.
+        #[cfg(feature = "embeddings")]
+        #[arg(long, conflicts_with = "daemon")]
+        embed_model: Option<String>,
+    },
+    /// Find symbols semantically similar to a given symbol (issue #154).
+    ///
+    /// Ranks the symbol/file nodes most similar to an existing symbol by
+    /// cosine similarity of stored embeddings — the "who else does this?"
+    /// lookup for surfacing reusable code. The anchor's already-stored
+    /// embedding is the query: no model is loaded, nothing is re-scanned,
+    /// and the anchor itself is never returned.
+    ///
+    /// Rows are `SemanticResult` records (`record_id`, `name`,
+    /// `repo_relative_path`, `span`, `score`), ordered by score descending
+    /// with ties broken by `record_id` ascending; the answer is byte-stable
+    /// across repeated runs on an unchanged store.
+    ///
+    /// Exit codes:
+    ///   0 — at least one similar node returned.
+    ///   1 — malformed/unresolvable/ambiguous handle, anchor without a stored
+    ///       embedding, or a store ingested without `--embed`.
+    ///   2 — the anchor resolved and is embedded, but no other node scored
+    ///       above the similarity floor.
+    ///
+    /// Documented in `docs/cli/query.md`.
+    #[cfg(feature = "embeddings")]
+    Similar {
+        /// Anchor handle: a qualified symbol name (e.g. `nested::Widget::new`)
+        /// or a `record_id` (`codegraph:v1:…`).
+        handle: String,
+        /// Embedded `AletheiaDB` data directory (must be ingested with `--embed`).
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Maximum number of similar nodes returned (default 10).
         #[arg(long, default_value_t = 10)]
         limit: usize,
         /// Output format.
@@ -1444,12 +2402,54 @@ pub(crate) enum QuerySubcommand {
         /// Exclude unverified agent observations (no cited verification evidence).
         #[arg(long)]
         verified_only: bool,
+        /// Restrict recall to observations authored by this agent identity
+        /// (issue #195). Composes with `--repo`, `--verified-only`,
+        /// `--not-agent`, and `--supersession`; the default (no flag) leaves
+        /// recall unscoped. Deterministic code-graph facts carry no `agent_id`
+        /// and are never returned by an author-scoped recall.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Exclude observations authored by this agent identity (issue #195).
+        /// Composes with `--agent`: a recalled observation must satisfy both
+        /// selectors (when both name the same agent the exclusion wins).
+        #[arg(long)]
+        not_agent: Option<String>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
         /// Supersession resolution mode for memory/observations.
         #[arg(long, value_enum, default_value_t = crate::temporal_status::SupersessionMode::Exclude)]
         supersession: crate::temporal_status::SupersessionMode,
+        /// Collapse near-duplicate observations into one representative row
+        /// per cluster (issue #163).
+        ///
+        /// The answer starts with an envelope naming the requested and actual
+        /// modes, the similarity threshold, and source/representative counts,
+        /// followed by one compact row per representative carrying
+        /// `cluster_size`, `member_ids`, `cluster_observed_at_min`,
+        /// `cluster_observed_at_max`, and `trust_spread`. Without this flag the
+        /// recall answer is unchanged.
+        #[arg(long)]
+        collapse: bool,
+        /// Cosine-similarity threshold for collapse clustering, in `[0.0, 1.0]`
+        /// (issue #163). Pinned default 0.85, echoed in the answer envelope;
+        /// ignored by normalized-text equality clustering. Raising it
+        /// monotonically refines the partition (clusters only split, never
+        /// merge); lowering it monotonically coarsens it.
+        #[arg(long, default_value_t = crate::query::DEFAULT_COLLAPSE_SIMILARITY_THRESHOLD)]
+        similarity_threshold: f32,
+        /// Collapse clustering mode (issue #163). `auto` (default) uses
+        /// embedding-cosine similarity when the store has a loaded vector
+        /// index and degrades to normalized-text equality when the store was
+        /// never embedded; an unreadable index is refused rather than
+        /// degraded over.
+        #[arg(long, value_enum, default_value_t = CollapseModeArg::Auto)]
+        collapse_mode: CollapseModeArg,
+        /// Include records retired from recall (issue #156), labeled with
+        /// their `retirement_state`. By default retired records are excluded
+        /// from recall with an exclusion diagnostic.
+        #[arg(long)]
+        include_retired: bool,
     },
     /// Retrieve evidence-backed context for a named symbol.
     ///
@@ -1459,11 +2459,18 @@ pub(crate) enum QuerySubcommand {
     /// Missing evidence links are surfaced as `unresolved` items.
     ///
     /// On no-match: emits `{"ok":false,"error":{"code":"no_match",...}}` to
-    /// stdout and exits with code 2. No synthesized prose; no hallucinated
+    /// stdout and exits with code 2. On ambiguity (issue #192): emits
+    /// `{"ok":false,"error":{"code":"ambiguous_symbol","candidates":[...],...}}`
+    /// to stdout and exits with code 1. No synthesized prose; no hallucinated
     /// fallback records.
     Context {
         /// Symbol name to look up.
         name: String,
+        /// Disambiguation selector (issue #192): a candidate `record_id` or
+        /// `file:span` handle from an `ambiguous_symbol` response, to get
+        /// context scoped to exactly that symbol.
+        #[arg(long)]
+        candidate: Option<String>,
         /// Graph JSONL path (mutually exclusive with --data-dir).
         #[arg(long)]
         graph: Option<PathBuf>,
@@ -1493,6 +2500,61 @@ pub(crate) enum QuerySubcommand {
         /// Supersession resolution mode for memory/observations.
         #[arg(long, value_enum, default_value_t = crate::temporal_status::SupersessionMode::Exclude)]
         supersession: crate::temporal_status::SupersessionMode,
+        /// Cap the total evidence records returned across all sections
+        /// (issue #211).
+        ///
+        /// Sections fill in envelope order; each keeps its top-ranked prefix
+        /// and a section that loses records is rendered as
+        /// `{"returned","total","records"}` so every omission is counted. A
+        /// budget at or above the natural section sizes leaves the answer
+        /// byte-identical to the un-budgeted one. Omit for the full answer.
+        #[arg(long)]
+        max_records: Option<usize>,
+        /// Token ceiling for a budgeted context pack (issue #131), counted
+        /// with the pinned `word-punct-v1` method (issue #84).
+        ///
+        /// The pack sheds the lowest-priority records first (unverified agent
+        /// observations before code facts) until the measured pack fits, and
+        /// reports `result_complete` plus an explicit drop account when it
+        /// shed anything. Mutually exclusive with `--max-bytes`: pick one
+        /// ceiling. Also mutually exclusive with `--max-records` — a pack's
+        /// sections are bare arrays (a complete pack's sections are identical
+        /// to the un-budgeted answer's), so the #211 truncated-section
+        /// accounting cannot render inside one; exclusivity avoids a new
+        /// silent-omission class. Omit both for the full answer.
+        #[arg(long, conflicts_with_all = ["max_bytes", "max_records"])]
+        max_tokens: Option<usize>,
+        /// Byte ceiling for a budgeted context pack (issue #131), measured
+        /// over the rendered JSON's UTF-8 bytes.
+        ///
+        /// Same pack semantics as `--max-tokens`: deterministic
+        /// trust-first fill priority, `result_complete`, and an explicit
+        /// drop account. Mutually exclusive with `--max-tokens` and
+        /// `--max-records` (see above). Omit both for the full answer.
+        #[arg(long, conflicts_with_all = ["max_tokens", "max_records"])]
+        max_bytes: Option<usize>,
+    },
+    /// Return the latest captured benchmark run for a benchmark id, symbol, or file.
+    Bench {
+        /// Benchmark id, symbol name, or file path to look up.
+        target: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict to the run captured at this commit SHA or unique prefix.
+        /// Mutually exclusive with --as-of.
+        #[arg(long, conflicts_with = "as_of")]
+        at: Option<String>,
+        /// Return the latest run at or before this RFC 3339 instant
+        /// (valid-time axis). Mutually exclusive with --at.
+        #[arg(long, conflicts_with = "at")]
+        as_of: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
     },
     /// Retrieve evidence-backed context for a task.
     Task {
@@ -1508,6 +2570,74 @@ pub(crate) enum QuerySubcommand {
         #[cfg(feature = "embedded-aletheiadb")]
         #[arg(long, requires = "data_dir", conflicts_with = "graph")]
         daemon: bool,
+    },
+    /// Surface ready-to-dispatch tasks by resolving task dependencies (issue #161).
+    TaskReady {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Flag in-flight tasks whose code footprints overlap (issue #150).
+    ///
+    /// Compares the deterministic code footprint of every in-flight task —
+    /// direct `MENTIONS_SYMBOL`/`TOUCHES_FILE` edges plus the two-hop
+    /// `REFERENCES_TASK` → session → `TOUCHED_FILE`/`MENTIONS_SYMBOL` path —
+    /// and reports each pair sharing at least one live `Symbol`/`File`
+    /// handle. Rows are inspection leads, never proof of edit conflict.
+    /// Exit 0 with an empty `pairs` list and `zero_overlaps: true` when
+    /// nothing overlaps; exit 2 (`no_project_data`) when no `Task` records
+    /// exist; exit 3 (`invalid_status_filter`) on a malformed `--status`
+    /// filter; exit 1 on malformed input.
+    ///
+    /// Documented in `docs/cli/task-overlap.md` and `docs/cli/query.md`.
+    TaskOverlap {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Comma-separated in-flight statuses to compare (default
+        /// `open,in_progress,blocked`). Only in-flight statuses are
+        /// eligible; any other value is rejected with exit 3.
+        #[arg(long)]
+        status: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    // Appended (issue #147); kept at the end to minimize cross-lane merge conflicts.
+    /// Gate task completion on live verification evidence for every acceptance
+    /// criterion (issue #147).
+    ///
+    /// Read-only, deterministic: for one task, every linked `AcceptanceCriterion`
+    /// is checked against the verification records that close it. A criterion
+    /// is satisfied only by a passing record (the shared
+    /// `verification_outcome` rule) whose cited code has not drifted since the
+    /// run (the issue #111 freshness signal). `ready: true` means every
+    /// criterion is satisfied; reasons are `missing_evidence`,
+    /// `failing_evidence`, or `stale_evidence`. Exit 0 for a verdict,
+    /// exit 2 (`no_match`) when the task does not exist.
+    ///
+    /// Documented in `docs/cli/task-evidence-gate.md` and `docs/cli/query.md`.
+    TaskEvidenceGate {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Task ID or handle (`p:<project-id>` / local external handle / record ID).
+        id_or_handle: String,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
     },
     /// List pending promotion candidates.
     Candidates {
@@ -1559,6 +2689,35 @@ pub(crate) enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Query the retirement state and receipt trail of one agent-memory
+    /// record (issue #156).
+    ///
+    /// Reports whether the record is currently retired from recall (or was at
+    /// the `--as-of` pin) plus the ordered receipt trail — retirements and
+    /// reinstatements with actor, transaction time, reason, and metadata —
+    /// without mutating anything. The target's original provenance is
+    /// reported from the untouched record.
+    ///
+    /// Documented in `docs/cli/retire.md`.
+    Retirement {
+        /// Agent-memory record ID (`agent_memory:v1:...`) whose retirement
+        /// state and receipt trail to report.
+        handle: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Pin the recall state to this RFC 3339 transaction-time instant:
+        /// receipts after the pin are invisible, so the reported state is
+        /// what recall would have shown then.
+        #[arg(long)]
+        as_of: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Audit the evidence behind one agent-authored memory claim.
     ///
     /// Starts from a memory record and returns its provenance, supporting,
@@ -1583,6 +2742,59 @@ pub(crate) enum QuerySubcommand {
         /// Exclude unverified observations; report each as an `excluded` diagnostic.
         #[arg(long)]
         verified_only: bool,
+        /// Cap the total evidence records returned across all sections
+        /// (issue #211).
+        ///
+        /// Sections fill in envelope order; each keeps its top-ranked prefix
+        /// and a section that loses records is rendered as
+        /// `{"returned","total","records"}` so every omission is counted. A
+        /// budget at or above the natural section sizes leaves the answer
+        /// byte-identical to the un-budgeted one. Omit for the full answer.
+        #[arg(long)]
+        max_records: Option<usize>,
+    },
+    /// Trace the agent-belief timeline for one code target (issue #235).
+    ///
+    /// Resolves `<TARGET>` (a symbol record ID, a repo-relative `path`,
+    /// a `path:line`, or an exact symbol name) to one `Symbol`/`File` record,
+    /// then returns every live agent-authored `Observation`, `Decision`, and
+    /// `Failure` citing it — oldest to newest by `observed_at` (falling back
+    /// to `ingested_at`, record ID tiebreaker) — each carrying a
+    /// machine-readable status (`current` | `superseded` | `contradicted` —
+    /// closed vocabulary), the forward record that overrode or disputed it,
+    /// and citation provenance. Output is metadata only: record IDs, handles,
+    /// timestamps, confidence, and statuses — never record bodies.
+    ///
+    /// Statuses derive solely from author-written `superseded_by` /
+    /// `SUPERSEDES` / `CONTRADICTS` data already in the store, resolved
+    /// through the shared temporal resolver. Contradiction is not truth
+    /// arbitration: both sides of a dispute stay visible.
+    ///
+    /// Exit codes:
+    ///   0 — timeline returned (possibly an explicit empty `entries: []`).
+    ///   1 — malformed handle or flag combination (JSON diagnostic, stderr).
+    ///   2 — target handle unknown, stale, or ambiguous, or a `path:line`
+    ///       with no enclosing symbol (JSON diagnostic on stderr; the
+    ///       `error.code` distinguishes `no_match`, `stale_handle`,
+    ///       `ambiguous`, and `no_symbol_at_line`).
+    ///
+    /// Documented in `docs/cli/belief-timeline.md` and `docs/cli/query.md`.
+    BeliefTimeline {
+        /// Symbol record ID, repo-relative file path, `path:line`, or exact
+        /// symbol name.
+        target: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict target handle resolution to one repository (issue #67).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Output format: `json` (default, machine-readable) or `text`.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+        format: OutputFormat,
     },
     /// Find changes and trust-separated evidence over a commit range.
     Changes {
@@ -1641,6 +2853,64 @@ pub(crate) enum QuerySubcommand {
         /// `unsupported_combination` envelope).
         #[arg(long)]
         all_history: bool,
+        /// Cap the total evidence records returned across all sections
+        /// (issue #211).
+        ///
+        /// Sections fill in envelope order; each keeps its top-ranked prefix
+        /// and a section that loses records is rendered as
+        /// `{"returned","total","records"}` so every omission is counted. A
+        /// budget at or above the natural section sizes leaves the answer
+        /// byte-identical to the un-budgeted one. Omit for the full answer.
+        #[arg(long)]
+        max_records: Option<usize>,
+    },
+    /// Rank code targets by repeated agent-failure density (issue #254).
+    ///
+    /// The store-wide complement to `eg query failures <HANDLE>`: instead of
+    /// requiring a caller-supplied target, this lane aggregates every live
+    /// agent-authored `Failure` record and ranks the code targets
+    /// (`Symbol`/`File`) they resolve to by **distinct failing-run count**
+    /// (total failure count is the documented tie-break) — the "here's where
+    /// agents keep drowning" map, for the operator deciding where to send
+    /// the next agent (or where a context fix is needed).
+    ///
+    /// Each row cites its evidence: the target record ID + repo-relative
+    /// path/span, and every contributing `Failure` record ID with its
+    /// run/session handle. Failures that resolve to no code target are
+    /// reported in an explicit `unresolved` section, never silently dropped.
+    /// Ordering is deterministic and byte-stable across repeated runs on an
+    /// unchanged store.
+    ///
+    /// Exit codes:
+    ///   0 — at least one live `Failure` record in scope (ranked rows may be
+    ///       empty when every failure is `unresolved`).
+    ///   1 — invalid `--limit`, or a malformed `--as-of`/`--since` instant
+    ///       (machine-readable JSON on stderr).
+    ///   2 — zero live `Failure` records in scope (`no_match`).
+    ///
+    /// Documented in `docs/cli/failure-hotspots.md` and `docs/cli/query.md`.
+    FailureHotspots {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Cap the number of ranked hotspots returned. The answer signals
+        /// whether the list was truncated.
+        #[arg(long, default_value_t = query::FAILURE_HOTSPOTS_DEFAULT_LIMIT)]
+        limit: usize,
+        /// Aggregate only failures observed at or before this RFC 3339
+        /// instant. May be combined with --since for a window.
+        #[arg(long)]
+        as_of: Option<String>,
+        /// Aggregate only failures observed at or after this RFC 3339
+        /// instant. May be combined with --as-of for a window.
+        #[arg(long)]
+        since: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
     },
     /// Flag agent observations whose cited code has drifted since recording (issue #85).
     ///
@@ -1709,6 +2979,19 @@ pub(crate) enum QuerySubcommand {
         /// Supersession resolution mode for memory/observations.
         #[arg(long, value_enum, default_value_t = crate::temporal_status::SupersessionMode::Exclude)]
         supersession: crate::temporal_status::SupersessionMode,
+        /// Restrict the `observations` section to memories authored by this
+        /// agent identity (issue #195). Composes with `--not-agent`; the
+        /// default (no flag) leaves recall unscoped. Deterministic code-graph
+        /// facts (the `source_facts` section) carry no `agent_id` and are
+        /// never presented as author-scoped memory — the selector applies to
+        /// agent-authored observations only.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Exclude observations authored by this agent identity (issue #195).
+        /// Composes with `--agent`: an observation must satisfy both selectors
+        /// (when both name the same agent the exclusion wins).
+        #[arg(long)]
+        not_agent: Option<String>,
     },
     /// Surface graph-derived change-impact LEADS for a symbol or file handle (issue #76).
     ///
@@ -1762,6 +3045,16 @@ pub(crate) enum QuerySubcommand {
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
+        /// Cap the total evidence records returned across all sections
+        /// (issue #211).
+        ///
+        /// Sections fill in envelope order; each keeps its top-ranked prefix
+        /// and a section that loses records is rendered as
+        /// `{"returned","total","records"}` so every omission is counted. A
+        /// budget at or above the natural section sizes leaves the answer
+        /// byte-identical to the un-budgeted one. Omit for the full answer.
+        #[arg(long)]
+        max_records: Option<usize>,
     },
     /// Walk the transitive inbound callers/referencers of a symbol with call paths (issue #139).
     ///
@@ -1831,6 +3124,130 @@ pub(crate) enum QuerySubcommand {
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
+    },
+    /// Map a symbol to the tests that exercise it before an edit (issue #126).
+    ///
+    /// Given a symbol record ID (`codegraph:vN:<hex>`) or exact symbol name,
+    /// walks inbound `CALLS` edges and reports every test symbol (extractor-
+    /// stamped `role == "test"`) that can reach the target. Non-test callers
+    /// are traversed but never reported: a test that calls through a helper
+    /// surfaces as `transitive` (hop > 1) with its full call path. Rows are
+    /// reachability LEADS, not proof of coverage: absence of a covering test
+    /// is not proof the symbol is untested by other means.
+    ///
+    /// Output is NDJSON: a summary header line (target, direction, edge
+    /// labels, max depth, totals, truncation, diagnostics, corpus-mode
+    /// provenance, and the reachability-lead disclaimer) followed by one line
+    /// per covering test (`--format text` renders the human view).
+    ///
+    /// Exit codes:
+    ///   0 — completed, including the explicit empty result when the symbol
+    ///       has no covering test in this view.
+    ///   1 — malformed / ambiguous / unsupported handle, invalid --max-depth,
+    ///       or unsupported combination; machine-readable JSON on stderr.
+    ///   2 — handle resolves to no live record (stale or unknown), or
+    ///       --at/--as-of names no resolvable commit.
+    ///
+    /// Documented in `docs/cli/tests.md` and `docs/cli/query.md`.
+    Tests {
+        /// Symbol record ID (`codegraph:vN:<hex>`) or exact symbol name.
+        handle: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict symbol resolution to one repository.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Inbound walk depth bound (hops from the queried symbol).
+        /// Reaching the bound yields a truncation diagnostic with dropped
+        /// frontier counts per depth rather than silently omitting reachable
+        /// callers.
+        #[arg(long, default_value_t = 5)]
+        max_depth: usize,
+        /// Restrict the walk to the graph state at this commit SHA or unique
+        /// prefix (requires a history graph). Mutually exclusive with --as-of.
+        #[arg(long, conflicts_with = "as_of")]
+        at: Option<String>,
+        /// Restrict the walk to the graph state at the most recent commit at
+        /// or before this RFC 3339 instant. Mutually exclusive with --at.
+        #[arg(long, conflicts_with = "at")]
+        as_of: Option<String>,
+        /// Route the query through the running daemon's `tests_for_symbol`
+        /// verb instead of reading the local store.
+        #[cfg(feature = "embedded-aletheiadb")]
+        #[arg(long, requires = "data_dir")]
+        daemon: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Render one symbol's local call neighborhood as a diagram (issue #228).
+    ///
+    /// A local-orientation lane for the transitive-family queries: given a
+    /// symbol record ID or an exact symbol name, draws the bounded
+    /// neighborhood around it — direct callers (`CALLS` in-edges), direct
+    /// callees (`CALLS` out-edges), and the containing file/module
+    /// (`DEFINES`/`CONTAINS`) — in a standard text diagram format
+    /// (Mermaid by default, or Graphviz DOT). `--depth` extends the walk
+    /// beyond depth 1 (containers then contribute their members and imports);
+    /// `--max-nodes` caps the rendered node count.
+    ///
+    /// The diagram is a deterministic projection of already-stored,
+    /// citable edges: every node carries its stable record ID plus a
+    /// repo-relative file/span citation in the legend, every edge is labeled
+    /// with its stored kind, and no edge appears that is not in the graph.
+    /// Node keys (`n0`, `n1`, …) are assigned in ascending record-ID order,
+    /// so output is byte-identical across runs. It is NOT a control-flow or
+    /// data-flow diagram: the lines are graph edges, not proof of runtime
+    /// behavior.
+    ///
+    /// Exit codes:
+    ///   0 — diagram rendered.
+    ///   1 — malformed handle / invalid --depth / invalid --max-nodes /
+    ///       ambiguous name / unsupported (non-symbol) handle; machine-
+    ///       readable JSON on stderr.
+    ///   2 — handle resolves to no live record (stale or unknown), or
+    ///       --at/--as-of names no resolvable commit.
+    ///   3 — symbol resolved but has no callers, callees, or container in
+    ///       this view (`empty_neighborhood`).
+    ///
+    /// Documented in `docs/cli/diagram.md` and `docs/cli/query.md`.
+    Diagram {
+        /// Symbol record ID (`codegraph:vN:<hex>`) or exact symbol name.
+        handle: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict symbol resolution to one repository.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Neighborhood depth bound (hops from the queried symbol; default 1).
+        /// Reachable nodes beyond the bound yield a truncation diagnostic with
+        /// dropped frontier counts per depth rather than silently omitted.
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        /// Maximum rendered nodes, anchor included (default 100). Dropped
+        /// nodes and their incident edges are counted in the truncation
+        /// diagnostic, never silently omitted.
+        #[arg(long, default_value_t = 100)]
+        max_nodes: usize,
+        /// Restrict the walk to the graph state at this commit SHA or unique
+        /// prefix (requires a history graph). Mutually exclusive with --as-of.
+        #[arg(long, conflicts_with = "as_of")]
+        at: Option<String>,
+        /// Restrict the walk to the graph state at the most recent commit at
+        /// or before this RFC 3339 instant. Mutually exclusive with --at.
+        #[arg(long, conflicts_with = "at")]
+        as_of: Option<String>,
+        /// Output format (mermaid, dot, json, text; default mermaid).
+        #[arg(long, value_enum, default_value_t = DiagramFormat::Mermaid)]
+        format: DiagramFormat,
     },
     /// Walk the transitive outbound callees/dependencies of a symbol with dependency paths (issue #253).
     ///
@@ -2319,6 +3736,47 @@ pub(crate) enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Dead-code triage candidates: symbols with no live in-graph callers (issue #240).
+    ///
+    /// Lists indexed symbols that have **zero recorded direct incoming
+    /// `CALLS` edges**, plus symbols whose every recorded direct caller is
+    /// itself such a candidate (the one-hop dead-cluster rule: if `a` is
+    /// called only by `b` and `b` is unreferenced, both are reported).
+    ///
+    /// Excluded from candidacy (counted, never silently dropped):
+    /// recognized non-call entry points (`#[test]` / `#[bench]` harness
+    /// entries, `#[no_mangle]` / `#[export_name]` FFI exports, binary-crate
+    /// `fn main`) and externally-reachable symbols under the issue #213
+    /// public-surface rule (top-level `pub`, visibility-widening `pub use`
+    /// re-exports) — an unused-internally `pub fn` may be a real external
+    /// entry point.
+    ///
+    /// Every row is a **candidate** (suspected dead code), never proof: the
+    /// response metadata states the soundness boundary — the graph cannot
+    /// observe dynamic dispatch via trait objects, macro-generated callers,
+    /// reflection-like usage, FFI consumers, or cross-crate consumers.
+    /// Deletion stays a human/agent decision; transitive whole-program
+    /// reachability pruning is out of scope.
+    ///
+    /// Documented in `docs/cli/dead-code.md`.
+    DeadCode {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict the candidate set to one repository in a multi-repo store.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Maximum candidate rows returned (default 100, max 500). Values
+        /// outside 1..=500 are rejected with an `invalid_limit` diagnostic.
+        #[arg(long, default_value_t = query::DEAD_CODE_DEFAULT_LIMIT)]
+        limit: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Return a repository orientation map for cold-starting in an unfamiliar repository.
     Orient {
         /// Graph JSONL path (mutually exclusive with --data-dir).
@@ -2711,6 +4169,253 @@ pub(crate) enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// List extractor-coverage-gap diagnostics (issue #246).
+    ///
+    /// Returns every persisted `Diagnostic` graph node carrying both a
+    /// repo-relative path and a span — the extractor's self-declared blind
+    /// spots (unsupported macro invocations, unresolved call/dispatch stubs)
+    /// — as citable rows, one NDJSON object per gap, with no scan or
+    /// recompute. Each row carries the record ID, the complete byte/line
+    /// span (which slices the cited source), the diagnostic name, and a
+    /// human summary.
+    ///
+    /// The lane never reclassifies source-authored markers: TODO/FIXME
+    /// `DebtMarker`s and `.unwrap()`/`.expect()` `PanicRiskSite`s belong to
+    /// other lanes and are excluded by construction.
+    ///
+    /// A scope with zero gap diagnostics is an explicit success (exit 0)
+    /// with an empty `diagnostics` array and `empty_reason`
+    /// `no_gaps_in_scope` — distinct from unknown/no-match/error. "No
+    /// extraction-gap diagnostics in scope" is not proof the code is fully
+    /// understood for any other purpose, only that the extractor flagged
+    /// nothing it could not parse.
+    Diagnostics {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict results to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Restrict results to one repo-relative file path.
+        #[arg(long)]
+        file: Option<String>,
+        /// Corpus selector (issue #456): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding records removed at HEAD.
+        /// This is the DEFAULT when a source snapshot exists; the flag makes it
+        /// explicit. Mutually exclusive with --all-history (enforced at
+        /// runtime with an `unsupported_combination` envelope).
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #456): read the UNION of all commit snapshots
+        /// so a gap removed at a later commit still appears (once per commit,
+        /// distinguished by `git_commit`). Mutually exclusive with --at-head
+        /// (enforced at runtime with an `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Surface stub and panic-risk macro markers as a code-triage lane (issue #210).
+    ///
+    /// Returns every persisted `Diagnostic` macro-invocation node whose macro
+    /// name is in the closed known-risk set — `todo!`, `unimplemented!`,
+    /// `unreachable!` (category `stub`) and `panic!` (category `panic`) — as
+    /// citable rows, one per marker, with no scan or recompute. Each row
+    /// carries the stable category, the macro name, the `Diagnostic` record
+    /// ID, the repo-relative file/span handle, and the enclosing symbol's
+    /// handle when a `DEFINES` owner exists (explicit `null` at module top
+    /// level).
+    ///
+    /// Classification is exact and conservative over the closed set:
+    /// path-qualified names reduce to their final `::` segment
+    /// (`std::panic!` is still a `panic!`), matching is exact (no substring
+    /// matches: `mytodo!` and `panic_info!` never classify), and a benign
+    /// macro (`println!`, `vec!`, `format!`, …) is never returned as a risk
+    /// marker. `assert!`/`assert_eq!` and `.unwrap()`/`.expect()` are
+    /// deliberately outside the set (see `eg query unwrap-expect`).
+    ///
+    /// A scope with zero risk markers is an explicit success (exit 0) with an
+    /// empty `markers` array and `empty_reason` `no_markers_in_scope` —
+    /// distinct from unknown/no-match/error. Rows are advisory: each asserts
+    /// only that a marker of the given category exists at the span, never
+    /// that the surrounding code is correct or incorrect.
+    ///
+    /// Documented in `docs/cli/risk-markers.md`.
+    RiskMarkers {
+        /// Optional repo-relative directory or module path prefix scoping the
+        /// inventory (segment-aware; same contract as `eg query subsystem`).
+        #[arg(long)]
+        path: Option<String>,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Pin the inventory to a commit SHA or unique prefix on the
+        /// valid-time axis (same selector contract as `eg query symbol --at`).
+        #[arg(long)]
+        at: Option<String>,
+        /// Restrict results to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Corpus selector (issue #456): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding records removed at HEAD.
+        /// This is the DEFAULT when a source snapshot exists; the flag makes it
+        /// explicit. Mutually exclusive with --all-history and --at (enforced at
+        /// runtime with an `unsupported_combination` envelope).
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #456): read the UNION of all commit snapshots
+        /// so a marker removed at a later commit still appears. Mutually
+        /// exclusive with --at-head and --at (enforced at runtime with an
+        /// `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Inventory `#[deprecated]` symbols with their still-resolvable call sites (issue #249).
+    ///
+    /// Returns every code symbol carrying a `#[deprecated]` attribute mark —
+    /// bare, `= "..."` note shorthand, or `(since = "...", note = "...")`
+    /// meta form — as an inventory row: a stable record ID, the repo-relative
+    /// file/span handle, and the verbatim bounded `deprecated_since` /
+    /// `deprecated_note` payloads
+    /// (`null` when the attribute did not carry them — never fabricated).
+    /// For each deprecated symbol, the lane reports its still-resolvable call
+    /// sites over the existing `CALLS` edge vocabulary as a migration
+    /// worklist, each call site carrying a citable edge record ID and the
+    /// caller's repo-relative file/span. Call edges the graph cannot resolve
+    /// are cited under `coverage.unresolved_call_edges` — never silently
+    /// dropped and never counted as zero.
+    ///
+    /// Rows derive solely from deterministic extractor facts and assert only
+    /// that the mark exists and the listed calls resolve — never what should
+    /// replace the symbol. No LLM prose, no replacement suggestions, and no
+    /// raw source text beyond the bounded attribute payloads is synthesized.
+    /// Strictly read-only; byte-identical across runs on an unchanged store.
+    /// Ordering is deterministic: symbols by (path, span start line, record
+    /// ID), call sites by (caller path, caller span start line, edge ID).
+    ///
+    /// `--file <PATH>` scopes the inventory (and the `symbols_considered`
+    /// tally) to declarations in that repo-relative file; the call-site
+    /// worklists of the selected symbols stay complete, citing callers
+    /// wherever they are.
+    ///
+    /// Exit codes:
+    ///   0 — inventory returned (at least one deprecated symbol).
+    ///   3 — `no_deprecated_symbols`: live code symbols exist, none marked.
+    ///   4 — `no_code_symbols`: the input resolves to zero code-graph nodes.
+    ///   1 — malformed input (unknown/ambiguous `--repo`, unreadable graph,
+    ///       both/neither `--graph`/`--data-dir`).
+    ///
+    /// Documented in `docs/cli/deprecated-symbols.md`.
+    DeprecatedSymbols {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict the inventory to one repository in a multi-repo store.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Restrict the inventory to symbols declared in this repo-relative
+        /// file.
+        #[arg(long)]
+        file: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Audit the resting store for secret-shaped values that bypassed redaction (issue #244).
+    ///
+    /// Sweeps every persisted queryable string field across all domains —
+    /// agent-memory, artifact, verification, project, user-context, log-graph,
+    /// and code-graph records (code-graph symbol bodies/spans and import
+    /// paths are exempt from the write gate, so they are the prime
+    /// unredacted-at-rest risk) — and reports secret-shaped values.
+    ///
+    /// Detection is two-layered: (a) known token patterns aligned to the
+    /// `secret_class` taxonomy in `docs/schema/redaction.md` (`api_token`,
+    /// `ssh_private_key`, `database_url`, `cloud_credential`,
+    /// `webhook_secret`, `session_cookie`, `env_secret`, `email`), and (b)
+    /// generic tokens above the documented Shannon-entropy + length threshold
+    /// (≥20 chars, ≥4.2 bits/char). Each finding carries `record_id`,
+    /// `domain`, `field_path`, `classification` (`secret_class` or
+    /// `high_entropy`), and a BLAKE3 `hash_prefix` — never the raw value.
+    ///
+    /// Records stamped `redaction_policy_version: "v1"` and values that are
+    /// already `<REDACTED:secret_class:hash_prefix>` markers are recognized as
+    /// already-handled and are never flagged; the documented allowlist
+    /// suppresses public sample keys and test-fixture tokens. Strictly
+    /// read-only; byte-identical across runs on an unchanged store. Findings
+    /// are advisory heuristic matches — never confirmed secrets — and a clean
+    /// sweep is not proof the store holds no secrets.
+    ///
+    /// Exit codes:
+    ///   0 — clean store: zero findings.
+    ///   3 — ≥1 finding reported.
+    ///   1 — malformed input (unknown/ambiguous `--repo`, unreadable graph,
+    ///       both/neither `--graph`/`--data-dir`).
+    ///
+    /// Documented in `docs/cli/redaction-audit.md`.
+    RedactionAudit {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict the sweep to one repository in a multi-repo store.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Audit producer trust-class consistency across every persisted record (issue #236).
+    ///
+    /// Read-only: scans every persisted node, edge, and tombstone and verifies
+    /// that each record's `producer_kind` is consistent with the trust class
+    /// its node kind implies. Deterministic code-fact kinds may only be written
+    /// by deterministic producers; agent-authored kinds may only be written by
+    /// agent producers. Each violation is a citable JSON record (`record_id`,
+    /// `kind`, `producer_kind`, the repo-relative handle/span where applicable,
+    /// and the broken rule) — never synthesized prose. A clean store returns an
+    /// explicit `ok:true` with counted totals.
+    ///
+    /// Edges are audited against their source node's kind and tombstones against
+    /// their target record's kind (resolved in-batch, last-write-wins — the same
+    /// semantics as the daemon's `lookup_node_kind`); unresolvable endpoints are
+    /// skipped, not flagged. `producer_kind: other` fails closed. Legacy records
+    /// without a producer envelope are exempt.
+    ///
+    /// Exit codes:
+    ///   0 — audit ran (violations reported, or clean with
+    ///       `empty_reason: "no_trust_violations"`).
+    ///   1 — malformed input (unreadable graph, both/neither
+    ///       `--graph`/`--data-dir`).
+    ///
+    /// Documented in `docs/cli/trust-audit.md`; the rule set in
+    /// `docs/schema/producer-version.md` §10.
+    TrustAudit {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Inventory the scanned repo's own `unsafe`-code surface (issue #222).
     ///
     /// Returns every Tree-sitter-detected `unsafe { .. }` block, `unsafe fn`
@@ -2852,6 +4557,58 @@ pub(crate) enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Trace a code symbol to the commit that introduced it, plus the
+    /// project-graph PR / issue / review records whose `merge_commit_sha`
+    /// equals that commit (issue #159).
+    ///
+    /// The introducing commit is the first commit whose snapshot contains the
+    /// symbol (reintroductions never move the origin). The project link is
+    /// deterministic commit-SHA byte equality ONLY — no fuzzy title or body
+    /// matching, and no live GitHub calls: the lane resolves entirely offline
+    /// against the already-ingested store.
+    ///
+    /// Code facts (the introducing commit) and project facts (PR/issue/review
+    /// rows) render in trust-separated `code` / `project` sections, mirroring
+    /// `eg query context`'s contract. When the store carries code history but
+    /// no GitHub import, the answer degrades to a commit-only result with an
+    /// explicit `github_import_absent` note — never an error, and never
+    /// implying no PR exists.
+    ///
+    /// Exit codes:
+    ///   0 — origin traced (possibly with empty project sections).
+    ///   1 — ambiguous symbol name, ambiguous commit prefix, or malformed
+    ///       `--as-of` timestamp (JSON diagnostic on stdout).
+    ///   2 — unknown symbol (`no_match`), symbol without commit-linked
+    ///       history (`no_history`), or `--at` commit absent from the store
+    ///       (`missing_commit`).
+    ///
+    /// Documented in `docs/cli/origin.md` and `docs/cli/query.md`.
+    Origin {
+        /// Symbol stable ID or exact symbol name.
+        #[arg(index = 1)]
+        symbol: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict symbol resolution to one repository (issue #67).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Resolve the origin against the code state as of this commit SHA or
+        /// unique prefix (valid-time axis). Mutually exclusive with --as-of.
+        #[arg(long, conflicts_with = "as_of")]
+        at: Option<String>,
+        /// Resolve the origin against the code state as of the most recent
+        /// commit at or before this RFC 3339 instant (valid-time axis).
+        /// Mutually exclusive with --at.
+        #[arg(long, conflicts_with = "at")]
+        as_of: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Resolve a `file:line` location to its smallest enclosing code symbol (issue #151).
     ///
     /// Turns a raw location — a compiler diagnostic, panic backtrace frame,
@@ -2926,6 +4683,10 @@ pub(crate) enum QuerySubcommand {
         /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Route the query through the running daemon (requires --data-dir, conflicts with --graph).
+        #[cfg(feature = "embedded-aletheiadb")]
+        #[arg(long, requires = "data_dir", conflicts_with = "graph")]
+        daemon: bool,
         /// Resolve against symbol spans as they existed at this commit SHA or
         /// unique prefix (requires a history-bearing store).
         #[arg(long, conflicts_with = "as_of")]
@@ -2979,6 +4740,129 @@ pub(crate) enum QuerySubcommand {
         /// 1..=500 are rejected with an `invalid_limit` diagnostic.
         #[arg(long, default_value_t = query::CHURN_DEFAULT_LIMIT)]
         limit: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Rank Rust callable symbols by deterministic structural complexity,
+    /// highest first (issue #162).
+    ///
+    /// Every Rust callable (`function` / `method` / `test` symbol kind) carries
+    /// a source-derived integer `complexity`: 1 plus one per decision point in
+    /// the item's own body (`if` / `else if`, `for`, `while`, `loop`, each
+    /// `match` arm, each `?`, each `&&`, each `||`). Closure bodies count
+    /// toward the enclosing callable; nested `fn` items get their own symbol.
+    /// The score is a code fact, not agent confidence.
+    ///
+    /// Ordering is deterministic and byte-stable: complexity descending, then
+    /// qualified name ascending (documented tie-break), then symbol record ID
+    /// ascending. The answer states explicitly whether `--limit` truncated it.
+    ///
+    /// Exit codes:
+    ///   0 — ranking returned.
+    ///   1 — load error, invalid --limit, unknown/ambiguous --repo selector.
+    ///   2 — no scored callable symbols in scope (`no_match`).
+    ///
+    /// Documented in `docs/cli/complexity.md`.
+    Complexity {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict the ranking to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Maximum ranked symbols returned (default 50, max 500). Values outside
+        /// 1..=500 are rejected with an `invalid_limit` diagnostic.
+        #[arg(long, default_value_t = query::COMPLEXITY_DEFAULT_LIMIT)]
+        limit: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Surface recorded contradicting observations on a shared code target (issue #232).
+    ///
+    /// Returns the pairs of records joined by a recorded `CONTRADICTS` edge —
+    /// agent-authored claims (`Observation` / `Decision` / `Failure`), recorded
+    /// verification executions (`TestRun` / `CommandRun` / …), and user-context
+    /// records (`Preference` / `WorkflowRule` / …) — that share a cited code
+    /// target within the resolved scope. Deterministic code facts are never a
+    /// party; a `CONTRADICTS` edge touching one is skipped whole.
+    ///
+    /// The scope resolves in precedence order: exact record ID, exact symbol
+    /// name, repo-relative file path (covering the symbols the file defines),
+    /// or a segment-aware subsystem path prefix. A conflict where any party
+    /// was superseded by a later record is marked `resolved` and excluded
+    /// unless `--include-resolved` is passed. This lane only *surfaces*
+    /// recorded disagreements — it never infers them and never adjudicates;
+    /// a passing verification shown as a `verification` party against a
+    /// recorded `Failure` belief is the operator's adjudication lead.
+    ///
+    /// Output is deterministic and byte-stable across repeated runs on an
+    /// unchanged store. Exit 0 with an empty `conflicts` list when the scope
+    /// is valid but has no recorded conflicts; exit 2 (`no_match`) when the
+    /// scope resolves to nothing; exit 1 on malformed input.
+    ///
+    /// Per-run agent cost rollup from imported trajectory `CostUsage` records
+    /// (issue #132).
+    ///
+    /// One row per `AgentRun` whose source trajectory `info` block carried any
+    /// cost, token, or duration field: the values verbatim from the transcript
+    /// (absent values are `null`/unknown, never zero), the `CostUsage` record
+    /// ID, the owning run/session IDs, and the source handle — plus aggregate
+    /// sums over the full filtered set. Cost figures are transcript-derived
+    /// claims, never deterministic code facts; the envelope carries the
+    /// epistemic disclaimer verbatim.
+    ///
+    /// Output is deterministic and byte-stable across repeated runs on an
+    /// unchanged store.
+    ///
+    /// Documented in `docs/cli/query.md`.
+    Cost {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict to runs whose task handle starts with this prefix. The
+        /// handle is the BLAKE3 hash of the trajectory's task text; copy it
+        /// from a previous `eg query cost` row.
+        #[arg(long)]
+        task: Option<String>,
+        /// Restrict to the session with this ID (exact or leading prefix).
+        #[arg(long)]
+        session: Option<String>,
+        /// Restrict by the run's recorded verification outcome.
+        #[arg(long, value_parser = ["verified", "failed"])]
+        verification: Option<String>,
+        /// Maximum rows returned. Totals always cover the full filtered set;
+        /// `totals.rows_truncated` reports truncation.
+        #[arg(long, default_value_t = query::COST_DEFAULT_LIMIT)]
+        limit: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Documented in `docs/cli/conflicts.md` and `docs/cli/query.md`.
+    Conflicts {
+        /// Symbol name / record ID, repo-relative file path, or subsystem
+        /// path prefix the conflicts are scoped to.
+        scope: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict scope resolution to one repository (issue #67).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Include conflicts where a party was superseded by a later record.
+        #[arg(long)]
+        include_resolved: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -3244,7 +5128,10 @@ pub(crate) enum QuerySubcommand {
         /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Unify a leading `crate::` with this crate name (query + imports).
+        /// Override the owning-crate auto-resolution (issue #450): unify a leading
+        /// `crate::` with this crate name for the query and every import.
+        /// Without it, each import's `crate::` resolves from the owning-crate
+        /// facts (target name, package attribution, workspace directory name).
         #[arg(long = "crate")]
         crate_name: Option<String>,
         /// Restrict the importer set to one repository in a multi-repo store.
@@ -3389,6 +5276,352 @@ pub(crate) enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    // Appended (issue #265); kept at the end to minimize cross-lane merge conflicts.
+    /// List code targets (symbols and/or files) with zero cross-domain
+    /// evidence edges into the agent-memory, verification, or project
+    /// domains, ranked riskiest-first by inbound structural reference count.
+    ///
+    /// A target is a blind spot when no live, current-state edge with one of
+    /// the documented evidence classes (`OBSERVES`, `MENTIONS_SYMBOL`,
+    /// `TOUCHED_FILE`, `FAILED_ON`, `TOUCHES_FILE`) targets it from a node in
+    /// the agent-memory, verification, or project domains — i.e. no linked
+    /// observation, verification record, or task. Evidence does not inherit
+    /// between a file and its symbols.
+    ///
+    /// Every row is a triage lead, never a verdict: absence of recorded
+    /// evidence is not evidence the code is unimportant, untested, or
+    /// unsafe. An empty blind-spot set is an explicit machine-readable
+    /// success: exit 0, `ok:true`, an empty `blind_spots` array, and a
+    /// `no_blind_spots` diagnostic — distinct from the `no_targets`
+    /// diagnostic of a target-free store and from a store-absent error
+    /// (exit 1).
+    ///
+    /// Documented in `docs/cli/blind-spots.md`.
+    BlindSpots {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict the evaluated targets to one repository in a multi-repo store.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Which code-target populations to evaluate.
+        #[arg(long, default_value = "both")]
+        kind: BlindSpotKindArg,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    // Appended (issue #262); kept at the end to minimize cross-lane merge conflicts.
+    /// Rank agents by the downstream fate of their observations.
+    ///
+    /// One row per `agent_id` (with `agent_kind`), carrying deterministic
+    /// counts over: observations written; promotion outcomes split by
+    /// terminal verdict (`approved`, `edited_then_approved`, `rejected`,
+    /// `deferred`, `expired`) for candidates whose supporting evidence is
+    /// this agent's observations; observations later superseded
+    /// (`superseded_by`); and linked verification outcomes
+    /// (passed/failed/inconclusive) attributable to the agent's sessions.
+    ///
+    /// Trust is separated structurally: `observations_written` and
+    /// `superseded_observations` aggregate agent-authored claims,
+    /// `promotion_outcomes` aggregates recorded operator decisions, and
+    /// `verification_outcomes` aggregates recorded verification evidence —
+    /// the output never presents an agent's claim as source truth. Every
+    /// nonzero bucket cites resolvable `record_id` handles; an empty store
+    /// (or no qualifying agents) returns an explicit `no_agents` diagnostic
+    /// rather than silence.
+    ///
+    /// Rows sort canonically by `agent_id`; the answer is byte-stable across
+    /// repeated runs and platforms. JSON is the default; `--format text`
+    /// gives a skimmable table. Respects `--repo` scoping like the other
+    /// lanes; requires no network and no `--embed` store.
+    ///
+    /// This slice reports — it never gates, weights, throttles, or disables
+    /// agents, and it computes no learned reputation score: deterministic
+    /// counts over existing edges only.
+    ///
+    /// Documented in `docs/cli/agent-track-record.md`.
+    #[command(visible_alias = "agents")]
+    TrackRecord {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict results to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Retrace one agent session's footprint, claims, and verification.
+    ///
+    /// No footprint found is not evidence the run did nothing: a run that
+    /// never wrote a cited edge, a dropped transcript import, or a partially
+    /// ingested store all look the same as an idle session.
+    ///
+    /// Documented in `docs/cli/session-retrospective.md`.
+    Session {
+        /// Session record ID or imported session handle.
+        id_or_handle: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    // Appended (issue #258); kept at the end to minimize cross-lane merge conflicts.
+    /// Find every usage site of an external dependency symbol before upgrade.
+    ///
+    /// Answers "where is `tokio::spawn` actually called?" from the
+    /// AST-derived unresolved `CALLS` edges, resolving each written callee
+    /// against the file's `use` declarations — so
+    /// `use a::b::c as d; d(...)` reports under `a::b::c`. The query path may
+    /// be fully or partially qualified (`tokio::spawn`, `aletheiadb`);
+    /// matching is segment-aware, so `tokio::spaw` never matches. Comments and
+    /// string literals can never produce rows: every row is backed by a parsed
+    /// call site. Paths inside the repository's own crate namespace are
+    /// reported with `external: false` and a hint toward
+    /// `eg query transitive-callers`.
+    ///
+    /// Exit codes:
+    ///   0 — at least one usage site found.
+    ///   1 — malformed path, or an unsupported corpus/temporal combination
+    ///       (machine-readable JSON on stderr).
+    ///   2 — well-formed path with zero usage sites (`no_match`).
+    ///
+    /// Documented in `docs/cli/query.md`.
+    Uses {
+        /// The dependency symbol path to find (fully or partially qualified,
+        /// `::`-separated, e.g. `tokio::spawn` or `aletheiadb`).
+        path: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict the usage sites to one repository in a multi-repo store.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Resolve usage sites at this commit (full SHA or unique
+        /// prefix). Mutually exclusive with --as-of and the corpus flags.
+        #[arg(long)]
+        at: Option<String>,
+        /// Resolve usage sites as of this RFC 3339 instant. Mutually
+        /// exclusive with --at and the corpus flags.
+        #[arg(long)]
+        as_of: Option<String>,
+        /// Corpus selector (issue #427): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding sites removed at HEAD.
+        /// This is the DEFAULT when a source snapshot exists; the flag makes it
+        /// explicit. Mutually exclusive with --all-history / --at / --as-of.
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #427): read the UNION of all commit snapshots
+        /// so a site present only in an earlier commit still appears. Mutually
+        /// exclusive with --at-head / --at / --as-of.
+        #[arg(long)]
+        all_history: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Emit the machine-readable query-lane capability manifest (issue #251).
+    ///
+    /// Local and pure: derived from the command surface alone — no network,
+    /// no ingested store, no project config. Works on a fresh clone with an
+    /// empty data dir.
+    Lanes {
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Inventory `#[allow(...)]` / `#![allow(...)]` lint suppressions (issue #227).
+    ///
+    /// Returns every Tree-sitter-detected lint-suppression attribute as a
+    /// citable debt row: a stable record ID, the sorted lint-name list
+    /// (`dead_code`, `clippy::too_many_arguments`, …), the closed scope
+    /// (`item` / `module` / `crate`), the adjacent justification-comment
+    /// signal, the repo-relative file/span handle, and the enclosing symbol
+    /// handle (explicit `null` when no symbol encloses the attribute —
+    /// always at crate scope, and at module scope where the module is a
+    /// `Module` record rather than a `Symbol`). `#[allow(` text inside line
+    /// comments, doc comments, block comments, and string literals is never
+    /// returned; detection runs over the attribute AST, not the raw text.
+    ///
+    /// Rows derive solely from deterministic extractor facts and assert only
+    /// that a suppression of a lint set exists at a span — never that the
+    /// suppression is warranted. Strictly read-only; byte-identical across
+    /// runs on an unchanged store.
+    ///
+    /// Exit codes:
+    ///   0 — suppressions returned (or the scoped slice contains zero
+    ///       suppressions, with `empty_reason: "no_suppressions_in_scope"`).
+    ///   1 — malformed prefix, ambiguous commit prefix, or unknown/ambiguous
+    ///       repository selector.
+    ///   2 — scope not found (`scope_not_found`) or unknown commit
+    ///       (`unknown_commit`).
+    ///
+    /// Documented in `docs/cli/suppressions.md`.
+    Suppressions {
+        /// Optional repo-relative directory or module path prefix scoping the
+        /// inventory (segment-aware; same contract as `eg query subsystem`).
+        #[arg(long)]
+        path: Option<String>,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Pin the inventory to a commit SHA or unique prefix on the
+        /// valid-time axis (same selector contract as `eg query symbol --at`).
+        #[arg(long)]
+        at: Option<String>,
+        /// Restrict results to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Corpus selector (issue #456): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding records removed at HEAD.
+        /// This is the DEFAULT when a source snapshot exists; the flag makes it
+        /// explicit. Mutually exclusive with --all-history and --at (enforced at
+        /// runtime with an `unsupported_combination` envelope).
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #456): read the UNION of all commit snapshots
+        /// so a record removed at a later commit still appears. Mutually
+        /// exclusive with --at-head and --at (enforced at runtime with an
+        /// `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Records added to the store since a transaction-time cursor (issue #197).
+    ///
+    /// The delta feed for resuming and swarm agents: returns every record
+    /// whose transaction-time handle is strictly after `--tx-after`, spanning
+    /// all domains, ordered by `(transaction_time, record_id)`. The answer
+    /// carries a `next_cursor`; feeding it back returns only records added
+    /// after the prior call, with no gaps and no overlap. Retraction and
+    /// supersession records appear as records (classified by `event`), so a
+    /// consumer learns a prior record was retired.
+    ///
+    /// Exit codes:
+    ///   0 — delta returned (an empty delta is a well-formed `up_to_date`
+    ///       answer, not an error).
+    ///   1 — load error, invalid cursor, unknown domain, invalid --limit, or
+    ///       unknown/ambiguous --repo selector.
+    ///
+    /// Documented in `docs/cli/since.md`.
+    Since {
+        /// Transaction-time cursor: only records with `transaction_time`
+        /// strictly after this RFC 3339 instant are returned.
+        #[arg(long)]
+        tx_after: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict records to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Restrict the feed to one or more domains (repeatable). One of
+        /// `codegraph`, `agent_memory`, `verification`, `artifact`,
+        /// `project`, `semantic`, `user_context`, `log`. Unknown names exit 1
+        /// with an `unknown_domain` diagnostic.
+        #[arg(long)]
+        domain: Vec<String>,
+        /// Maximum records returned (default 500, max 5000); excess records
+        /// are truncated with an explicit `truncated` signal. Truncation only
+        /// ever cuts between transaction-time groups, so `next_cursor` stays
+        /// gap-free.
+        #[arg(long, default_value_t = query::SINCE_DEFAULT_LIMIT)]
+        limit: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Dereference a cited record-id handle back to its live source record
+    /// with a typed drift verdict (issue #160).
+    ///
+    /// The read-back half of the citation contract: a `record_id` emitted by
+    /// `query symbol|file|semantic` resolves to its record and reports
+    /// `valid` (live, coordinates unchanged), `drifted` (the pinned
+    /// `--at`/`--as-of` snapshot's record differs from the current view), or
+    /// `dangling` (no record matches — structured envelope, exit 2, never a
+    /// fuzzy guess). Codegraph ids only; other domains are refused as
+    /// `unsupported_handle_domain`.
+    Resolve {
+        /// The cited record id (e.g. `codegraph:v1:<suffix>`).
+        record_id: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir / --daemon).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Route the query through the running daemon (requires --data-dir, conflicts with --graph).
+        #[cfg(feature = "embedded-aletheiadb")]
+        #[arg(long, requires = "data_dir", conflicts_with = "graph")]
+        daemon: bool,
+        /// Resolve the record at this commit SHA or unique prefix, then
+        /// compare against the current view for the drift verdict. Mutually
+        /// exclusive with --as-of.
+        #[arg(long, conflicts_with = "as_of")]
+        at: Option<String>,
+        /// Resolve the record at the most recent commit at or before this
+        /// RFC 3339 instant (valid-time axis), then compare against the
+        /// current view for the drift verdict. Mutually exclusive with --at.
+        #[arg(long, conflicts_with = "at")]
+        as_of: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    // Appended (issue #119); kept at the end to minimize cross-lane merge conflicts.
+    /// List project tasks filtered by status (issue #119).
+    ///
+    /// Read-only, deterministic: every project `Task` resolves to its latest
+    /// `transaction_time` version per stable entity, then filters to the
+    /// requested statuses and groups rows by status. `--status active` (the
+    /// default) selects `open,in_progress,blocked`. Exit 0 with
+    /// `zero_matches: true` when the filter matches nothing; exit 2
+    /// (`no_project_data`) when no `Task` records exist; exit 3
+    /// (`invalid_status_filter`) on a malformed `--status` filter; exit 1 on
+    /// malformed input.
+    ///
+    /// Documented in `docs/cli/task-list.md` and `docs/cli/query.md`.
+    TaskList {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Comma-separated task statuses to list, or the `active`
+        /// convenience filter (`open,in_progress,blocked`; the default).
+        /// Every member of the project task-status vocabulary is eligible;
+        /// an unknown or malformed value fails with exit 3.
+        #[arg(long)]
+        status: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
@@ -3420,6 +5653,13 @@ pub(crate) enum DaemonAction {
         /// Bounded write queue capacity.
         #[arg(long, default_value_t = 64)]
         write_queue_capacity: usize,
+        /// Access-token lifetime in milliseconds (issue #70). When set, the
+        /// daemon rotates its bearer token every `token_ttl_ms`, publishes
+        /// the new token in `egregored.json`, and keeps each superseded token
+        /// valid for a cutover window of half the lifetime. Omit to disable
+        /// rotation (one token for the daemon lifetime).
+        #[arg(long)]
+        token_ttl_ms: Option<u64>,
     },
     /// Run the daemon in the current process.
     #[command(hide = true)]
@@ -3436,6 +5676,9 @@ pub(crate) enum DaemonAction {
         /// Bounded write queue capacity.
         #[arg(long, default_value_t = 64)]
         write_queue_capacity: usize,
+        /// Access-token lifetime in milliseconds (issue #70). See `Start`.
+        #[arg(long)]
+        token_ttl_ms: Option<u64>,
     },
     /// Report daemon status.
     Status {
@@ -3550,6 +5793,31 @@ pub(crate) enum WriteKind {
         /// Domain of the evidence targets (`codegraph`, `verification`, etc.).
         #[arg(long, default_value = "codegraph")]
         evidence_domain: String,
+        /// Supersede a prior observation-class record (issue #184): authors a
+        /// `SUPERSEDES` edge from the new observation to this record ID. The
+        /// target must be a live observation-class record (`Observation`,
+        /// `Decision`, `Failure`) in the store pointed at by `--graph` or
+        /// `--data-dir`; deterministic code-graph facts are rejected. Mutually
+        /// exclusive with `--contradicts`.
+        #[arg(long, conflicts_with = "contradicts")]
+        supersedes: Option<String>,
+        /// Contradict a prior observation-class record (issue #184): authors
+        /// a `CONTRADICTS` edge from the new observation to this record ID.
+        /// A contradiction is a mutual dispute, not a winner declaration —
+        /// both records stay live and citable. Same target rules as
+        /// `--supersedes`. Mutually exclusive with `--supersedes`.
+        #[arg(long, conflicts_with = "supersedes")]
+        contradicts: Option<String>,
+        /// Graph JSONL file used to validate the `--supersedes` /
+        /// `--contradicts` target at write time. Mutually exclusive with
+        /// `--data-dir`. The file is read, never modified.
+        #[arg(long, conflicts_with = "data_dir")]
+        graph: Option<PathBuf>,
+        /// Embedded store directory used to validate the `--supersedes` /
+        /// `--contradicts` target at write time. Mutually exclusive with
+        /// `--graph`. The store is opened read-only for validation.
+        #[arg(long, conflicts_with = "graph")]
+        data_dir: Option<PathBuf>,
         /// Output JSONL path for the produced records.
         #[arg(long, required = true)]
         out: PathBuf,
@@ -3684,6 +5952,57 @@ pub(crate) enum WriteKind {
         #[arg(long, required = true)]
         out: PathBuf,
     },
+    /// Write a typed live-authored `Failure` record in the agent-memory domain.
+    ///
+    /// Records a failed attempt as a citable node: provenance (`agent_id`,
+    /// `agent_kind`, `session_id`, `observed_at`, `source_handle`) plus a
+    /// reserved failure kind and at least one resolvable target
+    /// (`--failed-on` for codegraph/artifact record IDs, `--references-task`
+    /// for project task record IDs). Missing required fields fail with a
+    /// machine-readable JSON envelope on stderr
+    /// (`{"code":"missing_field","field":"<name>"}`) that never echoes
+    /// the failure text.
+    Failure {
+        /// Stable agent identity; required.
+        #[arg(long, default_value = "")]
+        agent_id: String,
+        /// Agent kind (`codex`, `claude-code`, `vantage`, `rust-swe-agent`,
+        /// `human`, `other`); required.
+        #[arg(long, default_value = "")]
+        agent_kind: String,
+        /// Active session identifier; required.
+        #[arg(long, default_value = "")]
+        session_id: String,
+        /// RFC 3339 observation timestamp; required.
+        #[arg(long, default_value = "")]
+        observed_at: String,
+        /// Citable source artifact path or hash; required.
+        #[arg(long, default_value = "")]
+        source_handle: String,
+        /// Failure kind: `command_failure`, `patch_invalid`,
+        /// `assumption_rejected`, or `workflow_blocked`; required.
+        #[arg(long, default_value = "")]
+        failure_kind: String,
+        /// Failure description; required. Redacted and bounded to a 500-byte
+        /// excerpt before storage; never echoed in error output.
+        #[arg(long, default_value = "")]
+        text: String,
+        /// Shell exit code; only valid for `command_failure`/`patch_invalid`.
+        #[arg(long)]
+        exit_code: Option<i64>,
+        /// Canonical codegraph/artifact record IDs the attempt failed on
+        /// (`FAILED_ON` links; repeatable). At least one of `--failed-on` /
+        /// `--references-task` is required.
+        #[arg(long, num_args = 0..)]
+        failed_on: Vec<String>,
+        /// Canonical project task record IDs this failure relates to
+        /// (`REFERENCES_TASK` links; repeatable).
+        #[arg(long, num_args = 0..)]
+        references_task: Vec<String>,
+        /// Output JSONL path for the produced records.
+        #[arg(long, required = true)]
+        out: PathBuf,
+    },
 }
 
 /// Subcommands for `audit`.
@@ -3771,6 +6090,153 @@ pub(crate) enum AuditSubcommand {
         /// Defaults to the manifest's `min_ratio`. When supplied, overrides it.
         #[arg(long)]
         min_ratio: Option<f64>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Measure cold query latency and gate p50 against the latency budget (issue #255).
+    ///
+    /// Builds the pinned reference corpus, then times cold wall-clock from
+    /// process start to the first emitted result line of
+    /// `eg query symbol <NAME>` — fresh processes, `--graph <JSONL>` and
+    /// `--data-dir <embedded store>` measured separately — reporting p50/p95
+    /// per source. Local-first and offline.
+    ///
+    /// Exit codes:
+    ///   0 — gate passed (`ok: true`).
+    ///   1 — gate failed (`ok: false`); the full JSON report is still printed.
+    ///   2 — usage/load error (bad manifest path, corpus build error, no result).
+    QueryLatency {
+        /// Path to the query-latency corpus manifest JSON.
+        #[arg(long, default_value = "corpus/query_latency_corpus.json")]
+        corpus: PathBuf,
+        /// Cold samples measured per input source.
+        ///
+        /// Defaults to the manifest's `samples`. When supplied, overrides it.
+        #[arg(long)]
+        samples: Option<usize>,
+        /// p50 budget in milliseconds each source must meet.
+        ///
+        /// Defaults to the manifest's `budget_p50_ms`. When supplied,
+        /// overrides it.
+        #[arg(long)]
+        budget_p50_ms: Option<f64>,
+        /// Which input sources to measure.
+        #[arg(long, default_value = "both")]
+        source: LatencySource,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Measure the structural query latency budget and enforce the scaling
+    /// gate (issue #120).
+    ///
+    /// Builds the pinned reference corpus at two store sizes (1x and 10x
+    /// record counts), then times wall-clock from process start to the first
+    /// emitted result line of `eg query symbol`, `eg query file`, and
+    /// `eg query drift` — cold and warm invocations — reporting p50/p95 per
+    /// query x temperature x size cell. Records a ripgrep baseline for the
+    /// equivalent symbol lookup so the comparison to the boring substitute
+    /// is explicit. The gate enforces the scaling assertion (the 10x store
+    /// must answer a targeted single-symbol lookup within 2x of the 1x
+    /// latency); the absolute p50/p95 budgets are advisory and never fail
+    /// the gate, so hardware variance cannot red CI. Local-first and offline.
+    ///
+    /// Exit codes:
+    ///   0 — scaling assertion passed (`ok: true`).
+    ///   1 — scaling assertion violated (`ok: false`); the full JSON report
+    ///       is still printed.
+    ///   2 — usage/load error (bad manifest path, corpus build error, no result).
+    QueryBudget {
+        /// Path to the query-budget corpus manifest JSON.
+        #[arg(long, default_value = "corpus/query_budget_corpus.json")]
+        corpus: PathBuf,
+        /// Cold samples measured per query x temperature x size cell.
+        ///
+        /// Defaults to the manifest's `samples`. When supplied, overrides it.
+        #[arg(long)]
+        samples: Option<usize>,
+        /// Warm samples measured per query x size cell (each preceded by one
+        /// unmeasured priming invocation).
+        ///
+        /// Defaults to the manifest's `warm_samples`. When supplied,
+        /// overrides it.
+        #[arg(long)]
+        warm_samples: Option<usize>,
+        /// Store-size multiplier for the scaled store.
+        ///
+        /// Defaults to the manifest's `scale_factor`. Must be at least 2.
+        #[arg(long)]
+        scale_factor: Option<usize>,
+        /// Scaling ceiling: the scaled store must answer within this multiple
+        /// of the 1x cold symbol p50.
+        ///
+        /// Defaults to the manifest's `max_scaling_ratio`. Must be positive.
+        #[arg(long)]
+        max_ratio: Option<f64>,
+        /// Advisory absolute p95 budget in milliseconds (reported, not gated).
+        ///
+        /// Defaults to the manifest's `budget_p95_ms`. When supplied,
+        /// overrides it.
+        #[arg(long)]
+        budget_p95_ms: Option<f64>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Measure time-to-first-citable-answer and enforce the hard warm-p95
+    /// product gate (issue #57).
+    ///
+    /// Builds the pinned reference corpus (a local Rust fixture: 41,919 LOC,
+    /// 25 deterministic synthetic git commits), then times wall-clock from
+    /// process start to the first emitted result line of `eg query symbol`,
+    /// `eg query file`, `eg query symbol --at <sha>`, and `eg query drift` —
+    /// warm invocations only, 5 consecutive runs per query class. Every
+    /// measured answer is checked against a fixture expectation and must
+    /// carry a record ID plus a repo-relative file/span or commit handle:
+    /// latency without correctness does not count. Setup phases (cold scan,
+    /// history replay, ingest, embedding setup) are timed and reported
+    /// separately from warm query latency. Boring substitutes (`rg`,
+    /// `git grep`, `git show`) are timed where applicable, with an
+    /// explicit "not comparable" note when a substitute cannot return
+    /// citable graph handles. The gate is hard: any query class whose warm
+    /// p95 exceeds the budget fails with a stable diagnostic naming the
+    /// class and the observed p95. Local-first and offline.
+    ///
+    /// Exit codes:
+    ///   0 — gate passed (`ok: true`).
+    ///   1 — gate failed (`ok: false`); the full JSON report is still printed.
+    ///   2 — usage/load error (bad manifest path, corpus build error, no result).
+    SymbolLatency {
+        /// Path to the symbol-latency corpus manifest JSON.
+        #[arg(long, default_value = "corpus/symbol_latency_corpus.json")]
+        corpus: PathBuf,
+        /// Warm samples measured per query class (each preceded by one
+        /// unmeasured priming invocation).
+        ///
+        /// Defaults to the manifest's `warm_samples`. When supplied,
+        /// overrides it.
+        #[arg(long)]
+        warm_samples: Option<usize>,
+        /// Hard warm-p95 budget in milliseconds each query class must meet.
+        ///
+        /// Defaults to the manifest's `budget_p95_ms`. When supplied,
+        /// overrides it. Unlike `audit query-budget`, this budget gates.
+        #[arg(long)]
+        budget_p95_ms: Option<f64>,
+        /// Depth of the deterministic synthetic git history.
+        ///
+        /// Defaults to the manifest's `history_commits`. When supplied,
+        /// overrides it. Must be at least 2.
+        #[arg(long)]
+        history_commits: Option<usize>,
+        /// Which synthetic-history commit (0-based, oldest first) the
+        /// symbol-at-commit lookup targets.
+        ///
+        /// Defaults to the manifest's `at_commit_index`. When supplied,
+        /// overrides it. Must be below the effective `history_commits`.
+        #[arg(long)]
+        at_commit_index: Option<usize>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -4038,6 +6504,34 @@ pub(crate) enum AuditSubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    // Appended (issue #185); kept at the end to minimize cross-lane merge conflicts.
+    /// Sweep agent-memory evidence health: classify every evidence link of every
+    /// live observation-class node (`Observation`, `Decision`, `Failure`) into
+    /// exactly one bucket — `resolves_live`, `drifted`, or `dangling` — and flag
+    /// denormalized-array vs stored-edge integrity violations (issue #185).
+    ///
+    /// Reads a seeded record set from a JSONL graph (`--graph`) or an embedded
+    /// store (`--data-dir`); strictly read-only, no daemon required. Default
+    /// output is newline-delimited JSON (one object per line: link rows, then
+    /// integrity-violation rows, then a summary line); `--format text` renders
+    /// the human view. Documented in `docs/cli/memory-evidence-health.md`.
+    ///
+    /// Exit codes:
+    ///   0 — clean (`ok: true`): no dangling links, no integrity violations.
+    ///       `drifted` links are freshness leads, not rot: they do not fail the gate.
+    ///   1 — findings (`ok: false`); the full report is still printed.
+    ///   2 — usage/load error (both or neither input flag, unreadable/empty store or graph).
+    MemoryEvidenceHealth {
+        /// Graph JSONL path (mutually exclusive with `--data-dir`).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` store directory (mutually exclusive with `--graph`).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
 }
 
 /// Actions for `eg audit evidence-pack` (issue #338).
@@ -4220,13 +6714,45 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             out,
             repo_id_override,
             raw_literals,
-        } => scan(&repo_path, &out, repo_id_override.as_deref(), raw_literals),
+        } => {
+            let args = resolve_scan_args(repo_id_override, raw_literals);
+            scan(&repo_path, &out, &args)
+        }
         Commands::ScanHistory {
             repo_path,
             out,
             repo_id_override,
             raw_literals,
-        } => scan_history(&repo_path, &out, repo_id_override.as_deref(), raw_literals),
+            max_commits,
+            since,
+            from,
+            to,
+            resume_from,
+        } => {
+            let mut args = resolve_scan_args(repo_id_override, raw_literals);
+            args.max_commits = max_commits;
+            args.since = since;
+            args.from_rev = from;
+            args.to_rev = to;
+            scan_history(&repo_path, &out, &args, resume_from.as_deref())
+        }
+        Commands::Config { action } => match action {
+            ConfigAction::Show => config_show(),
+        },
+        Commands::Schema { action } => match action {
+            SchemaAction::Export {
+                domain,
+                kind,
+                schema_version,
+                out,
+            } => schema_export_cmd(
+                domain.as_deref(),
+                kind.as_deref(),
+                schema_version,
+                out.as_deref(),
+            ),
+            SchemaAction::List { domain } => schema_list_cmd(domain.as_deref()),
+        },
         Commands::ScanLogs {
             log_path,
             repo_path,
@@ -4236,16 +6762,80 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             protected_store,
             producer,
             captured_at,
-        } => scan_logs(
-            &log_path,
-            &repo_path,
-            &out,
-            repo_id_override.as_deref(),
+        } => {
+            // scan-logs takes no raw-literals flag; the config still governs
+            // identity, fails fast when malformed, and warns on scope pins.
+            let args = resolve_scan_args(repo_id_override, false);
+            scan_logs(
+                &log_path,
+                &repo_path,
+                &out,
+                args.repo_id_override.as_deref(),
+                protected_raw_artifacts,
+                protected_store.as_deref(),
+                producer.as_deref(),
+                captured_at.as_deref(),
+            )
+        }
+        Commands::VerifyScan {
+            repo_path,
+            repo_id_override,
+            format,
+        } => verify_scan_cmd(&repo_path, repo_id_override.as_deref(), format),
+        Commands::CaptureBench {
+            input,
+            out,
+            session_id,
+            commit,
+            suite,
+            command,
+            executed_at,
+            repo,
+            graph,
+            format,
+        } => capture_bench(&CaptureBenchArgs {
+            input: &input,
+            out: &out,
+            session_id: &session_id,
+            commit: &commit,
+            suite: &suite,
+            command: command.as_deref(),
+            executed_at: &executed_at,
+            graph: graph.as_deref(),
+            format: &format,
+            repo: repo.as_deref(),
+        }),
+        Commands::CaptureProof {
+            verus_bin,
+            verus_arg,
+            target,
+            out,
+            session,
+            commit,
+            executed_at,
+            verifier_version,
+            repo,
+            timeout_secs,
+            probe_timeout_secs,
             protected_raw_artifacts,
-            protected_store.as_deref(),
-            producer.as_deref(),
-            captured_at.as_deref(),
-        ),
+            protected_store,
+            producer,
+        } => capture_proof::capture_proof_cmd(&capture_proof::CaptureProofArgs {
+            verus_bin: &verus_bin,
+            verus_arg: &verus_arg,
+            target: &target,
+            out: &out,
+            session_id: &session,
+            commit: &commit,
+            executed_at: &executed_at,
+            verifier_version: verifier_version.as_deref(),
+            repo: repo.as_deref(),
+            timeout_secs,
+            probe_timeout_secs,
+            protected_raw_artifacts,
+            protected_store: protected_store.as_deref(),
+            producer: producer.as_deref(),
+        }),
         Commands::CaptureTests {
             input,
             out,
@@ -4275,6 +6865,43 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             runner: runner.as_deref(),
             runner_version: runner_version.as_deref(),
             repo: repo.as_deref(),
+            graph: graph.as_deref(),
+            format: &format,
+            protected_raw_artifacts,
+            protected_store: protected_store.as_deref(),
+            producer: producer.as_deref(),
+        }),
+        Commands::CaptureCoverage {
+            input,
+            out,
+            session_id,
+            commit,
+            suite,
+            command,
+            exit_code,
+            executed_at,
+            tool,
+            tool_version,
+            repo,
+            repo_root,
+            graph,
+            format,
+            protected_raw_artifacts,
+            protected_store,
+            producer,
+        } => capture_coverage::capture_coverage(&capture_coverage::CaptureCoverageArgs {
+            input: &input,
+            out: &out,
+            session_id: &session_id,
+            commit: &commit,
+            suite: suite.as_deref(),
+            command: &command,
+            exit_code,
+            executed_at: &executed_at,
+            tool: &tool,
+            tool_version: tool_version.as_deref(),
+            repo: repo.as_deref(),
+            repo_root: repo_root.as_deref(),
             graph: graph.as_deref(),
             format: &format,
             protected_raw_artifacts,
@@ -4322,6 +6949,26 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             let daemon = false;
             inspect(graph.as_deref(), daemon, data_dir.as_deref(), format)
         }
+        Commands::Repos {
+            graph,
+            data_dir,
+            format,
+        } => repos_cmd(graph.as_deref(), data_dir.as_deref(), format),
+        Commands::Brief {
+            repo_path,
+            graph,
+            data_dir,
+            repo,
+            staged_only,
+            format,
+        } => brief_cmd(
+            &repo_path,
+            graph.as_deref(),
+            data_dir.as_deref(),
+            repo.as_deref(),
+            staged_only,
+            format,
+        ),
         Commands::Freshness {
             repo_path,
             graph,
@@ -4337,6 +6984,32 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
         ),
         Commands::Validate { graph, format } => validate_cmd(&graph, format),
         Commands::Index { graph } => index_cmd(&graph),
+        #[cfg(feature = "embedded-aletheiadb")]
+        Commands::Init {
+            repo_path,
+            data_dir,
+            format,
+            #[cfg(feature = "embeddings")]
+            no_embed,
+            #[cfg(feature = "embeddings")]
+            embed_model,
+            repo_id_override,
+            raw_literals,
+        } => init_cmd(&InitArgs {
+            repo_path,
+            data_dir,
+            format,
+            #[cfg(feature = "embeddings")]
+            no_embed,
+            #[cfg(feature = "embeddings")]
+            embed_model,
+            repo_id_override,
+            raw_literals,
+        }),
+        #[cfg(not(feature = "embedded-aletheiadb"))]
+        Commands::Init { .. } => anyhow::bail!(
+            "eg init requires the embedded-aletheiadb feature (re-run without --no-default-features)"
+        ),
         Commands::Ingest {
             graph,
             adapter,
@@ -4346,8 +7019,17 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             idempotency_key,
             #[cfg(feature = "embeddings")]
             embed,
+            #[cfg(feature = "embeddings")]
+            embed_model,
             #[cfg(feature = "embedded-aletheiadb")]
             force,
+            #[cfg(feature = "embedded-aletheiadb")]
+            encrypted,
+            #[cfg(feature = "embedded-aletheiadb")]
+            key_file,
+            #[cfg(feature = "embedded-aletheiadb")]
+            passphrase_env,
+            dangling_citation_policy,
         } => ingest(
             &graph,
             adapter,
@@ -4357,8 +7039,17 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             idempotency_key.as_deref(),
             #[cfg(feature = "embeddings")]
             embed,
+            #[cfg(feature = "embeddings")]
+            embed_model,
             #[cfg(feature = "embedded-aletheiadb")]
             force,
+            #[cfg(feature = "embedded-aletheiadb")]
+            encrypted,
+            #[cfg(feature = "embedded-aletheiadb")]
+            key_file.as_deref(),
+            #[cfg(feature = "embedded-aletheiadb")]
+            passphrase_env.as_deref(),
+            dangling_citation_policy,
         ),
         Commands::Export {
             format,
@@ -4429,6 +7120,19 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
                 transaction_time.as_deref(),
                 no_backoff,
             ),
+            ImportSource::Docs {
+                repo_root,
+                root,
+                code_graph,
+                out,
+                transaction_time,
+            } => import_docs_cmd(
+                repo_root.as_deref(),
+                &root,
+                code_graph.as_deref(),
+                out.as_deref(),
+                transaction_time.as_deref(),
+            ),
         },
         Commands::LinkEvidence {
             code_graph,
@@ -4471,6 +7175,11 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
         } => eval_memory_recall_cmd(&corpus, &data_dir, top_k, threshold, verified_only),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Daemon { action } => daemon(action),
+        #[cfg(feature = "embedded-aletheiadb")]
+        Commands::Keygen {
+            out,
+            passphrase_env,
+        } => keygen(&out, passphrase_env.as_deref()),
         Commands::Decide {
             candidate_id,
             outcome,
@@ -4519,6 +7228,42 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             confirm,
         ),
         #[cfg(feature = "embedded-aletheiadb")]
+        Commands::Retire {
+            handle,
+            graph,
+            data_dir,
+            reason,
+            superseded_by,
+            evidence_handle,
+            retired_by,
+            transaction_time,
+        } => retire_cmd(RetireCmdArgs {
+            handle: &handle,
+            graph: graph.as_deref(),
+            data_dir: data_dir.as_deref(),
+            reason: &reason,
+            superseded_by,
+            evidence_handle,
+            retired_by,
+            transaction_time,
+        }),
+        #[cfg(feature = "embedded-aletheiadb")]
+        Commands::Reinstate {
+            handle,
+            graph,
+            data_dir,
+            reason,
+            reinstated_by,
+            transaction_time,
+        } => reinstate_cmd(ReinstateCmdArgs {
+            handle: &handle,
+            graph: graph.as_deref(),
+            data_dir: data_dir.as_deref(),
+            reason,
+            reinstated_by,
+            transaction_time,
+        }),
+        #[cfg(feature = "embedded-aletheiadb")]
         Commands::Repair { action } => repair_cmd(action),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Mcp { data_dir } => crate::mcp::run_stdio(&data_dir),
@@ -4541,16 +7286,27 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             format,
             #[cfg(feature = "embeddings")]
             embed,
+            #[cfg(feature = "embeddings")]
+            embed_model,
             raw_literals,
         } => scan_refresh_cmd(
             &repo_path,
-            &data_dir,
+            &resolve_data_dir(data_dir.as_deref()),
             cache.as_deref(),
             format,
             #[cfg(feature = "embeddings")]
             embed,
+            #[cfg(feature = "embeddings")]
+            embed_model,
             raw_literals,
         ),
+        #[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
+        Commands::Reembed {
+            data_dir,
+            model,
+            format,
+            dry_run,
+        } => reembed_cmd::reembed_cmd(&data_dir, &model, format, dry_run),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Watch {
             data_dir,
@@ -4606,6 +7362,12 @@ pub(crate) struct SymbolResult<'a> {
     doc: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     git_commit: Option<&'a str>,
+    /// The instant this row's version is valid as of (RFC 3339), from the
+    /// temporal metadata (issue #181) — the same axis the `symbol_at` MCP
+    /// tool cites. Absent for records that predate temporal metadata: never
+    /// fabricated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    valid_time: Option<&'a str>,
     /// Stable `Repository` record ID owning this row; absent when the store
     /// carries no repository topology for the record (legacy graphs).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4648,6 +7410,44 @@ pub(crate) struct SymbolResult<'a> {
     /// `corpus_mode`.
     #[serde(skip_serializing_if = "Option::is_none")]
     corpus_disclaimer: Option<String>,
+    /// Test-vs-production role of the row's record (issue #238): `test` or
+    /// `production`, drawn from the AST and the file path (a
+    /// `TrustClass::SourceDerived` fact, never agent-authored).
+    ///
+    /// OMITTED entirely for a record produced before issue #238 — role
+    /// UNKNOWN, which is a different fact from a present `production` value
+    /// (computed, and provably not test-gated). The text render likewise
+    /// prints nothing for an absent role rather than fabricating one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<&'a crate::ir::SymbolRole>,
+    /// Conditional-compilation gate chain (issue #190): the normalized
+    /// `#[cfg(...)]` / `#[cfg_attr(...)]` predicates lexically gating the
+    /// row's record, outermost gate first (file `#![cfg]` inner attributes,
+    /// then enclosing gated items/modules, then the item's own attributes).
+    /// Each entry is the predicate exactly as written — never evaluated.
+    ///
+    /// OMITTED entirely for a record produced before issue #190, and for an
+    /// ungated record — gate UNKNOWN-or-absent, which is a different fact
+    /// from a present chain. The text render likewise prints nothing for an
+    /// absent chain rather than fabricating a gate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cfg: Option<&'a Vec<String>>,
+    /// Deterministic structural complexity score (issue #162): 1 plus one
+    /// per decision point in the item's own body. Present on Rust callable
+    /// `Symbol` nodes (`function` / `method` / `test` symbol kinds); a
+    /// `TrustClass::SourceDerived` code fact, never agent confidence.
+    ///
+    /// OMITTED entirely for a record produced before issue #162 and for
+    /// non-callable symbols — score UNKNOWN-or-inapplicable, which is a
+    /// different fact from a present minimum. The text render likewise
+    /// prints nothing for an absent score rather than fabricating one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    complexity: Option<u32>,
+    /// Answer completeness signal (issue #121): whether the printed row set
+    /// is the complete match set, plus `total_matches` / `applied_limit`
+    /// exactly when a cap or selection narrowed the answer.
+    #[serde(flatten)]
+    completeness: RowCompleteness,
 }
 
 /// Resolves the effective corpus mode for a current-state code lane and,
@@ -4812,6 +7612,11 @@ pub(crate) struct DriftResult<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     repository: Option<&'a str>,
     status: &'static str,
+    /// Answer completeness signal (issue #121): whether the printed row set
+    /// is the complete match set, plus `total_matches` / `applied_limit`
+    /// exactly when the `--limit` cap narrowed the answer.
+    #[serde(flatten)]
+    completeness: RowCompleteness,
 }
 
 /// Output row for a semantic similarity result.
@@ -4833,11 +7638,30 @@ pub(crate) struct SemanticResult<'a> {
     /// Human-usable repository identity handle (e.g. `owner/name`).
     #[serde(skip_serializing_if = "Option::is_none")]
     repository: Option<&'a str>,
+    /// Confidence band for this row (issue #263): `strong` when
+    /// `score >= SEMANTIC_CONFIDENT_THRESHOLD`, else `weak`. The row-level
+    /// band complements the answer-level `confidence` verdict (issue #221):
+    /// the verdict judges the answer by its best row, the band judges each
+    /// row on its own.
+    confidence_band: &'static str,
+    /// The calibrated threshold this row was judged against (issue #263).
+    selection_threshold: f32,
+    /// How the threshold was set (issue #263); mirrors drift's `selection_basis`.
+    selection_basis: &'static str,
+    /// Answer completeness signal (issue #121): whether the printed row set
+    /// is the complete match set, plus `total_matches` / `applied_limit`
+    /// exactly when the `--limit` cap narrowed the answer.
+    #[serde(flatten)]
+    completeness: RowCompleteness,
 }
 
 #[cfg(feature = "embeddings")]
 impl<'a> SemanticResult<'a> {
-    fn from_match(m: &'a SemanticMatch, index: &'a query::RepositoryIndex) -> Self {
+    pub(crate) fn from_match(
+        m: &'a SemanticMatch,
+        index: &'a query::RepositoryIndex,
+        completeness: RowCompleteness,
+    ) -> Self {
         let repository_id = index.owner_of(&m.record_id);
         Self {
             record_id: &m.record_id,
@@ -4847,6 +7671,10 @@ impl<'a> SemanticResult<'a> {
             span: m.span,
             repository_id,
             repository: repository_id.and_then(|id| index.display_of(id)),
+            confidence_band: crate::semantic_confidence::ConfidenceBand::of_score(m.score).as_str(),
+            selection_threshold: crate::semantic_confidence::SEMANTIC_CONFIDENT_THRESHOLD,
+            selection_basis: crate::semantic_confidence::SEMANTIC_SELECTION_BASIS,
+            completeness,
         }
     }
 }
@@ -4922,7 +7750,8 @@ pub(crate) struct ContextSourceFact<'a> {
 /// `provenance_handle` (or `agent_id`/`session_id`), `observed_at`,
 /// `confidence`, and the evidence links.
 use crate::query::{
-    ContextLinkedItem, ContextObservation, context_linked_item, context_observation,
+    ContextDecision, ContextLinkedItem, ContextObservation, context_decision, context_linked_item,
+    context_observation,
 };
 
 /// One unresolved evidence link target, surfaced per AC5.
@@ -5007,18 +7836,26 @@ pub(crate) struct ContextResponse<'a> {
     /// returned handles instead of losing them.
     #[serde(skip_serializing_if = "Option::is_none")]
     freshness: Option<&'static str>,
-    source_facts: Vec<ContextSourceFact<'a>>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    topology_edges: Vec<ContextTopologyEdge<'a>>,
-    observations: Vec<ContextObservation<'a>>,
-    project_state: Vec<ContextLinkedItem<'a>>,
-    artifacts: Vec<ContextLinkedItem<'a>>,
-    verification_evidence: Vec<ContextLinkedItem<'a>>,
+    source_facts: BudgetedSection<ContextSourceFact<'a>>,
+    #[serde(skip_serializing_if = "BudgetedSection::is_empty")]
+    topology_edges: BudgetedSection<ContextTopologyEdge<'a>>,
+    observations: BudgetedSection<ContextObservation<'a>>,
+    /// Agent-authored decisions with rationale (issue #191). Always
+    /// present; empty when no decisions link to the symbol.
+    decisions: BudgetedSection<ContextDecision<'a>>,
+    project_state: BudgetedSection<ContextLinkedItem<'a>>,
+    artifacts: BudgetedSection<ContextLinkedItem<'a>>,
+    verification_evidence: BudgetedSection<ContextLinkedItem<'a>>,
     /// `SemanticDrift` records targeting this symbol, score descending
     /// (issue #108). Always present — an empty array, not an omitted field,
     /// signals "no drift recorded" (AC4).
-    drift_history: Vec<ContextDrift<'a>>,
-    unresolved: Vec<ContextUnresolved<'a>>,
+    drift_history: BudgetedSection<ContextDrift<'a>>,
+    unresolved: BudgetedSection<ContextUnresolved<'a>>,
+    /// Active approved policy folded into the answer (issue #169). Always
+    /// present; an empty array signals "no in-scope policy applies" (AC5).
+    /// Budgeted like every other section (issue #211): the fold keeps its
+    /// top-ranked (record-ID ordered) prefix and the remainder flows on.
+    policy: BudgetedSection<ContextPolicyRow<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     excluded: Vec<ExcludedDiagnostic<'a>>,
     /// Corpus the current-state view read (issue #427):
@@ -5028,6 +7865,11 @@ pub(crate) struct ContextResponse<'a> {
     corpus_mode_source: &'static str,
     /// One-line human description of the corpus that was read.
     corpus_disclaimer: String,
+    /// Store-level trust-domain presence (issue #196): which of the five
+    /// domains the store contains at least one record in. Lets a reader tell
+    /// an empty section that means "domain absent from this store" apart from
+    /// one that means "domain present, no records for this entity".
+    store_coverage: query::StoreCoverage,
 }
 
 /// Full task context query response envelope.
@@ -5039,6 +7881,8 @@ pub(crate) struct TaskContextResponse<'a> {
     acceptance_criteria: Vec<ContextLinkedItem<'a>>,
     source_facts: Vec<ContextSourceFact<'a>>,
     observations: Vec<ContextObservation<'a>>,
+    /// Agent-authored decisions with rationale (issue #191).
+    decisions: Vec<ContextDecision<'a>>,
     artifacts: Vec<ContextLinkedItem<'a>>,
     verification_evidence: Vec<ContextLinkedItem<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -5047,6 +7891,11 @@ pub(crate) struct TaskContextResponse<'a> {
     unresolved: Vec<ContextUnresolved<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     excluded: Vec<ExcludedDiagnostic<'a>>,
+    /// Store-level trust-domain presence (issue #196): which of the five
+    /// domains the store contains at least one record in. Lets a reader tell
+    /// an empty section that means "domain absent from this store" apart from
+    /// one that means "domain present, no records for this entity".
+    store_coverage: query::StoreCoverage,
 }
 
 /// One semantic drift item in the `semantic_drift` section of a subsystem response.
@@ -5101,6 +7950,32 @@ pub(crate) struct SubsystemLogSignature<'a> {
     resolved_frames: Vec<SubsystemLogFrame<'a>>,
 }
 
+/// Documents an active author selector on a subsystem answer (issue #195).
+///
+/// Present only when `--agent` / `--not-agent` was given. Records which
+/// selector spelled the filter, which answer field carries the authoring agent
+/// identity, and how many observations the filter matched — so an empty
+/// `observations` array under an active scope is an explicit empty result,
+/// not a silent fallback to unscoped recall.
+#[derive(Serialize)]
+pub(crate) struct AuthorScopeReport<'a> {
+    /// The `--agent` value: only observations authored by this `agent_id`
+    /// were returned. Omitted when the flag was not given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<&'a str>,
+    /// The `--not-agent` value: observations authored by this `agent_id`
+    /// were excluded. Omitted when the flag was not given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    not_agent: Option<&'a str>,
+    /// The observation field carrying the authoring agent identity.
+    author_field: &'static str,
+    /// Observations in the answer after the author filter and supersession
+    /// resolution.
+    observations_matched: usize,
+    /// Observations under the prefix before the author filter.
+    observations_total: usize,
+}
+
 /// Full subsystem context query response envelope (issue #83).
 #[derive(Serialize)]
 pub(crate) struct SubsystemResponse<'a> {
@@ -5110,6 +7985,12 @@ pub(crate) struct SubsystemResponse<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     topology_edges: Vec<ContextTopologyEdge<'a>>,
     observations: Vec<ContextObservation<'a>>,
+    /// Agent-authored decisions with rationale (issue #191).
+    decisions: Vec<ContextDecision<'a>>,
+    /// Author selector applied to `observations` (issue #195). `None`
+    /// (omitted) when recall was unscoped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    author_scope: Option<AuthorScopeReport<'a>>,
     project_state: Vec<ContextLinkedItem<'a>>,
     artifacts: Vec<ContextLinkedItem<'a>>,
     verification_evidence: Vec<ContextLinkedItem<'a>>,
@@ -5171,6 +8052,9 @@ pub(crate) struct SemanticContextMatch<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     topology_edges: Vec<ContextTopologyEdge<'a>>,
     observations: Vec<ContextObservation<'a>>,
+    /// Agent-authored decisions with rationale (issue #191). Always
+    /// present; empty when no decisions link to the match.
+    decisions: Vec<ContextDecision<'a>>,
     project_state: Vec<ContextLinkedItem<'a>>,
     artifacts: Vec<ContextLinkedItem<'a>>,
     verification_evidence: Vec<ContextLinkedItem<'a>>,
@@ -5352,14 +8236,14 @@ pub(crate) struct MemoryAuditResponse<'a> {
     ok: bool,
     memory_id: &'a str,
     verified_only: bool,
-    memory_claim: Vec<AuditClaim<'a>>,
+    memory_claim: BudgetedSection<AuditClaim<'a>>,
     direct_provenance: AuditProvenance<'a>,
-    supporting_evidence: Vec<AuditItem<'a>>,
-    contradicting_evidence: Vec<AuditItem<'a>>,
-    superseding_records: Vec<AuditItem<'a>>,
-    related_code_handles: Vec<AuditItem<'a>>,
-    related_project_handles: Vec<AuditItem<'a>>,
-    verification_evidence: Vec<AuditItem<'a>>,
+    supporting_evidence: BudgetedSection<AuditItem<'a>>,
+    contradicting_evidence: BudgetedSection<AuditItem<'a>>,
+    superseding_records: BudgetedSection<AuditItem<'a>>,
+    related_code_handles: BudgetedSection<AuditItem<'a>>,
+    related_project_handles: BudgetedSection<AuditItem<'a>>,
+    verification_evidence: BudgetedSection<AuditItem<'a>>,
     diagnostics: Vec<AuditDiagnostic<'a>>,
     excluded: Vec<AuditExcluded<'a>>,
     page: AuditPage,
@@ -5394,10 +8278,10 @@ pub(crate) struct FailureHistoryResponse<'a> {
     target_handle: &'a str,
     target_type: &'a str,
     target_ids: Vec<&'a str>,
-    runtime_failures: Vec<FailureAttemptJson<'a>>,
-    agent_failures: Vec<FailureAttemptJson<'a>>,
-    superseding_successes: Vec<AuditItem<'a>>,
-    patch_artifacts: Vec<AuditItem<'a>>,
+    runtime_failures: BudgetedSection<FailureAttemptJson<'a>>,
+    agent_failures: BudgetedSection<FailureAttemptJson<'a>>,
+    superseding_successes: BudgetedSection<AuditItem<'a>>,
+    patch_artifacts: BudgetedSection<AuditItem<'a>>,
     /// `AgentSession` record IDs reached via `AUTHORED_BY` from a failure — the
     /// citable provenance when a `Failure` carries no `agent_id`/`session_id`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -5417,11 +8301,162 @@ pub(crate) struct FailureHistoryResponse<'a> {
 }
 
 // ---------------------------------------------------------------------------
+/// One side of a recorded disagreement, projected to a bounded payload-safe
+/// view (issue #232). A party is an agent-authored claim, a verification
+/// execution, or a user-context record — never a deterministic code fact.
+#[derive(Serialize)]
+pub(crate) struct ConflictPartyJson<'a> {
+    record_id: &'a str,
+    kind: &'static str,
+    /// Lane provenance class: `agent_authored` / `verification` / `user_context`.
+    party_class: &'static str,
+    /// Derived trust class label (issue #114 vocabulary).
+    trust_class: &'static str,
+    /// Which end of the `CONTRADICTS` edge the party sits on: `source` / `target`.
+    edge_role: &'static str,
+    /// The record's own ID first, then its evidence-link target IDs (sorted,
+    /// deduplicated). Non-empty by construction.
+    citation_handles: Vec<&'a str>,
+    /// Non-empty author label (`agent_id[:session_id]`, the deciding user for
+    /// user-context records, else a stable `unknown_agent` marker).
+    author: String,
+    /// Verification `executed_at`, else agent `observed_at`, else a stable
+    /// `unknown_time` marker — never an invented timestamp.
+    observed_at: &'a str,
+    /// Recorded confidence, else a stable `unspecified` marker.
+    confidence: &'a str,
+    /// The shared scope target handle both parties were filtered by.
+    target_handle: &'a str,
+    /// Bounded payload-safe summary (agent-authored text is hashed, AC9).
+    summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary_hash: Option<String>,
+}
+
+/// One recorded disagreement: the unordered party pair joined by recorded
+/// `CONTRADICTS` edge(s) (issue #232).
+#[derive(Serialize)]
+pub(crate) struct ConflictJson<'a> {
+    /// Unordered pair key `[min_record_id, max_record_id]` — the stable
+    /// conflict identity.
+    conflict_id: [&'a str; 2],
+    /// Recorded `CONTRADICTS` edge IDs joining the pair, sorted.
+    edge_ids: Vec<&'a str>,
+    /// The two parties, in record-ID order.
+    parties: Vec<ConflictPartyJson<'a>>,
+    /// True when any party was superseded by a later live record.
+    resolved: bool,
+    /// Superseding record IDs (sorted); empty when unresolved.
+    resolved_by: Vec<&'a str>,
+}
+
+/// One stable machine-readable conflicts diagnostic.
+#[derive(Serialize)]
+pub(crate) struct ConflictDiagnosticJson<'a> {
+    code: &'a str,
+    detail: &'a str,
+}
+
+/// Deterministic tallies for a conflicts answer.
+#[derive(Serialize)]
+pub(crate) struct ConflictsCountsJson {
+    contradicts_edges_considered: usize,
+    conflicts_found: usize,
+    conflicts_returned: usize,
+    conflicts_resolved_excluded: usize,
+    edges_skipped_ineligible_party: usize,
+}
+
+impl From<&query::ConflictsCounts> for ConflictsCountsJson {
+    fn from(counts: &query::ConflictsCounts) -> Self {
+        Self {
+            contradicts_edges_considered: counts.contradicts_edges_considered,
+            conflicts_found: counts.conflicts_found,
+            conflicts_returned: counts.conflicts_returned,
+            conflicts_resolved_excluded: counts.conflicts_resolved_excluded,
+            edges_skipped_ineligible_party: counts.edges_skipped_ineligible_party,
+        }
+    }
+}
+
+/// Full conflicts response envelope (issue #232).
+#[derive(Serialize)]
+pub(crate) struct ConflictsResponse<'a> {
+    ok: bool,
+    scope: &'a str,
+    /// `symbol` / `file` / `subsystem`.
+    scope_kind: &'static str,
+    target_handle: &'a str,
+    /// Every code record ID the scope resolved to (sorted).
+    target_ids: Vec<&'a str>,
+    include_resolved: bool,
+    conflicts: Vec<ConflictJson<'a>>,
+    /// Number of conflicts returned (mirrors `conflicts.len()`).
+    count: usize,
+    counts: ConflictsCountsJson,
+    diagnostics: Vec<ConflictDiagnosticJson<'a>>,
+}
+
+impl PrintText for ConflictsResponse<'_> {
+    fn as_text(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "conflicts for scope '{}' ({}): {} conflict(s)",
+            self.scope, self.scope_kind, self.count
+        );
+        for conflict in &self.conflicts {
+            let _ = writeln!(
+                out,
+                "conflict [{}, {}] resolved: {}",
+                conflict.conflict_id[0], conflict.conflict_id[1], conflict.resolved
+            );
+            if !conflict.resolved_by.is_empty() {
+                let _ = writeln!(out, "  resolved_by: {}", conflict.resolved_by.join(", "));
+            }
+            let _ = writeln!(out, "  edges: {}", conflict.edge_ids.join(", "));
+            for party in &conflict.parties {
+                let _ = writeln!(
+                    out,
+                    "  - {} [{}, {}] {}",
+                    party.edge_role, party.party_class, party.trust_class, party.record_id
+                );
+                let _ = writeln!(
+                    out,
+                    "    kind: {} author: {} observed_at: {} confidence: {}",
+                    party.kind, party.author, party.observed_at, party.confidence
+                );
+                let _ = writeln!(
+                    out,
+                    "    target: {} citations: {}",
+                    party.target_handle,
+                    party.citation_handles.join(", ")
+                );
+                let _ = writeln!(out, "    summary: {}", party.summary);
+            }
+        }
+        for diagnostic in &self.diagnostics {
+            let _ = writeln!(out, "note: {}: {}", diagnostic.code, diagnostic.detail);
+        }
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
 // query_cmd — dispatch
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
+    // Fail fast on a malformed `egregore.toml` even for lanes that never read
+    // the store (issue #261): a bad config is never silently ignored. The
+    // lanes manifest (issue #251) is the exception: it is local and pure —
+    // clap metadata only — so it skips config parsing entirely and works on
+    // a fresh clone with an empty data dir.
+    if !matches!(subcommand, QuerySubcommand::Lanes { .. }) {
+        let _ = cli_project_config();
+    }
     match subcommand {
         QuerySubcommand::Churn {
             graph,
@@ -5451,6 +8486,135 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_churn_cmd(&records, selected.as_deref(), limit, format)
+        }
+        QuerySubcommand::Complexity {
+            graph,
+            data_dir,
+            repo,
+            limit,
+            format,
+        } => {
+            // Validate the limit before touching the store so a malformed
+            // bound fails fast with a machine-readable diagnostic.
+            if limit == 0 || limit > query::COMPLEXITY_MAX_LIMIT {
+                let diag = serde_json::json!({
+                    "code": "invalid_limit",
+                    "limit": limit,
+                    "min": 1,
+                    "max": query::COMPLEXITY_MAX_LIMIT,
+                    "message": format!(
+                        "--limit must be between 1 and {} (default {})",
+                        query::COMPLEXITY_MAX_LIMIT,
+                        query::COMPLEXITY_DEFAULT_LIMIT
+                    ),
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_complexity_cmd(&records, selected.as_deref(), limit, format)
+        }
+        QuerySubcommand::Cost {
+            graph,
+            data_dir,
+            task,
+            session,
+            verification,
+            limit,
+            format,
+        } => {
+            // Validate the limit before touching the store so a malformed
+            // bound fails fast with a machine-readable diagnostic (same
+            // contract as `eg query churn`).
+            if limit == 0 || limit > query::COST_MAX_LIMIT {
+                let diag = serde_json::json!({
+                    "code": "invalid_limit",
+                    "limit": limit,
+                    "min": 1,
+                    "max": query::COST_MAX_LIMIT,
+                    "message": format!(
+                        "--limit must be between 1 and {} (default {})",
+                        query::COST_MAX_LIMIT,
+                        query::COST_DEFAULT_LIMIT
+                    ),
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            let verification = match verification.as_deref() {
+                None => None,
+                Some("verified") => Some(query::CostVerificationOutcome::Verified),
+                Some("failed") => Some(query::CostVerificationOutcome::Failed),
+                // Unreachable: clap's value_parser rejects anything else.
+                Some(other) => {
+                    let diag = serde_json::json!({
+                        "code": "invalid_verification",
+                        "verification": other,
+                        "allowed": ["verified", "failed"],
+                        "message": "--verification must be \"verified\" or \"failed\"",
+                    });
+                    eprintln!("{diag}");
+                    std::process::exit(1);
+                }
+            };
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_cost_cmd(
+                &records,
+                &query::CostFilters {
+                    task,
+                    session,
+                    verification,
+                },
+                limit,
+                format,
+            )
+        }
+        QuerySubcommand::Conflicts {
+            scope,
+            graph,
+            data_dir,
+            repo,
+            include_resolved,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_conflicts_cmd(
+                &records,
+                &scope,
+                &index,
+                selected.as_deref(),
+                include_resolved,
+                format,
+            )
+        }
+        QuerySubcommand::Resolve {
+            record_id,
+            graph,
+            data_dir,
+            #[cfg(feature = "embedded-aletheiadb")]
+            daemon,
+            at,
+            as_of,
+            format,
+        } => {
+            // Validate the handle before touching any store so a malformed
+            // or non-codegraph id fails fast with a machine-readable
+            // diagnostic (the lane itself re-validates; this keeps the
+            // dispatch honest about the contract).
+            query_resolve_cmd(
+                &record_id,
+                graph.as_deref(),
+                data_dir,
+                #[cfg(feature = "embedded-aletheiadb")]
+                daemon,
+                at.as_deref(),
+                as_of.as_deref(),
+                format,
+            )
         }
         QuerySubcommand::Recency {
             graph,
@@ -5495,6 +8659,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             repo_path,
             at_head,
             all_history,
+            role,
             format,
         } => {
             #[cfg(feature = "embedded-aletheiadb")]
@@ -5551,6 +8716,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                         as_of.as_deref(),
                         repo.as_deref(),
                         format,
+                        role,
                     );
                 }
                 // Validate the temporal selectors before touching the local store
@@ -5584,6 +8750,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                     format,
                     &index,
                     selected.as_deref(),
+                    role,
                 );
             }
             #[cfg(feature = "embedded-aletheiadb")]
@@ -5608,6 +8775,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                     as_of.as_deref(),
                     repo.as_deref(),
                     format,
+                    role,
                 );
             }
             // Sidecar-index fast path (issue #447) for the plain current-state,
@@ -5707,6 +8875,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                                 freshness_code.as_ref(),
                                 corpus_mode,
                                 corpus_mode_source,
+                                role,
                             )
                         },
                         |prefix| {
@@ -5719,6 +8888,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                                 selected,
                                 package.as_deref(),
                                 freshness_code.as_ref(),
+                                role,
                             )
                         },
                     )
@@ -5733,6 +8903,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                         selected,
                         package.as_deref(),
                         freshness_code.as_ref(),
+                        role,
                     )
                 },
             )
@@ -5907,6 +9078,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             tx_as_of,
             repo,
             repo_path,
+            role,
             format,
         } => {
             // Transaction-time file views are reserved: reject with the
@@ -5948,6 +9120,11 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 // `(record_id, commit)` pair to its current version.
                 // Superseded prior versions are a transaction-time concern
                 // (issue #66), not part of a plain valid-time point query.
+                // Config fallback (issue #261): explicit `--data-dir` wins; the
+                // config-pinned dir applies only when neither `--graph` nor
+                // `--data-dir` was passed, so `--graph` plus a pinned store never
+                // reads as "both provided".
+                let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
                 let records = match (graph.as_deref(), data_dir.as_deref()) {
                     (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                     (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
@@ -5965,6 +9142,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                     as_of.as_deref(),
                     selected.as_deref(),
                     format,
+                    role,
                 );
             }
             #[cfg(feature = "embedded-aletheiadb")]
@@ -5979,7 +9157,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 let dir = data_dir
                     .as_deref()
                     .expect("clap requires --data-dir with --daemon");
-                return query_file_via_daemon(&path, dir, repo.as_deref(), format);
+                return query_file_via_daemon(&path, dir, repo.as_deref(), format, role);
             }
             // Sidecar-index fast path (issue #447): a file's defined-symbol set
             // is a `ByPath` closure. `--repo` (scope) and `--repo-path`
@@ -6005,6 +9183,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 &index,
                 selected.as_deref(),
                 freshness_code.as_ref(),
+                role,
             )
         }
         QuerySubcommand::Drift {
@@ -6028,6 +9207,56 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_drift(&records, limit, format, &index, selected.as_deref())
         }
+        QuerySubcommand::Clones {
+            graph,
+            data_dir,
+            #[cfg(feature = "embedded-aletheiadb")]
+            daemon,
+            repo,
+            min_size,
+            limit,
+            format,
+        } => {
+            // Validate the bounds before touching the store so a malformed
+            // bound fails fast with a machine-readable diagnostic (same
+            // contract as `eg query churn`).
+            if limit == 0 || limit > query::CLONES_MAX_LIMIT {
+                let diag = serde_json::json!({
+                    "code": "invalid_limit",
+                    "limit": limit,
+                    "min": 1,
+                    "max": query::CLONES_MAX_LIMIT,
+                    "message": format!(
+                        "--limit must be between 1 and {} (default {})",
+                        query::CLONES_MAX_LIMIT,
+                        query::CLONES_DEFAULT_LIMIT
+                    ),
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            if min_size < query::CLONES_DEFAULT_MIN_SIZE {
+                let diag = serde_json::json!({
+                    "code": "invalid_min_size",
+                    "min_size": min_size,
+                    "min": query::CLONES_DEFAULT_MIN_SIZE,
+                    "message": "--min-size must be at least 2: a clone class needs two members",
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            #[cfg(feature = "embedded-aletheiadb")]
+            if daemon {
+                let dir = data_dir
+                    .as_deref()
+                    .expect("clap requires --data-dir with --daemon");
+                return query_clones_via_daemon(dir, min_size, limit, repo.as_deref(), format);
+            }
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_clones_cmd(&records, selected.as_deref(), min_size, limit, format)
+        }
         #[cfg(feature = "embeddings")]
         QuerySubcommand::Semantic {
             query,
@@ -6037,6 +9266,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             under,
             limit,
             format,
+            embed_model,
         } => {
             if daemon {
                 // `--under` conflicts with `--daemon` at the CLI layer (scoped
@@ -6051,9 +9281,17 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                     repo.as_deref(),
                     under.as_deref(),
                     format,
+                    embed_model.as_deref(),
                 )
             }
         }
+        #[cfg(feature = "embeddings")]
+        QuerySubcommand::Similar {
+            handle,
+            data_dir,
+            limit,
+            format,
+        } => similar::query_similar_cmd(&handle, &data_dir, limit, format),
         #[cfg(feature = "embeddings")]
         QuerySubcommand::SemanticContext {
             query,
@@ -6077,16 +9315,28 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             repo,
             limit,
             verified_only,
+            agent,
+            not_agent,
             format,
             supersession,
+            collapse,
+            similarity_threshold,
+            collapse_mode,
+            include_retired,
         } => query_semantic_memory(
             &query,
             &data_dir,
             limit,
             repo.as_deref(),
             verified_only,
+            agent.as_deref(),
+            not_agent.as_deref(),
             format,
             supersession,
+            collapse,
+            similarity_threshold,
+            collapse_mode,
+            include_retired,
         ),
         QuerySubcommand::Context {
             name,
@@ -6096,6 +9346,10 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             at_head,
             all_history,
             supersession,
+            max_records,
+            max_tokens,
+            max_bytes,
+            candidate,
         } => {
             // Sidecar-index fast path (issue #447): the plain context bundle is a
             // `ByName` closure. With `--repo-path` the freshness hint needs the
@@ -6135,6 +9389,22 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 &[graph.as_deref(), data_dir.as_deref()],
                 owner_hint.as_deref(),
             );
+            // Issue #196: `store_coverage` must describe the whole store, not
+            // the #447 sidecar-selected closure. When a valid sidecar index
+            // served the closure, answer from its validated `by_kind` keys
+            // (no record parsing); otherwise `records` is already the whole
+            // store (cold scan, `Whole` selector, or `--data-dir`).
+            let store_coverage = graph.as_deref().map_or_else(
+                || query::StoreCoverage::from_records(&records),
+                |path| match crate::graph_index::GraphIndex::load_for(path) {
+                    Ok(index) if !index.body.has_temporal_history => {
+                        query::StoreCoverage::from_index_kind_keys(
+                            index.body.by_kind.keys().map(String::as_str),
+                        )
+                    }
+                    _ => query::StoreCoverage::from_records(&records),
+                },
+            );
             query_context_cmd(
                 &records,
                 &name,
@@ -6142,7 +9412,34 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 supersession,
                 at_head,
                 all_history,
+                max_records,
+                store_coverage,
+                candidate.as_deref(),
+                // Issue #131: clap's `conflicts_with_all` rules out two
+                // ceilings at once; fail closed rather than guess if one ever
+                // slips through.
+                match (max_tokens, max_bytes) {
+                    (Some(n), None) => Some(context_pack::PackBudget::Tokens(n)),
+                    (None, Some(n)) => Some(context_pack::PackBudget::Bytes(n)),
+                    (None, None) => None,
+                    (Some(_), Some(_)) => {
+                        return Err(anyhow::anyhow!(
+                            "--max-tokens and --max-bytes are mutually exclusive"
+                        ));
+                    }
+                },
             )
+        }
+        QuerySubcommand::Bench {
+            target,
+            graph,
+            data_dir,
+            at,
+            as_of,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_bench_cmd(&records, &target, at.as_deref(), as_of.as_deref(), format)
         }
         QuerySubcommand::Task {
             id_or_handle,
@@ -6160,6 +9457,43 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             }
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_task_cmd(&records, &id_or_handle)
+        }
+        QuerySubcommand::TaskReady {
+            graph,
+            data_dir,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_task_ready_cmd(&records, format)
+        }
+        QuerySubcommand::TaskOverlap {
+            graph,
+            data_dir,
+            status,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_task_overlap_cmd(&records, status.as_deref(), format)
+        }
+        // Appended (issue #147); kept at the end to minimize cross-lane merge conflicts.
+        QuerySubcommand::TaskEvidenceGate {
+            graph,
+            data_dir,
+            id_or_handle,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_task_evidence_gate_cmd(&records, &id_or_handle, format)
+        }
+        // Appended (issue #119); kept at the end to minimize cross-lane merge conflicts.
+        QuerySubcommand::TaskList {
+            graph,
+            data_dir,
+            status,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_task_list_cmd(&records, status.as_deref(), format)
         }
         QuerySubcommand::Candidates {
             graph,
@@ -6201,9 +9535,51 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             graph,
             data_dir,
             verified_only,
+            max_records,
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
-            query_memory_cmd(&records, &id_or_handle, verified_only)
+            query_memory_cmd(&records, &id_or_handle, verified_only, max_records)
+        }
+        QuerySubcommand::Retirement {
+            handle,
+            graph,
+            data_dir,
+            as_of,
+            format,
+        } => query_retirement_cmd(
+            &handle,
+            graph.as_deref(),
+            data_dir.as_deref(),
+            as_of.as_deref(),
+            format,
+        ),
+        QuerySubcommand::BeliefTimeline {
+            target,
+            graph,
+            data_dir,
+            repo,
+            format,
+        } => {
+            // Strictly read-only lane (issue #235): opening the embedded
+            // engine in place re-persists its on-disk index files, so
+            // `--data-dir` reads from a throwaway copy, never the live store
+            // (same contract as the other read-only lanes).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_belief_timeline_cmd(&records, &target, &index, selected.as_deref(), format)
         }
         QuerySubcommand::Changes {
             base,
@@ -6222,6 +9598,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             repo,
             at_head,
             all_history,
+            max_records,
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             let index = query::RepositoryIndex::build(&records);
@@ -6233,7 +9610,36 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 selected.as_deref(),
                 at_head,
                 all_history,
+                max_records,
             )
+        }
+        QuerySubcommand::FailureHotspots {
+            graph,
+            data_dir,
+            limit,
+            as_of,
+            since,
+            format,
+        } => {
+            // Validate the limit before touching the store so a malformed
+            // bound fails fast with a machine-readable diagnostic.
+            if limit == 0 || limit > query::FAILURE_HOTSPOTS_MAX_LIMIT {
+                let diag = serde_json::json!({
+                    "code": "invalid_limit",
+                    "limit": limit,
+                    "min": 1,
+                    "max": query::FAILURE_HOTSPOTS_MAX_LIMIT,
+                    "message": format!(
+                        "--limit must be between 1 and {} (default {})",
+                        query::FAILURE_HOTSPOTS_MAX_LIMIT,
+                        query::FAILURE_HOTSPOTS_DEFAULT_LIMIT
+                    ),
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_failure_hotspots_cmd(&records, limit, as_of.as_deref(), since.as_deref(), format)
         }
         QuerySubcommand::EvidenceFreshness {
             graph,
@@ -6257,6 +9663,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             all_history,
             format,
             supersession,
+            agent,
+            not_agent,
         } => {
             // Validate the prefix before loading records so malformed input fails
             // fast with a machine-readable diagnostic, not a store I/O error.
@@ -6280,6 +9688,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 all_history,
                 format,
                 supersession,
+                agent.as_deref(),
+                not_agent.as_deref(),
             )
         }
         QuerySubcommand::ChangeImpact {
@@ -6291,6 +9701,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             at_head,
             all_history,
             format: _format,
+            max_records,
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             let index = query::RepositoryIndex::build(&records);
@@ -6303,6 +9714,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 depth,
                 at_head,
                 all_history,
+                max_records,
             )
         }
         QuerySubcommand::TransitiveCallers {
@@ -6334,6 +9746,11 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // `query path`/`query implementors`). Temporal selectors need the
             // history-inclusive store view; the current-state read suffices
             // otherwise. A JSONL graph is read identically either way.
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(_), Some(_)) => {
                     anyhow::bail!("provide only one of --graph or --data-dir, not both")
@@ -6357,6 +9774,142 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 as_of.as_deref(),
                 at_head,
                 all_history,
+                format,
+            )
+        }
+        QuerySubcommand::Tests {
+            handle,
+            graph,
+            data_dir,
+            repo,
+            max_depth,
+            at,
+            as_of,
+            #[cfg(feature = "embedded-aletheiadb")]
+            daemon,
+            format,
+        } => {
+            // Validate the bound before any store I/O: a zero-hop walk can
+            // never return the direct-caller set and is malformed input.
+            if max_depth == 0 {
+                let diag = serde_json::json!({
+                    "code": "invalid_max_depth",
+                    "max_depth": 0,
+                    "message": "--max-depth must be at least 1",
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            #[cfg(feature = "embedded-aletheiadb")]
+            if daemon {
+                let dir = data_dir
+                    .as_deref()
+                    .expect("clap requires --data-dir with --daemon");
+                return query_tests_via_daemon(
+                    &handle,
+                    dir,
+                    max_depth,
+                    at.as_deref(),
+                    as_of.as_deref(),
+                    repo.as_deref(),
+                    format,
+                );
+            }
+            // Strictly read-only lane (issue #424): opening the embedded engine
+            // in place re-persists its on-disk index files, so `--data-dir` reads
+            // from a throwaway copy, never the live store (same contract as
+            // `query path`/`query implementors`). Temporal selectors need the
+            // history-inclusive store view; the current-state read suffices
+            // otherwise. A JSONL graph is read identically either way.
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, Some(dir)) if at.is_some() || as_of.is_some() => {
+                    load_records_from_db_history_readonly(dir)?
+                }
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_tests_cmd(
+                &records,
+                &handle,
+                &index,
+                selected.as_deref(),
+                max_depth,
+                at.as_deref(),
+                as_of.as_deref(),
+                format,
+            );
+            Ok(())
+        }
+        QuerySubcommand::Diagram {
+            handle,
+            graph,
+            data_dir,
+            repo,
+            depth,
+            max_nodes,
+            at,
+            as_of,
+            format,
+        } => {
+            // Validate the bounds before any store I/O.
+            if depth == 0 {
+                let diag = serde_json::json!({
+                    "code": "invalid_depth",
+                    "depth": 0,
+                    "message": "--depth must be at least 1",
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            if max_nodes == 0 {
+                let diag = serde_json::json!({
+                    "code": "invalid_max_nodes",
+                    "max_nodes": 0,
+                    "message": "--max-nodes must be at least 1",
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            // Strictly read-only lane (issue #424): opening the embedded engine
+            // in place re-persists its on-disk index files, so `--data-dir` reads
+            // from a throwaway copy, never the live store (same contract as
+            // `query transitive-callers`). Temporal selectors need the
+            // history-inclusive store view; the current-state read suffices
+            // otherwise. A JSONL graph is read identically either way.
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, Some(dir)) if at.is_some() || as_of.is_some() => {
+                    load_records_from_db_history_readonly(dir)?
+                }
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_diagram_cmd(
+                &records,
+                &handle,
+                &index,
+                selected.as_deref(),
+                depth,
+                max_nodes,
+                at.as_deref(),
+                as_of.as_deref(),
                 format,
             )
         }
@@ -6389,6 +9942,11 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // `query path`/`query implementors`). Temporal selectors need the
             // history-inclusive store view; the current-state read suffices
             // otherwise. A JSONL graph is read identically either way.
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(_), Some(_)) => {
                     anyhow::bail!("provide only one of --graph or --data-dir, not both")
@@ -6432,6 +9990,11 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // `query path`/`query implementors`). Temporal selectors need the
             // history-inclusive store view; the current-state read suffices
             // otherwise. A JSONL graph is read identically either way.
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(_), Some(_)) => {
                     anyhow::bail!("provide only one of --graph or --data-dir, not both")
@@ -6504,6 +10067,11 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // engine in place re-persists its on-disk index files, so
             // `--data-dir` reads from a throwaway copy, never the live store
             // (same contract as the other read-only lanes).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
@@ -6532,6 +10100,11 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // A temporal pin needs the history-inclusive store view: the
             // embedded store keeps older commit versions only there, so a
             // current-view read would wrongly lose pinned answers.
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(_), Some(_)) => {
                     anyhow::bail!("provide only one of --graph or --data-dir, not both")
@@ -6564,6 +10137,11 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // files; producer-drift documents a read-only guarantee, so an
             // embedded store is read through a throwaway copy. The guard
             // keeps the copy alive for the reads below.
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let store_copy = data_dir.as_deref().map(readonly_audit_store).transpose()?;
             let effective_data_dir = store_copy.as_ref().map(|(path, _guard)| path.as_path());
             let records = load_query_records(graph.as_deref(), effective_data_dir)?;
@@ -6598,6 +10176,11 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // engine in place re-persists its on-disk index files, so
             // `--data-dir` reads from a throwaway copy, never the live store
             // (same contract as the other read-only lanes).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
@@ -6617,6 +10200,51 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 all_history,
                 format,
             )
+        }
+        QuerySubcommand::DeadCode {
+            graph,
+            data_dir,
+            repo,
+            limit,
+            format,
+        } => {
+            // Validate the limit before touching the store so a malformed
+            // bound fails fast with a machine-readable diagnostic.
+            if limit == 0 || limit > query::DEAD_CODE_MAX_LIMIT {
+                let diag = serde_json::json!({
+                    "code": "invalid_limit",
+                    "limit": limit,
+                    "min": 1,
+                    "max": query::DEAD_CODE_MAX_LIMIT,
+                    "message": format!(
+                        "--limit must be between 1 and {} (default {})",
+                        query::DEAD_CODE_MAX_LIMIT,
+                        query::DEAD_CODE_DEFAULT_LIMIT
+                    ),
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            // Strictly read-only lane (issue #240): opening the embedded
+            // engine in place re-persists its on-disk index files, so
+            // `--data-dir` reads from a throwaway copy, never the live store
+            // (same contract as the other read-only lanes).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_dead_code_cmd(&records, &index, selected.as_deref(), limit, format)
         }
         QuerySubcommand::Orient {
             graph,
@@ -6658,6 +10286,11 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // engine in place re-persists its on-disk index files, so
             // `--data-dir` reads from a throwaway copy, never the live store
             // (same contract as the other read-only lanes).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) => load_records_from_data_dir_log_retained_readonly(dir)?,
@@ -6719,6 +10352,11 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // the embedded log-retention caveat (issue #363). The `--graph` path
             // preserves every ingested line, so it is `false`.
             let embedded_source = data_dir.is_some();
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) if at.is_some() || as_of.is_some() => {
@@ -6757,7 +10395,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                     repo_scope.as_deref(),
                     at.as_deref(),
                     None,
-                )?)
+                ))
             } else {
                 None
             };
@@ -6785,6 +10423,11 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // re-persists its on-disk index files, so `--data-dir` reads from a
             // throwaway copy, never the live store (same contract as the other
             // read-only lanes).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
@@ -6832,6 +10475,11 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // engine in place re-persists its on-disk index files, so
             // `--data-dir` reads from a throwaway copy, never the live store
             // (same contract as the other read-only lanes).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
@@ -6881,6 +10529,11 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // engine in place re-persists its on-disk index files, so
             // `--data-dir` reads from a throwaway copy, never the live store
             // (same contract as the other read-only lanes).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
@@ -6914,6 +10567,11 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
         } => {
             // Strictly read-only lane (issue #218): same throwaway-copy
             // `--data-dir` contract as the other read-only lanes.
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
@@ -6935,6 +10593,151 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 format,
             )
         }
+        QuerySubcommand::Diagnostics {
+            graph,
+            data_dir,
+            repo,
+            file,
+            at_head,
+            all_history,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_diagnostics_cmd(
+                &records,
+                &index,
+                selected.as_deref(),
+                file.as_deref(),
+                at_head,
+                all_history,
+                format,
+            )
+        }
+        QuerySubcommand::RiskMarkers {
+            path,
+            graph,
+            data_dir,
+            at,
+            repo,
+            at_head,
+            all_history,
+            format,
+        } => {
+            // Strictly read-only lane (issue #210): same throwaway-copy
+            // `--data-dir` contract as the other read-only lanes.
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_risk_markers_cmd(
+                &records,
+                path.as_deref(),
+                at.as_deref(),
+                &index,
+                selected.as_deref(),
+                at_head,
+                all_history,
+                format,
+            )
+        }
+        QuerySubcommand::DeprecatedSymbols {
+            graph,
+            data_dir,
+            repo,
+            file,
+            format,
+        } => {
+            // Strictly read-only lane (issue #249): opening the embedded
+            // engine in place re-persists its on-disk index files, so
+            // `--data-dir` reads from a throwaway copy, never the live store
+            // (same contract as the other read-only lanes).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_deprecated_symbols_cmd(
+                &records,
+                &index,
+                selected.as_deref(),
+                file.as_deref(),
+                format,
+            )
+        }
+        QuerySubcommand::RedactionAudit {
+            graph,
+            data_dir,
+            repo,
+            format,
+        } => {
+            // Strictly read-only lane (issue #244): opening the embedded
+            // engine in place re-persists its on-disk index files, so
+            // `--data-dir` reads from a throwaway copy, never the live store
+            // (same contract as the other read-only lanes).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_redaction_audit_cmd(&records, &index, selected.as_deref(), format)
+        }
+        QuerySubcommand::TrustAudit {
+            graph,
+            data_dir,
+            format,
+        } => {
+            // Strictly read-only lane (issue #236): opening the embedded
+            // engine in place re-persists its on-disk index files, so
+            // `--data-dir` reads from a throwaway copy, never the live store
+            // (same contract as the other read-only lanes).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            query_trust_audit_cmd(&records, format)
+        }
         QuerySubcommand::UnsafeSites {
             path,
             graph,
@@ -6949,6 +10752,11 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // engine in place re-persists its on-disk index files, so
             // `--data-dir` reads from a throwaway copy, never the live store
             // (same contract as the other read-only lanes).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
@@ -7006,6 +10814,27 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             };
             query_ownership_cmd(&records, &options, format)
         }
+        QuerySubcommand::Origin {
+            symbol,
+            graph,
+            data_dir,
+            repo,
+            at,
+            as_of,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_origin_cmd(
+                &records,
+                &symbol,
+                selected.as_deref(),
+                at.as_deref(),
+                as_of.as_deref(),
+                format,
+            )
+        }
         QuerySubcommand::At {
             location,
             graph,
@@ -7036,6 +10865,11 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // re-persists its on-disk index files, so `--data-dir` reads from
             // a throwaway copy, never the live store (same contract as the
             // other read-only query lanes).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 // Sidecar-index fast path (issue #447): a file's spans are a
                 // `ByPath` closure. `--repo`/`--at` need global topology / the
@@ -7068,6 +10902,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             location,
             graph,
             data_dir,
+            #[cfg(feature = "embedded-aletheiadb")]
+            daemon,
             at,
             as_of,
             repo,
@@ -7092,18 +10928,40 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                     std::process::exit(1);
                 }
             };
+            #[cfg(feature = "embedded-aletheiadb")]
+            if daemon {
+                let dir = data_dir
+                    .as_deref()
+                    .expect("clap requires --data-dir with --daemon");
+                return query_locate_via_daemon(
+                    path,
+                    line,
+                    dir,
+                    at.as_deref(),
+                    as_of.as_deref(),
+                    repo.as_deref(),
+                    supersession,
+                    format,
+                );
+            }
             // Strictly read-only lookup: `--data-dir` reads from a throwaway
             // copy, never the live store (same contract as `query at`).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
-                // Sidecar-index fast path (issue #447): a file's spans are a
-                // `ByPath` closure. `--repo`/`--at`/`--as-of` need global
-                // topology / the commit timeline and stay cold.
-                (Some(graph_path), None) if repo.is_none() && at.is_none() && as_of.is_none() => {
-                    load_records_from_jsonl_selected(
-                        graph_path,
-                        &crate::graph_index::Selector::ByPath(path.to_owned()),
-                    )?
-                }
+                // No sidecar-index fast path (issue #212): the locate answer
+                // is the full trust-separated cross-domain bundle — the same
+                // `record_context` walk `eg query context` performs (3 hops
+                // over cross-domain edges plus every record's evidence_links).
+                // No bounded `ByPath` closure can soundly supply that: a
+                // pathless `Observation` linked to the located symbol is not in
+                // the file's span closure, so the fast path silently dropped it
+                // from the bundle while the cold scan kept it. The whole-graph
+                // cold scan keeps an indexed answer byte-identical to the
+                // unindexed one.
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
                 (Some(_), Some(_)) => {
@@ -7156,6 +11014,11 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // throwaway copy, never the live store. A temporal pin needs the
             // history-inclusive store view so older commit versions are present
             // to snapshot.
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(_), Some(_)) => {
                     anyhow::bail!("provide only one of --graph or --data-dir, not both")
@@ -7263,6 +11126,11 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // untouched. --graph is a plain file read. A temporal pin needs the
             // history-inclusive store view; the current-state read suffices
             // otherwise. (Mirrors `query implementors`, issue #133.)
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(_), Some(_)) => {
                     anyhow::bail!("provide only one of --graph or --data-dir, not both")
@@ -7303,6 +11171,11 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // re-persists its on-disk index files, so `--data-dir` reads a
             // throwaway copy of the store — the original stays byte-for-byte
             // untouched. `--graph` is a plain file read. No temporal selectors.
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(_), Some(_)) => {
                     anyhow::bail!("provide only one of --graph or --data-dir, not both")
@@ -7348,6 +11221,11 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // the history-inclusive store view; the current-state read suffices
             // otherwise. `--graph` is a plain file read (the CONSTRUCTS edges are
             // Edge records, not a single-kind closure, so no sidecar fast path).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(_), Some(_)) => {
                     anyhow::bail!("provide only one of --graph or --data-dir, not both")
@@ -7364,6 +11242,51 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             query_who_constructs_cmd(
                 &records,
                 &handle,
+                &index,
+                selected.as_deref(),
+                at.as_deref(),
+                as_of.as_deref(),
+                at_head,
+                all_history,
+                format,
+            )
+        }
+        // Appended (issue #258); kept at the end to minimize cross-lane merge conflicts.
+        QuerySubcommand::Uses {
+            path,
+            graph,
+            data_dir,
+            repo,
+            at,
+            as_of,
+            at_head,
+            all_history,
+            format,
+        } => {
+            // Strictly read-only lane: `--data-dir` reads a throwaway copy so the
+            // live store stays byte-for-byte untouched. Temporal selectors need
+            // the history-inclusive store view; the current-state read suffices
+            // otherwise. `--graph` is a plain file read. Config fallback
+            // (issue #261): explicit `--data-dir` wins; the config-pinned dir
+            // applies only when neither `--graph` nor `--data-dir` was passed,
+            // so `--graph` plus a pinned store never reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, Some(dir)) if at.is_some() || as_of.is_some() => {
+                    load_records_from_db_history_readonly(dir)?
+                }
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_dep_usage_cmd(
+                &records,
+                &path,
                 &index,
                 selected.as_deref(),
                 at.as_deref(),
@@ -7441,6 +11364,11 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 .expect("bounded by the range check above");
             // Strictly read-only lane: `--data-dir` reads a throwaway copy so
             // the live store stays byte-for-byte untouched.
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
@@ -7456,6 +11384,154 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let repository_id = resolve_repo_scope(&index, Some(repo.as_str()))
                 .expect("a required selector always resolves or exits");
             query_sessions_cmd(&records, &index, &repository_id, limit, format)
+        }
+        // Appended (issue #265); kept at the end to minimize cross-lane merge conflicts.
+        QuerySubcommand::BlindSpots {
+            graph,
+            data_dir,
+            repo,
+            kind,
+            format,
+        } => {
+            // Strictly read-only lane (issue #265): opening the embedded
+            // engine in place re-persists its on-disk index files, so
+            // `--data-dir` reads from a throwaway copy, never the live store
+            // (same contract as the other read-only lanes).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_blind_spots_cmd(
+                &records,
+                &index,
+                selected.as_deref(),
+                kind.as_query(),
+                format,
+            )
+        }
+        // Appended (issue #262); kept at the end to minimize cross-lane merge conflicts.
+        QuerySubcommand::TrackRecord {
+            graph,
+            data_dir,
+            repo,
+            format,
+        } => {
+            // Strictly read-only lane (issue #262): opening the embedded
+            // engine in place re-persists its on-disk index files, so
+            // `--data-dir` reads from a throwaway copy, never the live store
+            // (same contract as the other read-only lanes).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_track_record_cmd(&records, selected.as_deref(), format)
+        }
+        QuerySubcommand::Session {
+            id_or_handle,
+            graph,
+            data_dir,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_session_cmd(&records, &id_or_handle, format)
+        }
+        QuerySubcommand::Lanes { format } => query_lanes_cmd(format),
+        QuerySubcommand::Suppressions {
+            path,
+            graph,
+            data_dir,
+            at,
+            repo,
+            at_head,
+            all_history,
+            format,
+        } => {
+            // Strictly read-only lane (issue #227): opening the embedded
+            // engine in place re-persists its on-disk index files, so
+            // `--data-dir` reads from a throwaway copy, never the live store
+            // (same contract as the other read-only lanes).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_lint_suppressions_cmd(
+                &records,
+                path.as_deref(),
+                at.as_deref(),
+                &index,
+                selected.as_deref(),
+                at_head,
+                all_history,
+                format,
+            )
+        }
+        QuerySubcommand::Since {
+            tx_after,
+            graph,
+            data_dir,
+            repo,
+            domain,
+            limit,
+            format,
+        } => {
+            // Transaction-time lane (issues #197, #66): every written version
+            // is a feed event, so load the history-inclusive view; and the
+            // strictly read-only lane (issue #227) means `--data-dir` reads
+            // from a throwaway copy, never the live store. Config fallback
+            // (issue #261): explicit `--data-dir` wins; the config-pinned dir
+            // applies only when neither `--graph` nor `--data-dir` was passed.
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, Some(dir)) => load_records_from_db_history_readonly(dir)?,
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_since_cmd(
+                &records,
+                &tx_after,
+                &domain,
+                selected.as_deref(),
+                limit,
+                format,
+            )
         }
     }
 }
@@ -7837,6 +11913,7 @@ pub(crate) fn exit_ambiguous_repository(groups: &std::collections::BTreeSet<Opti
 #[cfg(feature = "embeddings")]
 pub(crate) fn generate_embeddings(
     records: &[GraphRecord],
+    model_name: &str,
 ) -> Result<(
     crate::embeddings::EmbeddingVectorMap,
     usize,
@@ -7844,19 +11921,22 @@ pub(crate) fn generate_embeddings(
 )> {
     use crate::embeddings::{
         DEFAULT_EMBEDDING_MODEL_ARCHITECTURE, DEFAULT_EMBEDDING_MODEL_DIMENSIONS,
-        DEFAULT_EMBEDDING_MODEL_NAME, EmbeddingVectorKey, EmbeddingVectorMap, aletheia_embeddings,
-        default_embedding_model_identity, embedding_candidates,
+        EmbeddingVectorKey, EmbeddingVectorMap, aletheia_embeddings, embedding_candidates,
+        embedding_model_identity,
     };
 
     let candidates = embedding_candidates(records);
     if candidates.is_empty() {
         // Zero candidates still creates a queryable (empty) vector index, so it
         // still needs an identity: the dimension is the model's declared one,
-        // since the model was never loaded to report a measured dimension.
+        // since the model was never loaded to report a measured dimension. The
+        // identity records the RESOLVED model name (issue #261), not the
+        // built-in default, so a config-pinned model is described honestly even
+        // when nothing was embedded.
         return Ok((
             EmbeddingVectorMap::new(),
             DEFAULT_EMBEDDING_MODEL_DIMENSIONS,
-            default_embedding_model_identity(DEFAULT_EMBEDDING_MODEL_DIMENSIONS),
+            embedding_model_identity(model_name, DEFAULT_EMBEDDING_MODEL_DIMENSIONS),
         ));
     }
 
@@ -7867,7 +11947,7 @@ pub(crate) fn generate_embeddings(
 
     let embedder = aletheia_embeddings::EmbedderBuilder::new()
         .model_architecture(DEFAULT_EMBEDDING_MODEL_ARCHITECTURE)
-        .model_id(Some(DEFAULT_EMBEDDING_MODEL_NAME))
+        .model_id(Some(model_name))
         .from_pretrained_hf()
         .context("failed to load embedding model")?;
 
@@ -7897,11 +11977,13 @@ pub(crate) fn generate_embeddings(
 
     // The identity records the MEASURED dimension the model actually produced,
     // not the declared constant, so a model whose real dimension drifts from the
-    // constant is still described honestly.
+    // constant is still described honestly — and the RESOLVED model name (issue
+    // #261), so a config-pinned or `--embed-model` model is never misdescribed
+    // as the built-in default.
     Ok((
         map,
         dimensions,
-        default_embedding_model_identity(dimensions),
+        embedding_model_identity(model_name, dimensions),
     ))
 }
 
@@ -8171,6 +12253,32 @@ pub(crate) fn temporal_commit_if_prefix<'a>(
 // query context (issue #38)
 // ---------------------------------------------------------------------------
 
+/// One active approved policy record folded into a context answer (issue
+/// #169).
+///
+/// Mirrors [`query::PolicyEntry`]: the authorization basis is the cited
+/// approval decision (whose audit trail the fold already verified), and the
+/// trust class is `other` under the #114 closed vocabulary — distinguishable
+/// from source-derived code facts and unverified observations.
+#[derive(Serialize)]
+pub(crate) struct ContextPolicyRow<'a> {
+    record_id: &'a str,
+    kind: &'static str,
+    body: &'a str,
+    approval_decision_id: &'a str,
+    active_from: &'a str,
+    status: &'static str,
+    trust: crate::query::TrustClass,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope_repo: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope_path_glob: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope_language: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope_lifecycle_phase: Option<&'a str>,
+}
+
 /// The five trust-separated context sections (plus topology edges and
 /// unresolved references) rendered from a [`query::SymbolContext`].
 ///
@@ -8180,10 +12288,12 @@ pub(crate) struct ContextSections<'a> {
     source_facts: Vec<ContextSourceFact<'a>>,
     topology_edges: Vec<ContextTopologyEdge<'a>>,
     observations: Vec<ContextObservation<'a>>,
+    decisions: Vec<ContextDecision<'a>>,
     project_state: Vec<ContextLinkedItem<'a>>,
     artifacts: Vec<ContextLinkedItem<'a>>,
     verification_evidence: Vec<ContextLinkedItem<'a>>,
     unresolved: Vec<ContextUnresolved<'a>>,
+    policy: Vec<ContextPolicyRow<'a>>,
 }
 
 /// One stable machine-readable diagnostic in the public-api response.

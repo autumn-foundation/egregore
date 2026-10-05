@@ -297,6 +297,37 @@ fn seed_history_repo(repo: &Path) -> [String; 3] {
     [first, second, third]
 }
 
+/// Salts the initial commit's content so two fixture repositories have
+/// distinct root commits — and therefore distinct repository identities.
+/// Git commit identity does not include the checkout path, so byte-identical
+/// seeds would produce byte-identical identities (issue #224).
+fn seed_history_repo_salted(repo: &Path, salt: &str) -> [String; 3] {
+    git(repo, ["init"]);
+    git(repo, ["config", "user.email", "codegraph@example.invalid"]);
+    git(repo, ["config", "user.name", "Codegraph Test"]);
+    git(repo, ["config", "core.autocrlf", "false"]);
+    git(repo, ["config", "commit.gpgsign", "false"]);
+
+    write(
+        repo,
+        "src/lib.rs",
+        &format!("pub fn original() -> u32 {{ 1 }}\n// fixture salt: {salt}\n"),
+    );
+    let first = commit(repo, "initial symbol", "2026-01-01T00:00:00Z");
+
+    write(repo, "src/lib.rs", "pub fn renamed() -> u32 { 2 }\n");
+    let second = commit(repo, "rename symbol", "2026-01-02T00:00:00Z");
+
+    write(
+        repo,
+        "src/extra.rs",
+        "pub struct Added;\nimpl Added { pub fn value(&self) -> u32 { 3 } }\n",
+    );
+    let third = commit(repo, "add extra module", "2026-01-03T00:00:00Z");
+
+    [first, second, third]
+}
+
 fn seed_two_file_history_repo(repo: &Path) -> [String; 2] {
     git(repo, ["init"]);
     git(repo, ["config", "user.email", "codegraph@example.invalid"]);
@@ -541,5 +572,729 @@ fn assert_temporal_file(records: &[Value], path: &str, sha: &str, valid_time: &s
                 && record["temporal"]["valid_time"] == valid_time
         }),
         "missing temporal file {path} at {sha}"
+    );
+}
+
+/// Issue #444: the history pipeline runs the import-target pass per commit
+/// slice, so each `File —IMPORTS→ Module|File` edge carries that commit's
+/// temporal provenance (git commit + valid time), exactly like the
+/// per-commit CALLS/IMPLEMENTS edges.
+#[test]
+fn history_replay_stamps_import_target_edges_with_commit_temporal() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    git(repo, ["init"]);
+    git(repo, ["config", "user.email", "codegraph@example.invalid"]);
+    git(repo, ["config", "user.name", "Codegraph Test"]);
+    git(repo, ["config", "core.autocrlf", "false"]);
+    git(repo, ["config", "commit.gpgsign", "false"]);
+
+    write(repo, "src/lib.rs", "pub mod b;\n");
+    write(repo, "src/b.rs", "pub fn f() {}\n");
+    write(repo, "src/consumer.rs", "use crate::b;\n");
+    let sha = commit(repo, "add import", "2026-02-01T00:00:00Z");
+
+    let jsonl = scan_repository_history(repo)
+        .expect("history should scan")
+        .to_jsonl()
+        .expect("history graph should serialize");
+    let records = parse_jsonl(&jsonl);
+
+    // The target-side edge is the IMPORTS edge whose summary names the
+    // importer and the resolved module target ("X imports Y (Rust import …)");
+    // the extractor's containment edges ("consumer imports crate::b") carry
+    // no `(Rust import …)` marker.
+    let target_edges: Vec<&Value> = records
+        .iter()
+        .filter(|record| {
+            record["record_type"] == "edge"
+                && record["label"] == "IMPORTS"
+                && record["summary"]
+                    .as_str()
+                    .is_some_and(|summary| summary.contains("(Rust import "))
+        })
+        .collect();
+    assert_eq!(
+        target_edges.len(),
+        1,
+        "history replay should mint exactly one import-target edge"
+    );
+    let edge = target_edges[0];
+    assert_eq!(
+        edge["temporal"]["git_commit"], sha,
+        "the edge must carry its commit's temporal provenance"
+    );
+    assert_eq!(
+        edge["temporal"]["valid_time"], "2026-02-01T00:00:00Z",
+        "the edge must carry its commit's valid time"
+    );
+}
+
+// ── Issue #224: incrementally update history from new commits ─────────────
+
+use aletheia_egregore::{
+    CodegraphError, adapters::records_from_jsonl, history_resume_point,
+    scan_repository_history_resumed,
+};
+
+/// Seeds `commits` linear commits, each rewriting `src/lib.rs`, dated
+/// 2026-01-01 + i days. Returns the commit SHAs oldest-first.
+fn seed_linear_repo(repo: &Path, commits: usize) -> Vec<String> {
+    seed_linear_repo_salted(repo, commits, "canonical")
+}
+
+/// Salts the initial commit's content so two fixture repositories have
+/// distinct root commits — and therefore distinct repository identities.
+/// Git commit identity does not include the checkout path, so byte-identical
+/// seeds would produce byte-identical identities (issue #224).
+fn seed_linear_repo_salted(repo: &Path, commits: usize, salt: &str) -> Vec<String> {
+    git(repo, ["init"]);
+    git(repo, ["config", "user.email", "codegraph@example.invalid"]);
+    git(repo, ["config", "user.name", "Codegraph Test"]);
+    git(repo, ["config", "core.autocrlf", "false"]);
+    git(repo, ["config", "commit.gpgsign", "false"]);
+
+    let mut shas = Vec::with_capacity(commits);
+    for i in 0..commits {
+        let contents = if i == 0 {
+            format!("pub fn f{i}() -> u32 {{ {i} }}\n// fixture salt: {salt}\n")
+        } else {
+            format!("pub fn f{i}() -> u32 {{ {i} }}\n")
+        };
+        write(repo, "src/lib.rs", &contents);
+        let date = format!("2026-01-{:02}T00:00:00Z", i + 1);
+        shas.push(commit(repo, &format!("commit {i}"), &date));
+    }
+    shas
+}
+
+fn repository_id_for(repo: &Path) -> String {
+    stable_id(&["repository", "local-root-commit", &git_root_sha(repo)])
+}
+
+fn full_replay_jsonl(repo: &Path) -> String {
+    scan_repository_history(repo)
+        .expect("history should scan")
+        .to_jsonl()
+        .expect("history graph should serialize")
+}
+
+#[test]
+fn full_replay_stamps_history_replay_tip_node() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    let shas = seed_history_repo(&repo);
+    let head = git_output(&repo, ["rev-parse", "HEAD"]);
+
+    let records = parse_jsonl(&full_replay_jsonl(&repo));
+
+    let tips: Vec<&Value> = records
+        .iter()
+        .filter(|record| record["kind"] == "HistoryReplayTip")
+        .collect();
+    assert_eq!(tips.len(), 1, "a full replay stamps exactly one tip node");
+    let tip = tips[0];
+    let payload = &tip["history_replay_tip"];
+    assert_eq!(payload["tip_sha"], head.as_str());
+    assert_eq!(payload["covered_commit_count"], 3);
+    assert_eq!(payload["tip_committed_at"], "2026-01-03T00:00:00Z");
+
+    // The tip is keyed per repository identity and CONTAINS-attached.
+    let repository_id = stable_id(&["repository", "local-root-commit", &shas[0]]);
+    assert_eq!(payload["repository_id"], repository_id.as_str());
+    let tip_id = stable_id(&["node", "history-replay-tip", &repository_id]);
+    assert_eq!(tip["id"], tip_id.as_str());
+    assert!(
+        records.iter().any(|record| record["record_type"] == "edge"
+            && record["label"] == "CONTAINS"
+            && record["source"] == repository_id.as_str()
+            && record["target"] == tip_id.as_str()),
+        "the tip node must be CONTAINS-attached to its Repository"
+    );
+}
+
+#[test]
+fn resume_point_extraction_is_keyed_per_repository_identity() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo_a = temp.path().join("repo-a");
+    let repo_b = temp.path().join("repo-b");
+    fs::create_dir_all(&repo_a).expect("repo dir should be created");
+    fs::create_dir_all(&repo_b).expect("repo dir should be created");
+    seed_history_repo_salted(&repo_a, "a");
+    seed_history_repo_salted(&repo_b, "b");
+    let head_a = git_output(&repo_a, ["rev-parse", "HEAD"]);
+    let head_b = git_output(&repo_b, ["rev-parse", "HEAD"]);
+
+    // A multi-repo frontier: both replays concatenated.
+    let mut records =
+        records_from_jsonl(&full_replay_jsonl(&repo_a)).expect("frontier A should parse");
+    records
+        .extend(records_from_jsonl(&full_replay_jsonl(&repo_b)).expect("frontier B should parse"));
+
+    let id_a = repository_id_for(&repo_a);
+    let id_b = repository_id_for(&repo_b);
+    assert_ne!(id_a, id_b, "fixture repos must have distinct identities");
+
+    let point_a = history_resume_point(&records, &id_a).expect("tip for repo A");
+    assert_eq!(point_a.repository_id, id_a);
+    assert_eq!(point_a.tip_sha, head_a);
+    assert_eq!(
+        point_a.prior_records.len(),
+        records.len(),
+        "the merge keeps every frontier record"
+    );
+
+    let point_b = history_resume_point(&records, &id_b).expect("tip for repo B");
+    assert_eq!(point_b.repository_id, id_b);
+    assert_eq!(point_b.tip_sha, head_b);
+
+    assert!(
+        history_resume_point(&records, "codegraph:v11:no-such-repo").is_none(),
+        "an unknown repository identity has no resume point"
+    );
+}
+
+#[test]
+fn resumed_run_matches_full_replay_byte_for_byte() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    seed_linear_repo(&repo, 8);
+
+    let frontier_jsonl = full_replay_jsonl(&repo);
+    let repository_id = repository_id_for(&repo);
+    let prior_records = records_from_jsonl(&frontier_jsonl).expect("frontier should parse");
+    let resume = history_resume_point(&prior_records, &repository_id).expect("tip should exist");
+
+    // N new commits land on the M-commit repo.
+    for i in 8..11 {
+        write(
+            &repo,
+            "src/lib.rs",
+            &format!("pub fn f{i}() -> u32 {{ {i} }}\n"),
+        );
+        commit(
+            &repo,
+            &format!("commit {i}"),
+            &format!("2026-01-{:02}T00:00:00Z", i + 1),
+        );
+    }
+
+    let outcome =
+        scan_repository_history_resumed(&repo, None, resume).expect("resume should succeed");
+    assert_eq!(outcome.processed, 3, "only the new commits are processed");
+    assert_eq!(
+        outcome.skipped, 8,
+        "the already-represented commits are skipped"
+    );
+
+    let full_jsonl = full_replay_jsonl(&repo);
+    let resumed_jsonl = outcome
+        .graph
+        .to_jsonl()
+        .expect("resumed graph should serialize");
+    assert_eq!(
+        resumed_jsonl, full_jsonl,
+        "a resumed run must be byte-identical to a full replay"
+    );
+
+    // The merged graph carries exactly one tip node, at the new HEAD.
+    let records = parse_jsonl(&resumed_jsonl);
+    let tips: Vec<&Value> = records
+        .iter()
+        .filter(|record| record["kind"] == "HistoryReplayTip")
+        .collect();
+    assert_eq!(tips.len(), 1, "the old tip is replaced, not duplicated");
+    assert_eq!(
+        tips[0]["history_replay_tip"]["tip_sha"],
+        git_output(&repo, ["rev-parse", "HEAD"]).as_str()
+    );
+    assert_eq!(tips[0]["history_replay_tip"]["covered_commit_count"], 11);
+}
+
+/// Issue #224, AC4: resuming one repository in a shared multi-repo frontier
+/// must leave every other repository's records byte-untouched — only the
+/// resumed repository's records get the re-derived producer envelope.
+///
+/// A naive merge re-stamps the whole graph, which rewrites the untouched
+/// repository's producer envelope (`producer_started_at` follows the
+/// advancing repository's new HEAD committer date and the language
+/// inventory is recomputed over the merged graph). This test pins the
+/// promise: B's serialized record lines are identical before and after A
+/// is resumed with new commits.
+#[test]
+fn resumed_run_leaves_other_repositories_records_byte_untouched() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo_a = temp.path().join("repo-a");
+    let repo_b = temp.path().join("repo-b");
+    fs::create_dir_all(&repo_a).expect("repo dir should be created");
+    fs::create_dir_all(&repo_b).expect("repo dir should be created");
+    seed_linear_repo_salted(&repo_a, 5, "a");
+    seed_linear_repo_salted(&repo_b, 5, "b");
+
+    // A shared multi-repo frontier: both full replays concatenated, the way
+    // a multi-repo store holds them.
+    let jsonl_a = full_replay_jsonl(&repo_a);
+    let jsonl_b = full_replay_jsonl(&repo_b);
+    let mut frontier_records = records_from_jsonl(&jsonl_a).expect("frontier A should parse");
+    frontier_records.extend(records_from_jsonl(&jsonl_b).expect("frontier B should parse"));
+
+    // B's record IDs and serialized lines, before the resume. Lines are
+    // compared as a multiset (sorted Vec): history may legitimately repeat
+    // a stable record ID across commits, so a plain ID->line map would
+    // silently drop duplicates.
+    let b_ids: BTreeSet<String> = parse_jsonl(&jsonl_b)
+        .iter()
+        .map(|record| {
+            record["id"]
+                .as_str()
+                .expect("every record has an id")
+                .to_owned()
+        })
+        .collect();
+    let mut b_lines_before: Vec<String> = jsonl_b.lines().map(str::to_owned).collect();
+    b_lines_before.sort();
+
+    // New commits land on A only; B is untouched on disk too.
+    let resume = history_resume_point(&frontier_records, &repository_id_for(&repo_a))
+        .expect("tip for repo A should exist");
+    for i in 5..7 {
+        write(
+            &repo_a,
+            "src/lib.rs",
+            &format!("pub fn f{i}() -> u32 {{ {i} }}\n"),
+        );
+        commit(
+            &repo_a,
+            &format!("commit {i}"),
+            &format!("2026-01-{:02}T00:00:00Z", i + 1),
+        );
+    }
+
+    let outcome =
+        scan_repository_history_resumed(&repo_a, None, resume).expect("resume should succeed");
+    assert_eq!(outcome.processed, 2, "only A's new commits are processed");
+    assert_eq!(
+        outcome.skipped, 5,
+        "A's already-represented commits are skipped"
+    );
+
+    // B's records in the merged graph: same multiset of serialized lines,
+    // byte-for-byte — no drops, no rewrites.
+    let merged_jsonl = outcome
+        .graph
+        .to_jsonl()
+        .expect("merged graph should serialize");
+    let mut b_lines_after: Vec<String> = merged_jsonl
+        .lines()
+        .filter(|line| {
+            let record: Value =
+                serde_json::from_str(line).expect("merged line should parse as JSON");
+            record["id"].as_str().is_some_and(|id| b_ids.contains(id))
+        })
+        .map(str::to_owned)
+        .collect();
+    b_lines_after.sort();
+    assert_eq!(
+        b_lines_after, b_lines_before,
+        "resuming repo A must leave repo B's records byte-identical"
+    );
+}
+
+#[test]
+fn resumed_run_with_zero_new_commits_is_a_noop() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    seed_linear_repo(&repo, 5);
+
+    let frontier_jsonl = full_replay_jsonl(&repo);
+    let repository_id = repository_id_for(&repo);
+    let prior_records = records_from_jsonl(&frontier_jsonl).expect("frontier should parse");
+    let resume = history_resume_point(&prior_records, &repository_id).expect("tip should exist");
+
+    // No new commits land.
+    let outcome =
+        scan_repository_history_resumed(&repo, None, resume).expect("resume should succeed");
+    assert_eq!(outcome.processed, 0);
+    assert_eq!(outcome.skipped, 5);
+    assert_eq!(
+        outcome.graph.to_jsonl().expect("graph should serialize"),
+        frontier_jsonl,
+        "a zero-new-commit resume converges byte-for-byte with the frontier"
+    );
+}
+
+#[test]
+fn resumed_run_detects_history_rewrite() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    seed_linear_repo(&repo, 5);
+
+    let frontier_jsonl = full_replay_jsonl(&repo);
+    let repository_id = repository_id_for(&repo);
+    let prior_records = records_from_jsonl(&frontier_jsonl).expect("frontier should parse");
+    let resume = history_resume_point(&prior_records, &repository_id).expect("tip should exist");
+
+    // Rewrite history: the stored tip is no longer an ancestor of HEAD.
+    git(&repo, ["reset", "--hard", "HEAD~2"]);
+    write(&repo, "src/lib.rs", "pub fn diverged() -> u32 { 99 }\n");
+    commit(&repo, "diverged history", "2026-02-01T00:00:00Z");
+
+    let error = scan_repository_history_resumed(&repo, None, resume)
+        .expect_err("a rewritten history must be detected");
+    match error {
+        CodegraphError::HistoryResume { code, .. } => {
+            assert_eq!(code, "history_rewrite_detected");
+        }
+        other => panic!("expected a HistoryResume error, got: {other:?}"),
+    }
+}
+
+#[test]
+fn resumed_run_rejects_resume_point_for_another_repository() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo_a = temp.path().join("repo-a");
+    let repo_b = temp.path().join("repo-b");
+    fs::create_dir_all(&repo_a).expect("repo dir should be created");
+    fs::create_dir_all(&repo_b).expect("repo dir should be created");
+    seed_linear_repo_salted(&repo_a, 3, "a");
+    seed_linear_repo_salted(&repo_b, 3, "b");
+
+    let records_a = records_from_jsonl(&full_replay_jsonl(&repo_a)).expect("frontier should parse");
+    // Present repo A's untouched resume point to repo B: the frontier's
+    // repository identity does not match the repository being scanned.
+    let resume =
+        history_resume_point(&records_a, &repository_id_for(&repo_a)).expect("tip should exist");
+
+    let error = scan_repository_history_resumed(&repo_b, None, resume)
+        .expect_err("a cross-repository resume point must be rejected");
+    match error {
+        CodegraphError::HistoryResume { code, .. } => {
+            assert_eq!(code, "repository_identity_mismatch");
+        }
+        other => panic!("expected a HistoryResume error, got: {other:?}"),
+    }
+}
+
+#[test]
+fn scan_history_resume_cli_matches_full_replay_byte_for_byte() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    seed_linear_repo(&repo, 8);
+
+    let frontier = temp.path().join("frontier.jsonl");
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan-history")
+        .arg(&repo)
+        .arg("--out")
+        .arg(&frontier)
+        .assert()
+        .success();
+
+    for i in 8..11 {
+        write(
+            &repo,
+            "src/lib.rs",
+            &format!("pub fn f{i}() -> u32 {{ {i} }}\n"),
+        );
+        commit(
+            &repo,
+            &format!("commit {i}"),
+            &format!("2026-01-{:02}T00:00:00Z", i + 1),
+        );
+    }
+
+    let resumed = temp.path().join("resumed.jsonl");
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan-history")
+        .arg(&repo)
+        .arg("--out")
+        .arg(&resumed)
+        .arg("--resume-from")
+        .arg(&frontier)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("\"processed\":3"))
+        .stderr(predicate::str::contains("\"skipped\":8"));
+
+    let full = temp.path().join("full.jsonl");
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan-history")
+        .arg(&repo)
+        .arg("--out")
+        .arg(&full)
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read(&resumed).expect("resumed output should exist"),
+        fs::read(&full).expect("full output should exist"),
+        "the resumed CLI output must be byte-identical to a full replay"
+    );
+}
+
+#[test]
+fn scan_history_resume_with_window_flag_is_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    seed_linear_repo(&repo, 3);
+
+    let frontier = temp.path().join("frontier.jsonl");
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan-history")
+        .arg(&repo)
+        .arg("--out")
+        .arg(&frontier)
+        .assert()
+        .success();
+
+    let out = temp.path().join("out.jsonl");
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan-history")
+        .arg(&repo)
+        .arg("--out")
+        .arg(&out)
+        .arg("--resume-from")
+        .arg(&frontier)
+        .arg("--max-commits")
+        .arg("2")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("resume_with_window"));
+    assert!(
+        !out.exists(),
+        "a rejected resume must not write partial output"
+    );
+}
+
+#[test]
+fn scan_history_resume_without_tip_is_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    seed_linear_repo(&repo, 3);
+
+    // A plain `scan` frontier carries no history-replay tip.
+    let plain = temp.path().join("plain.jsonl");
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan")
+        .arg(&repo)
+        .arg("--out")
+        .arg(&plain)
+        .assert()
+        .success();
+
+    let out = temp.path().join("out.jsonl");
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan-history")
+        .arg(&repo)
+        .arg("--out")
+        .arg(&out)
+        .arg("--resume-from")
+        .arg(&plain)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("no_resume_point"));
+    assert!(
+        !out.exists(),
+        "a rejected resume must not write partial output"
+    );
+}
+
+#[test]
+fn scan_history_resume_detects_rewrite() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    seed_linear_repo(&repo, 5);
+
+    let frontier = temp.path().join("frontier.jsonl");
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan-history")
+        .arg(&repo)
+        .arg("--out")
+        .arg(&frontier)
+        .assert()
+        .success();
+
+    git(&repo, ["reset", "--hard", "HEAD~2"]);
+    write(&repo, "src/lib.rs", "pub fn diverged() -> u32 { 99 }\n");
+    commit(&repo, "diverged history", "2026-02-01T00:00:00Z");
+
+    let out = temp.path().join("out.jsonl");
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan-history")
+        .arg(&repo)
+        .arg("--out")
+        .arg(&out)
+        .arg("--resume-from")
+        .arg(&frontier)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("history_rewrite_detected"));
+    assert!(
+        !out.exists(),
+        "a rewrite-detected resume must not write partial output"
+    );
+}
+
+#[test]
+fn scan_history_resume_noop_leaves_frontier_untouched() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    seed_linear_repo(&repo, 5);
+
+    let frontier = temp.path().join("frontier.jsonl");
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan-history")
+        .arg(&repo)
+        .arg("--out")
+        .arg(&frontier)
+        .assert()
+        .success();
+    let before = fs::read(&frontier).expect("frontier should exist");
+
+    // Zero new commits: resuming onto the same path is a no-op.
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan-history")
+        .arg(&repo)
+        .arg("--out")
+        .arg(&frontier)
+        .arg("--resume-from")
+        .arg(&frontier)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("\"processed\":0"))
+        .stderr(predicate::str::contains("\"skipped\":5"));
+
+    assert_eq!(
+        fs::read(&frontier).expect("frontier should exist"),
+        before,
+        "a no-op resume must leave the frontier byte-identical"
+    );
+}
+
+#[test]
+fn scan_history_resume_with_garbage_frontier_is_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    seed_linear_repo(&repo, 3);
+
+    let frontier = temp.path().join("frontier.jsonl");
+    fs::write(&frontier, "this is not jsonl\n{{{nope").expect("garbage should write");
+
+    let out = temp.path().join("out.jsonl");
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan-history")
+        .arg(&repo)
+        .arg("--out")
+        .arg(&out)
+        .arg("--resume-from")
+        .arg(&frontier)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("invalid_frontier"));
+    assert!(
+        !out.exists(),
+        "an unreadable frontier must not write partial output"
+    );
+}
+
+#[test]
+fn scan_history_resume_with_foreign_frontier_reports_mismatch() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo_a = temp.path().join("repo-a");
+    let repo_b = temp.path().join("repo-b");
+    fs::create_dir_all(&repo_a).expect("repo dir should be created");
+    fs::create_dir_all(&repo_b).expect("repo dir should be created");
+    seed_linear_repo_salted(&repo_a, 3, "a");
+    seed_linear_repo_salted(&repo_b, 3, "b");
+
+    let frontier_a = temp.path().join("frontier-a.jsonl");
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan-history")
+        .arg(&repo_a)
+        .arg("--out")
+        .arg(&frontier_a)
+        .assert()
+        .success();
+
+    // Repo A's frontier presented to repo B: the frontier carries a tip, but
+    // for another repository identity.
+    let out = temp.path().join("out.jsonl");
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan-history")
+        .arg(&repo_b)
+        .arg("--out")
+        .arg(&out)
+        .arg("--resume-from")
+        .arg(&frontier_a)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("repository_identity_mismatch"));
+    assert!(
+        !out.exists(),
+        "a rejected resume must not write partial output"
+    );
+}
+
+#[test]
+fn scan_history_resume_noop_does_not_create_out() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    seed_linear_repo(&repo, 5);
+
+    let frontier = temp.path().join("frontier.jsonl");
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan-history")
+        .arg(&repo)
+        .arg("--out")
+        .arg(&frontier)
+        .assert()
+        .success();
+
+    // Zero new commits and a *different* --out path: the no-op writes nothing.
+    let out = temp.path().join("current.jsonl");
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan-history")
+        .arg(&repo)
+        .arg("--out")
+        .arg(&out)
+        .arg("--resume-from")
+        .arg(&frontier)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("\"processed\":0"))
+        .stderr(predicate::str::contains("\"skipped\":5"));
+    assert!(
+        !out.exists(),
+        "a no-op resume must not create --out; the frontier already holds the converged records"
     );
 }

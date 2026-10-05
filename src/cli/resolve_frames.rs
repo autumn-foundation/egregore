@@ -72,7 +72,7 @@ pub(crate) fn resolve_frames_cmd(
         let index = query::RepositoryIndex::build(&records);
         Some(resolve_transitive_commit_view(
             &records, &index, None, at, as_of,
-        )?)
+        ))
     } else {
         None
     };

@@ -77,6 +77,7 @@ const ALL_EDGE_LABELS: &[EdgeLabel] = &[
     EdgeLabel::ClosesAcceptanceCriterion,
     EdgeLabel::OwnedByTask,
     EdgeLabel::ExternalHandle,
+    EdgeLabel::DependsOn,
     EdgeLabel::TouchesFile,
     EdgeLabel::MergedAs,
     EdgeLabel::ReviewsCommit,
@@ -111,7 +112,7 @@ const ALL_EDGE_LABELS: &[EdgeLabel] = &[
 const fn is_evidence_path_edge(label: EdgeLabel) -> bool {
     use EdgeLabel::{
         Aggregates, AuthoredBy, Calls, CapturedFrom, ChangedIn, ClosesAcceptanceCriterion,
-        Constructs, Contains, Contradicts, DecidedOn, Defines, DriftsFrom, DriftsPrior,
+        Constructs, Contains, Contradicts, DecidedOn, Defines, DependsOn, DriftsFrom, DriftsPrior,
         EmittedDuring, ExplainsChange, ExternalHandle, FailedOn, FingerprintedAs, FrameResolvesTo,
         HasEvidence, Implements, Imports, MaterializedAs, MeasuredBy, Mentions, MentionsSymbol,
         MergedAs, Observes, OwnedByTask, ParentOf, ProducedEvidence, ProducedPatch, PromptedFor,
@@ -131,6 +132,7 @@ const fn is_evidence_path_edge(label: EdgeLabel) -> bool {
         | ClosesAcceptanceCriterion
         | OwnedByTask
         | ExternalHandle
+        | DependsOn
         | TouchesFile
         | MergedAs
         | ReviewsCommit
@@ -695,6 +697,8 @@ mod tests {
                 end_byte: 10,
                 start_line: 1,
                 end_line: 2,
+                start_column: None,
+                end_column: None,
             }),
             Some(name.to_owned()),
             format!("symbol {name}"),
@@ -1243,7 +1247,7 @@ mod tests {
             ALL_EDGE_LABELS.len(),
             "traversed + excluded must cover every EdgeLabel variant exactly once"
         );
-        assert_eq!(ALL_EDGE_LABELS.len(), 49, "EdgeLabel has 49 variants");
+        assert_eq!(ALL_EDGE_LABELS.len(), 50, "EdgeLabel has 50 variants");
         // No overlap between the two class lists.
         for label in &traversed {
             assert!(!excluded.contains(label), "{label} in both classes");

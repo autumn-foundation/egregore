@@ -92,6 +92,7 @@ top-level `producer` field. The value is a single embedded `Producer` object
 | `task_writer` | `TaskWriter` | Project / task writer. |
 | `drift_engine` | `DriftEngine` | Semantic drift engine. |
 | `log_importer` | `LogImporter` | `scan-logs` log-signature importer (issues #319/#320). |
+| `doc_importer` | `DocImporter` | Repo-local design-doc importer (issue #149). |
 | `other` | `Other` | Any producer not enumerated above. |
 
 Adding a new `producer_kind` is **additive** (no schema version bump required).
@@ -124,6 +125,22 @@ version bump.
 | `codex_importer` | `importer_schema_version`, `source_format_version` |
 | `claude_code_importer` | `importer_schema_version`, `source_format_version` |
 | `log_importer` | `importer_schema_version`, `source_format_version` (`plain-v1`/`jsonl-v1`), `fingerprint_algorithm` (`template-v1`) |
+| `doc_importer` | `importer_schema_version`, `source_format_version` (`doc-ingest/v1`) |
+| `observation_writer` | `transport` when written over the MCP transport (issue #183); absent for CLI writes |
+
+The `observation_writer` example over MCP:
+```json
+"producer_components": {
+  "transport": "mcp"
+}
+```
+
+The `transport` component distinguishes how an observation entered the store:
+`eg write observation` (CLI) stamps empty components; the MCP
+`record_observation` tool stamps `transport: "mcp"`. Both stamp the same
+`producer_kind` (`observation_writer`), so origin-aware readers can
+distinguish transport while transport-agnostic readers keep working. The key
+is additive: it never participates in stable ID composition (§5).
 
 The `code_graph_extractor` example:
 ```json
@@ -269,3 +286,80 @@ following with one query each, with **zero false positives**:
    `producer_components.tree_sitter_rust != <current>`.
 3. "Which records came from a producer revision I no longer trust?" — filter on
    `producer.egregore_version` or `producer.egregore_git.commit`.
+
+---
+
+## 10 — Producer Trust-Class Audit (issue #236)
+
+**`eg query trust-audit`** (read-only; documented in `docs/cli/trust-audit.md`)
+scans every persisted node, edge, and tombstone and verifies that each record's
+`producer_kind` is consistent with the trust class its node kind implies. The
+rule set below is the reviewable contract the lane enforces; the classifier in
+`src/query/trust_audit.rs` is the executable twin — the two must not drift.
+
+### Producer trust classes
+
+| Class | `producer_kind` values | Meaning |
+|-------|------------------------|---------|
+| `deterministic` | `code_graph_extractor`, `history_replay`, `incremental_cache`, `log_importer`, `drift_engine` | Facts derived deterministically from source (extraction, history replay, cache refresh, log-signature import, embedding drift measurement). |
+| `agent` | `traj_importer`, `codex_importer`, `claude_code_importer`, `observation_writer`, `task_writer` | Agent-authored content (observations, trajectory/tool-call imports, project/task state). |
+
+`drift_engine` is `deterministic` by construction: it writes `SemanticDrift`,
+`EmbeddingModel`, and `EmbeddingVector` records — measurements computed from
+source bytes plus model bytes, not agent prose.
+
+### Node-kind trust classes
+
+`code_fact` — deterministic code-fact kinds. May **only** be written by a
+`deterministic`-class producer:
+
+`Repository`, `File`, `Module`, `Symbol`, `Import`, `Diagnostic`,
+`PanicRiskSite`, `DebtMarker`, `UnsafeSite`, `DependencyDeclaration`,
+`ScanCoverage`, `HistoryReplayWindow`, `Commit`, `Change`, `SemanticDrift`,
+`EmbeddingModel`, `EmbeddingVector`, `LogSource`, `ErrorSignature`, `LogEvent`,
+`LogOccurrenceBucket`.
+
+`agent_authored` — everything else (agent-memory, verification, user-context,
+project, and artifact kinds). May **only** be written by an `agent`-class
+producer:
+
+`Agent`, `AgentSession`, `Observation`, `AgentRun`, `AgentTurn`, `ToolCall`,
+`CommandRun`, `FileEdit`, `PatchArtifact`, `Failure`, `Decision`, `CostUsage`,
+`TestRun`, `CIStatus`, `BenchmarkRun`, `CoverageReport`, `ProofResult`,
+`PromoteCandidate`, `PromotionPrompt`, `PromotionDecision`, `Preference`,
+`WorkflowRule`, `NamingDecision`, `Constraint`, `Retraction`, `Task`,
+`AcceptanceCriterion`, `ExternalLink`, `Product`, `Project`, `Plan`,
+`GitHubIssue`, `PR`, `Review`, `ExternalIdentity`, `ReviewStateTransition`,
+`LocalTask`, `Artifact`, `Verification`, `CommandEvidence`.
+
+### Rules
+
+| Rule id | Meaning |
+|---------|---------|
+| `code_fact_written_by_agent_producer` | A `code_fact` kind written by an `agent`-class producer. This is the headline corruption case: agent-authored content masquerading as deterministic source truth. |
+| `agent_authored_written_by_deterministic_producer` | An `agent_authored` kind written by a `deterministic`-class producer. The extractor must never author observations, decisions, or project state. |
+| `unclassifiable_producer_kind` | `producer_kind: other` — an unknown or future variant this binary cannot classify. Flagged fail-closed: an unclassifiable producer is a violation, never a silent pass. |
+
+Edges are audited against the trust class implied by their **source** node's
+kind (resolved in-batch, last-write-wins — the same semantics as the daemon's
+`lookup_node_kind`). Tombstones are audited against the trust class implied by
+their **target** record's kind. An edge or tombstone whose endpoint kind cannot
+be resolved in the batch is **not** a trust-class violation — it is skipped
+(referential integrity is `eg validate`'s job, not this audit's) — **unless**
+its producer is `other`, which fails closed regardless of resolvability.
+
+Legacy records (`producer: None`, §6) are exempt: a record that predates the
+producer envelope cannot be retroactively known to come from a specific
+producer, and pretending otherwise would corrupt the audit trail.
+
+### Additive versioning
+
+- Adding a new `producer_kind` is additive (§2) **but the new variant enters
+  the audit unclassified**: it deserializes to `other` on older binaries and is
+  flagged `unclassifiable_producer_kind` until this section documents its trust
+  class. A new producer kind is only "clean" once it is listed above.
+- Adding a new `NodeKind` is additive per `docs/schema/schema-versioning.md`,
+  but the audit's classifier matches every `NodeKind` variant with **no
+  wildcard arm** (mirroring `TrustIndex::classify`, issue #114): the crate
+  fails to compile until the new kind is deliberately placed in `code_fact` or
+  `agent_authored`, so a future kind can never silently inherit a trust class.

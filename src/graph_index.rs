@@ -536,10 +536,40 @@ impl GraphIndex {
         self.climb_ancestry(id, graph_bytes, offsets, climbed);
     }
 
-    /// Climbs the containment ancestry (`CONTAINS`/`DEFINES`/`IMPORTS` edges where
-    /// the node is the target) to the repository root, adding each ancestor's
-    /// versions and incident edges so `RepositoryIndex` can reconstruct
-    /// owner/display attribution for `id`.
+    /// `true` when `id` names an `Import` node.
+    ///
+    /// Read from the index's own `by_id` postings: any parseable version of
+    /// the node decides, since a node's kind never changes across versions. An
+    /// unreadable or absent node reads as `false` (fail closed — the edge is
+    /// simply not climbed).
+    fn node_is_import_kind(&self, id: &str, graph_bytes: &[u8]) -> bool {
+        let Some(offsets) = self.body.by_id.get(id) else {
+            return false;
+        };
+        offsets
+            .iter()
+            .filter_map(|o| read_record_at(graph_bytes, *o))
+            .any(|record| {
+                matches!(
+                    record,
+                    GraphRecord::Node {
+                        kind: NodeKind::Import,
+                        ..
+                    }
+                )
+            })
+    }
+
+    /// Climbs the containment ancestry (`CONTAINS`/`DEFINES` edges, plus the
+    /// containment-shaped `IMPORTS` edge, where the node is the target) to the
+    /// repository root, adding each ancestor's versions and incident edges so
+    /// `RepositoryIndex` can reconstruct owner/display attribution for `id`.
+    ///
+    /// The issue-#444 `File —IMPORTS→ Module|File` target edge is NOT climbed:
+    /// it is a dependency edge, not containment — climbing it would
+    /// misattribute the imported module to the importing file. Only the
+    /// extractor's `File —IMPORTS→ Import` shape (the import declaration owned
+    /// by its file) counts as a parent edge.
     fn climb_ancestry(
         &self,
         id: &str,
@@ -565,13 +595,18 @@ impl GraphIndex {
                 else {
                     continue;
                 };
-                // A parent edge points AT this node with a containment label.
-                if target == node
-                    && matches!(
-                        label,
-                        EdgeLabel::Contains | EdgeLabel::Defines | EdgeLabel::Imports
-                    )
-                {
+                // A parent edge points AT this node with a containment label. An
+                // `IMPORTS` edge is a parent edge only in its containment
+                // shape (`File —IMPORTS→ Import`); the issue-#444 module-target
+                // edge (`File —IMPORTS→ Module|File`) is a dependency edge and
+                // must not climb.
+                let is_parent_edge = target == node
+                    && match label {
+                        EdgeLabel::Contains | EdgeLabel::Defines => true,
+                        EdgeLabel::Imports => self.node_is_import_kind(&node, graph_bytes),
+                        _ => false,
+                    };
+                if is_parent_edge {
                     offsets.insert(edge_offset);
                     self.add_id_versions(&source, offsets);
                     if let Some(parent_edges) = self.body.adjacency.get(&source) {
@@ -697,6 +732,8 @@ mod tests {
             end_byte: 100,
             start_line: a,
             end_line: b,
+            start_column: None,
+            end_column: None,
         }
     }
 
@@ -1092,5 +1129,107 @@ mod tests {
             )
             .expect("offsets");
         assert_eq!(offsets.len(), 1);
+    }
+
+    #[test]
+    fn ancestry_does_not_climb_target_side_imports_edge() {
+        // Issue #444: a `File —IMPORTS→ Module` target edge is a dependency
+        // edge, not containment. Climbing it would misattribute the imported
+        // module to the importing file's tree.
+        let mut g = Graph::new();
+        let repo = stable_id(&["node", "Repository", "r"]);
+        g.push(GraphRecord::node(
+            repo.clone(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some("r".to_owned()),
+            "Repository r".to_owned(),
+        ));
+        // Importing file.
+        let importer = file_id("src/importer.rs");
+        g.push(GraphRecord::syntax_node(
+            importer.clone(),
+            NodeKind::File,
+            "src/importer.rs".to_owned(),
+            span(1, 10),
+            "importer.rs".to_owned(),
+            "rust",
+            "file".to_owned(),
+        ));
+        g.push(GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo.clone(),
+            importer.clone(),
+            None,
+            "contains".to_owned(),
+        ));
+        // Imported module (in a different file).
+        let module_file = file_id("src/imported.rs");
+        g.push(GraphRecord::syntax_node(
+            module_file.clone(),
+            NodeKind::File,
+            "src/imported.rs".to_owned(),
+            span(1, 10),
+            "imported.rs".to_owned(),
+            "rust",
+            "file".to_owned(),
+        ));
+        g.push(GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo,
+            module_file.clone(),
+            None,
+            "contains".to_owned(),
+        ));
+        let module_id = stable_id(&["node", "Module", "src/imported.rs", "imported"]);
+        g.push(GraphRecord::node(
+            module_id.clone(),
+            NodeKind::Module,
+            Some("src/imported.rs".to_owned()),
+            None,
+            Some("imported".to_owned()),
+            "Module imported".to_owned(),
+        ));
+        g.push(GraphRecord::edge(
+            EdgeLabel::Defines,
+            module_file.clone(),
+            module_id.clone(),
+            None,
+            "defines".to_owned(),
+        ));
+        // The target-side IMPORTS edge: importer file → imported module.
+        g.push(GraphRecord::edge(
+            EdgeLabel::Imports,
+            importer.clone(),
+            module_id.clone(),
+            Some("1.0".to_owned()),
+            "src/importer.rs imports imported".to_owned(),
+        ));
+        let text = jsonl(&g);
+        let index = GraphIndex::build_from_bytes(text.as_bytes()).expect("build");
+        // Climb from the module: must reach its defining file (via DEFINES)
+        // but must NOT cross the IMPORTS edge to the importing file.
+        let mut offsets = BTreeSet::new();
+        let mut climbed = BTreeSet::new();
+        index.climb_ancestry(&module_id, text.as_bytes(), &mut offsets, &mut climbed);
+        let importer_offsets = index.body.by_id.get(&importer).cloned().unwrap_or_default();
+        for off in &importer_offsets {
+            assert!(
+                !offsets.contains(off),
+                "climb_ancestry must not cross File —IMPORTS→ Module to the importer"
+            );
+        }
+        // Sanity: the module's own defining file IS reached (via DEFINES).
+        let module_file_offsets = index
+            .body
+            .by_id
+            .get(&module_file)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            module_file_offsets.iter().any(|off| offsets.contains(off)),
+            "module's defining file must be reached via DEFINES"
+        );
     }
 }

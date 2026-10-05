@@ -1,6 +1,6 @@
 //! Language-neutral extraction helpers shared by the per-language extractors.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tree_sitter::Node;
 
@@ -59,23 +59,52 @@ pub fn next_symbol_ordinal(
 /// gets a `References` edge. Self-references (body ID == target ID) and
 /// name-equality guard loops (name == body name) are skipped.
 ///
+/// `suppressed_calls` holds (body ID, definition name) pairs whose `Calls`
+/// edge is owned by a repo-wide resolution pass instead of this textual one
+/// (issue #267: trait-dispatch call pairs, same-file included — the cross-file
+/// pass emits them with their resolution labels). Skipping them here keeps the
+/// stable edge IDs from colliding with the pass that owns them. `References`
+/// edges are unaffected.
+///
 /// Precision contract (issue #134): callers must supply [`SymbolBody::text`]
 /// built by [`reference_text`], so names that appear only inside comments or
 /// string literals never produce an edge, and substring occurrences never
 /// classify as calls ([`contains_identifier`] / [`looks_like_call`] both
 /// require identifier token boundaries).
+///
+/// `shadowed_names` maps a symbol-body ID to the bare simple names a nested
+/// definition shadows for that body (issue #422: a block-local `fn`
+/// shadows the same bare name for its enclosing function body). A shadowed
+/// BARE name key emits no edge — the bare call binds the nested definition,
+/// whose edge the scope-gated resolver emits instead. Qualified keys
+/// (`alpha::helper`) are never shadowed: an explicit path selects the outer
+/// definition and bypasses the shadowing.
 pub fn emit_reference_edges(
     graph: &mut Graph,
     definitions: &BTreeMap<String, String>,
     bodies: &[SymbolBody],
+    suppressed_calls: &BTreeSet<(String, String)>,
+    shadowed_names: &BTreeMap<String, Vec<String>>,
 ) {
     for body in bodies {
+        let shadowed = shadowed_names.get(&body.id);
         for (name, target_id) in definitions {
             if body.id == *target_id || name == &body.name || !contains_identifier(&body.text, name)
             {
                 continue;
             }
+            if !name.contains("::")
+                && shadowed.is_some_and(|names| names.iter().any(|simple| simple == name))
+            {
+                continue;
+            }
             if looks_like_call(&body.text, name) {
+                // Issue #267: trait-dispatch pairs are repo-wide owned; the
+                // textual pass stays silent so it never shadows the owning
+                // pass's resolution-labeled edge with an unlabeled twin.
+                if suppressed_calls.contains(&(body.id.clone(), name.clone())) {
+                    continue;
+                }
                 add_graph_edge(
                     graph,
                     EdgeLabel::Calls,
@@ -301,9 +330,13 @@ pub fn normalize_c_like_code(code: &str, raw_delims: &[char]) -> String {
     result.trim().to_owned()
 }
 
-/// Builds a [`SourceSpan`] from a Tree-sitter node's byte and line positions.
+/// Builds a [`SourceSpan`] from a Tree-sitter node's byte, line, and column
+/// positions (issue #463).
 ///
-/// Line numbers are 1-based to match editor conventions.
+/// Line numbers are 1-based to match editor conventions; columns are 0-based
+/// byte offsets from the start of the line (Tree-sitter `Point.column`
+/// semantics), which the SCIP exporter declares as
+/// `UTF8CodeUnitOffsetFromLineStart`.
 #[must_use]
 pub fn span(node: Node<'_>) -> SourceSpan {
     SourceSpan {
@@ -311,6 +344,8 @@ pub fn span(node: Node<'_>) -> SourceSpan {
         end_byte: node.end_byte(),
         start_line: node.start_position().row + 1,
         end_line: node.end_position().row + 1,
+        start_column: Some(node.start_position().column),
+        end_column: Some(node.end_position().column),
     }
 }
 
@@ -397,5 +432,37 @@ mod tests {
         assert!(looks_like_call("let x = prerun; run()", "run"));
         assert!(looks_like_call("(run())", "run"));
         assert!(!looks_like_call("anything", ""));
+    }
+
+    #[test]
+    fn span_records_zero_based_byte_offset_columns() {
+        // Issue #463: columns are zero-based byte offsets from the start of
+        // the line (Tree-sitter `Point.column` semantics), matching the SCIP
+        // `UTF8CodeUnitOffsetFromLineStart` position encoding.
+        let source = "fn top() {}\n    fn indented() {}\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("rust grammar loads");
+        let tree = parser.parse(source, None).expect("source parses");
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let items: Vec<tree_sitter::Node<'_>> = root
+            .children(&mut cursor)
+            .filter(|node| node.kind() == "function_item")
+            .collect();
+        assert_eq!(items.len(), 2);
+
+        let top = span(items[0]);
+        assert_eq!(top.start_line, 1);
+        assert_eq!(top.start_column, Some(0));
+        assert_eq!(top.end_line, 1);
+        assert_eq!(top.end_column, Some("fn top() {}".len()));
+
+        let indented = span(items[1]);
+        assert_eq!(indented.start_line, 2);
+        assert_eq!(indented.start_column, Some(4));
+        assert_eq!(indented.end_line, 2);
+        assert_eq!(indented.end_column, Some(4 + "fn indented() {}".len()));
     }
 }

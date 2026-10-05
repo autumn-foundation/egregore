@@ -686,6 +686,7 @@ fn log_edge(
         frame_resolution: None,
         frame_index: None,
         basis: None,
+        call_site_spans: None,
         is_exhaustive: None,
         temporal: None,
         summary: summary.to_owned(),

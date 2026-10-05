@@ -122,7 +122,10 @@ Error responses follow the standard envelope in
 |-------------------------|------|------|
 | `missing_field`         | 400  | `verb` is absent or blank; or `semantic_search` called without `params.query_vector` |
 | `bad_request`           | 400  | Unknown verb, or required `params` field missing or malformed |
-| `ambiguous_commit_prefix` | 400 | `symbol_at_commit` prefix matches > 1 commit |
+| `ambiguous_commit_prefix` | 400 | `symbol_at_commit` prefix matches > 1 commit; `resolve_record` `at` prefix matches > 1 commit |
+| `dangling_handle`       | 404  | `resolve_record`: no record matches the handle in the requested view (issue #160) |
+| `malformed_handle`      | 400  | `resolve_record`: `record_id` is not a `codegraph:vN:<suffix>` handle (issue #160) |
+| `unsupported_handle_domain` | 400 | `resolve_record`: well-formed handle from another id domain (issue #160) |
 | `unknown_repository_selector` | 400 | `params.repo` matches no repository identity in the store (issue #67) |
 | `ambiguous_repository_selector` | 400 | `params.repo` matches more than one repository identity; ambiguity is never resolved implicitly. The error object carries a `candidates` array with every matching repository record ID so callers can retry with an exact selector (issue #67) |
 | `missing_semantic_index` | 422 | `semantic_search` against a store with no embedding index (re-ingest with `--embed`) |
@@ -136,18 +139,28 @@ Error responses follow the standard envelope in
 
 ## 5 — Verb table
 
+The runtime source of truth for this table is `GET /v1/capabilities` (§10):
+it is built from the same `QUERY_VERB_TABLE` registry that `POST /v1/query`
+dispatches through, so the two cannot drift. The table below is the
+human-readable copy — if it ever disagrees with the endpoint, the endpoint
+wins and this document needs a fix.
+
 | Verb                    | Status      | Params                        | Notes |
 |-------------------------|-------------|-------------------------------|-------|
 | `get_records`           | implemented | `record_ids: [string]`        | Batch read by stable ID |
 | `symbol_by_name`        | implemented | `name: string`, `kind?: string`, `repo?: string` | Exact name match; honours `as_of.valid_time` |
 | `symbol_at_commit`      | implemented | `name: string`, `commit: string`, `repo?: string` | Prefix-safe commit lookup |
+| `resolve_record`        | implemented | `record_id: string`, `at?: string`, `as_of?: string` | Record-id handle resolution with drift verdict (issue #160) |
 | `file_defines`          | implemented | `repo_relative_path: string`, `repo?: string` | Symbols defined in a file |
+| `locate`                | implemented | `repo_relative_path: string`, `line: u64`, `repo?: string`, `at?: string`, `as_of?: string`, `supersession?: string` | Positional query: innermost symbol at `file:line` plus the full trust-separated context bundle (issue #212); daemon face of `eg query locate` |
 | `drift_top_n`           | implemented | `limit?: u64` (default 10, max 100), `repo?: string` | SemanticDrift records ranked by score |
+| `clone_classes`         | implemented | `limit?: u64` (default 50, max 500), `min_size?: u64` (default 2, min 2), `repo?: string` | Exact-duplicate Rust symbol bodies grouped into clone classes (issue #216); honours `as_of.valid_time` |
 | `semantic_search`       | implemented | `query_vector: [f32]`, `limit?: u64` (default 10, max 100), `repo?: string` | Natural-language code search over the shared store's embedding index. Requires the `embeddings` feature. |
 | `drift`                 | reserved    | same as `drift_top_n`         | Reserved for issue #10; returns `not_implemented` until wired. |
 | `observations_for_symbol` | implemented | `name: string`, `supersession?: string` | Cross-domain symbol context (issue #86); parity with `eg query context`. |
 | `agent_sessions_for_repo` | implemented | `repo: string` (alias `repository_id`), `limit?: u64` (default 20, max 200) | Repo-scoped recency digest of recent agent sessions (issue #112); daemon face of `eg query sessions`. |
 | `criteria_for_task`      | implemented | `task_id: string`            | Task acceptance-criteria/evidence context over [`docs/schema/project-graph.md`](project-graph.md); daemon face of `eg query task`. |
+| `tests_for_symbol`       | implemented | `handle: string`, `max_depth?: u64` (default 5, min 1), `repo?: string`, `at?: string`, `as_of?: string` | Tests that exercise a symbol over inbound `CALLS` edges (issue #126); daemon face of `eg query tests`. |
 
 Partial-name symbol matching (`eg query symbols <PATTERN>`, issue #102) is
 **CLI-only in this slice**: the daemon exposes no substring/glob symbol verb,
@@ -311,6 +324,39 @@ is ambiguous (matches > 1 commit), returns HTTP 400 `ambiguous_commit_prefix`.
 
 ---
 
+### `resolve_record`
+
+Resolves a cited `codegraph:vN:<suffix>` record-id handle to its live source
+record with a drift verdict (issue #160) — the daemon face of
+`eg query resolve --daemon`.
+
+**Params:**
+```json
+{ "record_id": "codegraph:v1:…", "at": "abc1234", "as_of": "2026-03-02T00:00:00Z" }
+```
+
+`at` (commit SHA prefix) and `as_of` (RFC 3339 valid-time instant) are
+optional and mutually exclusive. The selection and tombstone rules match the
+local lanes exactly: forget tombstones keep the issue #231 temporal
+exemption, repository-eviction tombstones suppress everywhere (issue #472),
+and an ambiguous `at` prefix is rejected, never guessed.
+
+**Record shape:** a single object with the citation fields
+(`record_id`, `kind`, `name`, `repo_relative_path`, `span`, `git_commit`,
+`valid_time`) plus `verdict` (`valid` | `drifted`; `drifted` adds `detail`,
+`current_repo_relative_path`, and `current_span`).
+
+**Errors:**
+
+| Code | HTTP | When |
+|------|------|------|
+| `dangling_handle` | 404 | No record matches the handle in the requested view |
+| `malformed_handle` | 400 | `record_id` is not a `codegraph:vN:<suffix>` handle |
+| `unsupported_handle_domain` | 400 | Well-formed handle from another id domain |
+| `ambiguous_commit_prefix` | 400 | `at` matches more than one commit |
+
+---
+
 ### `file_defines`
 
 List Symbol nodes whose `repo_relative_path` matches the given path, sorted by
@@ -344,6 +390,110 @@ current-state results.
   "page": { "cursor": null, "has_more": false, "returned": 2 }
 }
 ```
+
+---
+
+### `locate`
+
+Positional query (issue #212): resolve the innermost `Symbol` containing a
+1-based `file:line` and return the same full JSON envelope `eg query locate
+--graph` emits — the located `symbol`, its outermost → innermost
+`enclosing_chain`, and the trust-separated cross-domain bundle
+(`source_facts`, `topology_edges`, `observations`, `project_state`,
+`artifacts`, `verification_evidence`, `unresolved`). The answer is never a
+nearest-symbol guess. The row `limit` is inapplicable (the answer is a single
+envelope) and is ignored.
+
+**Params:**
+```json
+{
+  "repo_relative_path": "src/lib.rs",
+  "line": 13,
+  "repo": "optional repository selector (same contract as every other verb)",
+  "at": "optional commit prefix (mutually exclusive with as_of)",
+  "as_of": "optional RFC 3339 instant (mutually exclusive with at)",
+  "supersession": "optional \"exclude\" (default) or \"include-but-flag\""
+}
+```
+
+`at` / `as_of` reuse the same `file_symbols_at_point` machinery as the CLI
+`--at` / `--as-of` flags, so the temporal + repository-collision contract is
+identical. The request-level `as_of` selector is not applied: temporal pins
+are verb params here. `line` must be a positive integer.
+
+**Result shape:** `result.locate` is the `eg query locate` envelope verbatim.
+
+**Typed errors:** positional failures are `ok:false` bodies whose `error.code`
+matches the CLI's typed codes, so clients can re-emit the cold path's
+machine-readable envelope:
+
+| HTTP | `error.code` | Meaning |
+|------|--------------|---------|
+| 404 | `no_match` | No record carries the path in the selected view. |
+| 404 | `no_enclosing_symbol` | The path is known but no symbol span contains the line. |
+| 404 | `line_out_of_range` | The line is beyond the file's actual last line (`max_known_line` cited). |
+| 404 | `missing_commit` / `no_commit_at_or_before` | The `at` / `as_of` pin resolved to nothing. |
+| 400 | `ambiguous_repository` | Unscoped path exists in more than one repository; retry with `repo`. |
+| 400 | `ambiguous_commit_prefix` | `at` matches more than one commit (`candidates` listed). |
+| 400 | `malformed_timestamp` | `as_of` is not a valid RFC 3339 instant. |
+| 400 | `empty_history` | Temporal pin on a history-less store. |
+
+---
+
+### `tests_for_symbol`
+
+Map a symbol to the tests that exercise it before an edit (issue #126): the
+daemon face of `eg query tests`. Walks inbound `CALLS` edges from the target
+symbol and reports every extractor-stamped test symbol (`role == "test"`) that
+can reach it, with the concrete connecting call path for each row.
+
+**Params:**
+```json
+{
+  "handle": "process_order",
+  "max_depth": 5,
+  "repo": "optional repository selector (same contract as every other verb)",
+  "at": "optional commit prefix (mutually exclusive with as_of)",
+  "as_of": "optional RFC 3339 instant (mutually exclusive with at)"
+}
+```
+
+`handle` accepts a stable symbol record ID (`codegraph:vN:<hex>`) or an exact
+symbol name; `max_depth` must be a positive integer (default 5). `at` /
+`as_of` reuse the same commit-pin machinery as the CLI `--at` / `--as-of`
+flags, so the temporal + repository-collision contract is identical. The
+request-level `as_of` selector is not applied: temporal pins are verb params
+here. The request-level row `limit` truncates the returned row set (the
+`tests` summary always reports the full counts).
+
+**Result shape:** `result.tests` is the `eg query tests` header verbatim
+(resolved `target`, `direction: "inbound"`, `edge_labels: ["CALLS"]`,
+`max_depth`, `total_covering_tests` / `direct_tests` / `transitive_tests`
+counts, `truncation`, `diagnostics`, corpus-mode provenance, and the
+reachability-lead disclaimer); the rows are returned as `result.records` with
+the standard `page` envelope.
+
+Traversal semantics (inbound `CALLS` only; `REFERENCES` excluded; non-test
+callers traversed but never reported; hop 1 = `direct`, hop > 1 =
+`transitive`; level-synchronized BFS with deterministic shortest paths;
+`trust: "reachability_lead"` on every row) are identical to the CLI lane —
+both faces run the same shared response computation. Rows are reachability
+leads, not coverage proof; see [`docs/cli/tests.md`](../cli/tests.md).
+
+**Typed errors:** failures are `ok:false` bodies whose `error.code` matches
+the CLI's typed codes:
+
+| HTTP | `error.code` | Meaning |
+|------|--------------|---------|
+| 404 | `no_match` | Handle resolves to no live record. |
+| 404 | `stale_handle` | Handle names a tombstoned record. |
+| 404 | `missing_commit` / `no_commit_at_or_before` | The `at` / `as_of` pin resolved to nothing. |
+| 404 | `empty_history` | Temporal pin on a history-less store. |
+| 400 | `ambiguous_handle` | Name matches more than one live symbol (`candidates` listed). |
+| 400 | `ambiguous_commit_prefix` | `at` matches more than one commit. |
+| 400 | `invalid_as_of_timestamp` | `as_of` is not a valid RFC 3339 instant. |
+| 400 | `unsupported_handle` | Handle resolved to a non-symbol node. |
+| 400 | `bad_request` | `max_depth` is not a positive integer, `at` and `as_of` are both set, or a param has the wrong JSON type. |
 
 ---
 
@@ -392,6 +542,51 @@ node with those fields set).
 
 Coordination: issue #15 updates this response shape. Issue #10's future
 `drift` verb should return the same record shape.
+
+---
+
+### `clone_classes`
+
+Group exact-duplicate Rust symbol bodies into citable clone classes (issue
+#216): the daemon face of `eg query clones`. Computed by the shared query
+layer over the store's current-state codegraph records, so the daemon and the
+local `--graph` / `--data-dir` transports agree.
+
+**Params:**
+```json
+{ "limit": 50, "min_size": 2, "repo": "acme/widget" }
+```
+
+`limit` defaults to 50 and is capped at 500; `min_size` defaults to 2 and must
+be at least 2 (both rejected as 400 otherwise). Honours `as_of.valid_time`
+like `drift_top_n`: records newer than the instant are excluded from the
+class computation.
+
+**Record shape** — one record per clone class:
+
+```json
+{
+  "content_hash":  "blake3:9f2c…",
+  "size":          3,
+  "members": [
+    {
+      "record_id":          "codegraph:v1:…",
+      "qualified_name":     "a::compute",
+      "repo_relative_path": "src/a.rs",
+      "span":               {"start_byte":0,"end_byte":42,"start_line":1,"end_line":4}
+    }
+  ]
+}
+```
+
+No raw source body is emitted — only the shared normalized-content hash plus
+bounded citable handles. Classes order by `size` descending, then
+`content_hash` ascending; members by `record_id` ascending. The full report
+(counts, truncation signal, empty reason) also rides along under
+`result.report`, and `page.returned` counts the returned classes; `truncated`
+in the report says whether `limit` cut the class list (issue #121). A store
+with no clone classes yields a well-formed empty `records` array with
+`report.empty_reason == "no_clone_classes"`, not an error (issue #196).
 
 ---
 
@@ -444,6 +639,28 @@ completion, or agent memory. Confirm a lead with `eg query symbol`,
 order-stable across repeated runs and match the embedded `eg query semantic`
 top-k for the same store, after canonical ordering. Daemon and embedded read
 the same persisted index, so scores agree within a tight tolerance (≤ 1e-4).
+
+**Confidence verdict (issue #221):** every non-empty result carries a
+top-level `confidence` object stamped by the daemon itself, so MCP consumers
+inherit the same contract as the CLI without client-side derivation:
+
+```json
+"confidence": {"verdict":"confident","best_score":0.83,"total_candidates":42,"confident_threshold":0.39,"weak_threshold":0.34,"selection_basis":"corpus_calibrated_confidence_floor"}
+```
+
+`verdict` is one of `confident` (best score `>= 0.39`), `weak` (best score in
+`[0.34, 0.39)`), `abstain` (best score `< 0.34`). `best_score` is the highest
+score among the ranked candidates; `total_candidates` covers the
+pre-`limit` pool. Rows below the confident threshold are still returned —
+flagged per-row via the embedded lane's `confidence_band` — never silently
+dropped. An empty pool carries no `confidence` object: the empty answer is
+the CLI's exit-2 no-match path, not an abstention. The verdict is a pure
+function of the ranked score distribution, so repeated identical verbs yield
+byte-identical verdicts. The CLI's `--daemon` path forwards the daemon's
+verdict verbatim (re-serialized through the shared struct for canonical field
+order); against a pre-#221 daemon it derives the verdict client-side from the
+returned rows. Full semantics in [`docs/cli/query.md`](../cli/query.md)
+("Confidence verdicts").
 
 **Diagnostics:**
 
@@ -629,3 +846,76 @@ Cursor-based pagination is reserved for a future slice.
 - Breaking changes (renamed verbs, removed fields, changed `record` shapes for
   existing verbs) require bumping `DAEMON_QUERY_SCHEMA_VERSION` and updating
   this document and `daemon-api.md`.
+
+---
+
+## 10 — Capability discovery (`GET /v1/capabilities`, issue #166)
+
+`GET /v1/capabilities` is the daemon's self-description endpoint: one request
+tells a client the full live verb set and the query schema version, with zero
+`not_implemented` round-trips. It requires no knowledge of the verb set to
+call (plain GET route, Bearer <redacted> like `GET /v1/status`), and exists so
+integration bridges (the MCP stdio bridge, SDKs) can derive their tool list
+from the running daemon instead of hard-coding it from this document.
+
+### Contract
+
+Flat JSON, HTTP 200, no `ok`/`result` envelope (same shape as the
+observability endpoints in `daemon-api.md` §8):
+
+```json
+{
+  "api_version": "v1",
+  "daemon_query_schema_version": 1,
+  "verbs": [
+    { "name": "agent_sessions_for_repo", "status": "implemented" },
+    { "name": "clone_classes",           "status": "implemented" },
+    { "name": "criteria_for_task",       "status": "implemented" },
+    { "name": "drift",                   "status": "reserved" },
+    { "name": "drift_top_n",             "status": "implemented" },
+    { "name": "file_defines",            "status": "implemented" },
+    { "name": "get_records",             "status": "implemented" },
+    { "name": "locate",                  "status": "implemented" },
+    { "name": "observations_for_symbol", "status": "implemented" },
+    { "name": "semantic_search",         "status": "implemented" },
+    { "name": "symbol_at_commit",        "status": "implemented" },
+    { "name": "symbol_by_name",          "status": "implemented" }
+  ],
+  "accepted_record_tuples": [
+    { "domain": "agent_memory", "kind": "*", "schema_version": 1 },
+    { "domain": "artifact",     "kind": "*", "schema_version": 1 },
+    { "domain": "codegraph",    "kind": "*", "schema_version": 1 },
+    { "domain": "codegraph",    "kind": "*", "schema_version": 2 }
+  ]
+}
+```
+
+| Field | Type | Stability |
+|-------|------|-----------|
+| `api_version` | string | Always `"v1"` while this route lives under `/v1/` |
+| `daemon_query_schema_version` | integer | The value of the `DAEMON_QUERY_SCHEMA_VERSION` Rust constant in `src/daemon.rs` |
+| `verbs` | array of `{name: string, status: string}` | Sorted by `name`. `status` is exactly `implemented` or `reserved` — the closed set never gains a third value without a `/v2/` API prefix change |
+| `accepted_record_tuples` | array of `{domain: string, kind: string, schema_version: integer}` | Sorted by `(domain, schema_version)`. Every tuple the daemon accepts on ingest/read |
+
+### Semantics
+
+- **Verbs.** The `verbs` array is built from the same
+  `QUERY_VERB_TABLE` registry in `src/daemon.rs` that `POST /v1/query`
+  dispatches through — adding a verb to the daemon means adding a registry
+  row, so the manifest cannot drift from reality. `implemented` means the
+  verb is callable in *this* daemon build; `reserved` means it answers HTTP
+  501 `not_implemented`. `semantic_search` is `implemented` only in builds
+  with the `embeddings` feature, `reserved` otherwise.
+- **Record tuples.** `accepted_record_tuples` enumerates the
+  `(domain, kind, schema_version)` tuples the daemon's reader-side gate
+  (`is_known_record_version` in `src/schema_version.rs`) accepts — the same
+  gate that produces `unknown_schema_version` on ingest/read. A client
+  holding a record whose `(domain, schema_version)` pair is absent from this
+  list would be rejected, and can detect that before sending.
+- **`kind: "*"`** is a wildcard, not a literal kind. The gate checks domain +
+  schema_version only, never the record kind, so the wildcard is the honest
+  contract: any kind under a listed domain + version is accepted. Match your
+  tuple by domain + schema_version and treat `"*"` as any-kind.
+- **Not store inspection.** This endpoint reports what the daemon
+  *supports/accepts*, never which tuples are *present* in the store (store
+  inspection is tracked by issue #125).

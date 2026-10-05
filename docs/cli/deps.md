@@ -52,9 +52,10 @@ and cross-crate targets are outside the extraction contract).
   inventing a status.
 - **Unresolved targets are an explicit category, never dropped:** an edge
   whose target is an unresolved-call `Diagnostic` marker (no in-repo
-  definition matched, issue #152) or whose target record is missing from the
+  definition matched, issue #152), a trait-dispatch boundary marker (issue
+  #267), or whose target record is missing from the
   graph is emitted as a `category: "unresolved"` row with a stable `reason`
-  (`unresolved_call` / `missing_target`), the raw `target_record_id`, and —
+  (`unresolved_call` / `unresolved_dispatch` / `missing_target`), the raw `target_record_id`, and —
   for markers — the callee display name plus the call-site path/span.
 - **Deterministic:** rows are canonically ordered (dependencies by
   `(relation, record_id, edge_record_id)`, then unresolved rows by

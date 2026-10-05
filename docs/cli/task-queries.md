@@ -38,12 +38,13 @@ If the handle format is unrecognized, the command fails with stable exit code `1
 
 ## JSON Output Structure
 
-The output is a structured JSON envelope containing 8 context sections, sorted deterministically by stable ID:
+The output is a structured JSON envelope containing 9 context sections, sorted deterministically by stable ID:
 
 * **`tasks`**: The queried `Task` node(s), including historical versions.
 * **`acceptance_criteria`**: `AcceptanceCriterion` nodes owned by the Task. Verified acceptance criteria (status `verified`) will carry/inline their closing verification record under the `verification_record` field.
 * **`source_facts`**: Code-graph files or symbols linked to the task.
-* **`observations`**: Subjective agent-authored claims, decisions, and failure records referencing the task.
+* **`observations`**: Subjective agent-authored claims and failure records referencing the task. Holds `Observation` and `Failure` records only — never `Decision` records.
+* **`decisions`**: Agent-authored `Decision` nodes referencing the task, each carrying `decision_text` and `rationale_summary` plus `record_id`, `confidence` (when present), a provenance handle, and resolved `EXPLAINS_CHANGE` / `REFERENCES_TASK` evidence handles. Trust contract: decisions are agent-authored and evidence-backed, but they are deliberate judgments — never deterministic source truth. Treat the rationale as a claim to verify before reusing, not a fact to cite.
 * **`artifacts`**: `Artifact`, `PatchArtifact`, or `FileEdit` nodes linked to the task.
 * **`verification_evidence`**: `Verification` or `CommandRun` nodes validating the task or closing its criteria.
 * **`external_links`**: `ExternalLink` nodes referencing source issues.

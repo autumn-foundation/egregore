@@ -4,6 +4,17 @@ pub(crate) fn load_query_records(
     graph: Option<&Path>,
     data_dir: Option<&Path>,
 ) -> Result<Vec<GraphRecord>> {
+    // Config fallback (issue #261): explicit `--data-dir` > `egregore.toml`
+    // `data_dir`, and the config value applies only when the caller passed
+    // neither `--graph` nor `--data-dir` — a `--graph` file read plus a
+    // pinned store must not read as "both provided". Only converts the
+    // current `(None, None)` error into a success when a config pins a
+    // store — purely additive.
+    let config_dir = config_data_dir();
+    let data_dir = match (graph, data_dir) {
+        (None, None) => config_dir.as_deref(),
+        (_, data_dir) => data_dir,
+    };
     match (graph, data_dir) {
         (Some(path), None) => load_records_from_jsonl(path),
         (None, Some(dir)) => load_records_from_db(dir),
@@ -42,6 +53,16 @@ pub(crate) fn load_records_selected(
     data_dir: Option<&Path>,
     selector: &crate::graph_index::Selector,
 ) -> Result<Vec<GraphRecord>> {
+    // Config fallback (issue #261): explicit `--data-dir` > `egregore.toml`
+    // `data_dir`, and the config value applies only when the caller passed
+    // neither `--graph` nor `--data-dir` — a `--graph` file read plus a
+    // pinned store must not read as "both provided". Purely additive — only
+    // turns the `(None, None)` error into a success when a config pins a store.
+    let config_dir = config_data_dir();
+    let data_dir = match (graph, data_dir) {
+        (None, None) => config_dir.as_deref(),
+        (_, data_dir) => data_dir,
+    };
     match (graph, data_dir) {
         (Some(path), None) => load_records_from_jsonl_selected(path, selector),
         (None, Some(dir)) => load_records_from_db(dir),
@@ -295,6 +316,16 @@ pub(crate) fn load_query_records_history(
     graph: Option<&Path>,
     data_dir: Option<&Path>,
 ) -> Result<Vec<GraphRecord>> {
+    // Config fallback (issue #261): explicit `--data-dir` > `egregore.toml`
+    // `data_dir`, and the config value applies only when the caller passed
+    // neither `--graph` nor `--data-dir` — a `--graph` file read plus a
+    // pinned store must not read as "both provided". Purely additive — only
+    // turns the `(None, None)` error into a success when a config pins a store.
+    let config_dir = config_data_dir();
+    let data_dir = match (graph, data_dir) {
+        (None, None) => config_dir.as_deref(),
+        (_, data_dir) => data_dir,
+    };
     match (graph, data_dir) {
         (Some(path), None) => load_records_from_jsonl(path),
         (None, Some(dir)) => load_records_from_db_history(dir),
@@ -419,6 +450,16 @@ pub(crate) fn load_evidence_freshness_records(
     graph: Option<&Path>,
     data_dir: Option<&Path>,
 ) -> Result<Vec<GraphRecord>> {
+    // Config fallback (issue #261): explicit `--data-dir` > `egregore.toml`
+    // `data_dir`, and the config value applies only when the caller passed
+    // neither `--graph` nor `--data-dir` — a `--graph` file read plus a
+    // pinned store must not read as "both provided". Purely additive — only
+    // turns the `(None, None)` error into a success when a config pins a store.
+    let config_dir = config_data_dir();
+    let data_dir = match (graph, data_dir) {
+        (None, None) => config_dir.as_deref(),
+        (_, data_dir) => data_dir,
+    };
     match (graph, data_dir) {
         (Some(path), None) => load_records_from_jsonl(path),
         (None, Some(dir)) => load_records_from_db_history_readonly(dir),

@@ -668,6 +668,8 @@ fn generate_seed_and_corpus() {
             end_byte: 100,
             start_line: 1,
             end_line: 100,
+            start_column: None,
+            end_column: None,
         }
     }
     fn kind_of(name: &str) -> NodeKind {

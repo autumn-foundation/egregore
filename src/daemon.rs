@@ -25,8 +25,11 @@ use serde_json::json;
 
 use crate::{
     adapters::{
-        AdapterError, EmbeddedAletheiaSink, ExpectedRecordState, IngestReport, ingest_records,
+        AdapterError, DanglingCitationPolicy, EmbeddedAletheiaSink, ExpectedRecordState,
+        IngestReport, ingest_records_with_policy,
     },
+    cli::covering_tests::covering_tests_response_value,
+    cli::locate::locate_response_value,
     identity::{is_local_remote_url, repository_id_matches_payload},
     ir::{
         AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, EdgeLabel, EvidenceLink, GraphRecord,
@@ -37,7 +40,8 @@ use crate::{
     },
     query as graph_query,
     schema_version::{
-        RecordVersion, UNKNOWN_SCHEMA_VERSION_CODE, UnknownSchemaVersion, validate_record_version,
+        RecordVersion, UNKNOWN_SCHEMA_VERSION_CODE, UnknownSchemaVersion, accepted_record_tuples,
+        validate_record_version,
     },
 };
 
@@ -71,6 +75,13 @@ pub struct DaemonConfig {
     pub port: u16,
     /// Bounded write queue capacity.
     pub write_queue_capacity: usize,
+    /// Access-token lifetime in milliseconds (issue #70). `Some(ttl)` enables
+    /// token rotation: the daemon issues a fresh bearer token every `ttl`
+    /// milliseconds, publishes it in `egregored.json`
+    /// (`token_expires_at_unix_ms`), and keeps the superseded token valid for
+    /// a cutover window of `ttl / 2`. `None` disables rotation (v1 behavior:
+    /// one token for the daemon lifetime, `token_expires_at_unix_ms` is null).
+    pub token_ttl_ms: Option<u64>,
 }
 
 impl DaemonConfig {
@@ -82,6 +93,7 @@ impl DaemonConfig {
             host: DEFAULT_HOST.to_owned(),
             port: DEFAULT_PORT,
             write_queue_capacity: 64,
+            token_ttl_ms: None,
         }
     }
 }
@@ -153,10 +165,25 @@ pub struct DaemonMetadata {
     /// Reserved future multi-daemon index pointer. Null in v1 runtime metadata.
     #[serde(default)]
     pub daemons_index_url: Option<String>,
+    /// Storage mode of the store the daemon serves (issue #54): `plaintext`
+    /// (default) or `encrypted`. Defaults to plaintext for metadata written
+    /// before the field existed.
+    #[serde(default = "default_storage_mode")]
+    pub storage_mode: String,
+    /// Non-secret key-source type token for an encrypted store (issue #54):
+    /// `file` or `passphrase_file`. `None` for plaintext stores. Never key
+    /// material.
+    #[serde(default)]
+    pub key_source: Option<String>,
 }
 
 const fn daemon_runtime_schema_version() -> u32 {
     DAEMON_RUNTIME_SCHEMA_VERSION
+}
+
+/// Default storage mode for daemon metadata written before issue #54.
+fn default_storage_mode() -> String {
+    "plaintext".to_owned()
 }
 
 /// Response returned by daemon-backed ingestion.
@@ -174,6 +201,16 @@ pub struct DaemonIngestResponse {
     pub record_ids: Vec<String>,
     /// True when returned from the idempotency cache.
     pub idempotent: bool,
+    /// Records newly written (or superseding a prior version) by this ingest
+    /// (issue #130). `#[serde(default)]` keeps idempotency-cache entries
+    /// persisted by older binaries deserializable.
+    #[serde(default)]
+    pub inserted: usize,
+    /// Records skipped because the store already held byte-identical state
+    /// (issue #130). `#[serde(default)]` keeps idempotency-cache entries
+    /// persisted by older binaries deserializable.
+    #[serde(default)]
+    pub unchanged: usize,
 }
 
 /// One daemon ingest failure.
@@ -201,6 +238,8 @@ impl DaemonIngestResponse {
                 .collect(),
             record_ids,
             idempotent,
+            inserted: report.inserted,
+            unchanged: report.unchanged,
         }
     }
 }
@@ -432,7 +471,7 @@ fn already_running_error(data_dir: &Path, metadata: &DaemonMetadata) -> anyhow::
 
 #[derive(Clone)]
 struct ServerState {
-    token: String,
+    tokens: Arc<TokenRotationState>,
     store_identity: String,
     sink: Arc<RwLock<EmbeddedAletheiaSink>>,
     write_tx: mpsc::SyncSender<WriteCommand>,
@@ -443,12 +482,208 @@ struct ServerState {
     pressure: Arc<PressureTracker>,
     /// Monotonic per-class error counters surfaced in `GET /v1/status` (#61).
     error_counters: Arc<ErrorCounters>,
+    /// Storage mode of the served store (issue #54): `plaintext`/`encrypted`.
+    storage_mode: String,
+    /// Non-secret key-source type token (`file`/`passphrase_file`), if encrypted.
+    key_source: Option<String>,
+}
+
+/// Verdict of bearer-token validation against the daemon's rotation state
+/// (issue #70).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthVerdict {
+    /// The presented bearer is the current token, or a superseded token still
+    /// inside the documented cutover window.
+    Authorized,
+    /// The presented bearer is a token the daemon issued but superseded past
+    /// the cutover window. The request is rejected with `token_rotated` so the
+    /// client can re-read `egregored.json` and retry once.
+    Superseded,
+    /// No bearer was presented, or the bearer is not a token this daemon
+    /// issued (or issued so long ago it left the bounded history). The
+    /// request is rejected with `unauthorized`.
+    Denied,
+}
+
+/// Constant-time byte equality for bearer-token validation (issue #70).
+///
+/// Differences accumulate with bitwise OR and no data-dependent branches, so
+/// validation time does not leak token content. Length mismatch short-circuits:
+/// daemon tokens are fixed-length, so length is not a secret.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (a, b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+/// One issued token generation: the raw bearer value plus its lifecycle
+/// timestamps. Raw values live only in daemon memory, never in logs,
+/// diagnostics, or wire output (issue #70 redaction policy).
+struct TokenGeneration {
+    token: String,
+    issued_at_unix_ms: u128,
+    /// `None` while this generation is current; `Some(t)` once superseded at `t`.
+    superseded_at_unix_ms: Option<u128>,
+}
+
+/// Live access-token rotation state for one daemon process (issue #70).
+///
+/// The daemon accepts the current token plus superseded tokens inside the
+/// cutover window (`ttl / 2`). Superseded tokens past the window but inside
+/// the bounded history (`ttl` beyond the window) report [`AuthVerdict::Superseded`];
+/// anything older or unknown reports [`AuthVerdict::Denied`], so history stays
+/// bounded and stale tokens fail closed.
+struct TokenRotationState {
+    generations: RwLock<Vec<TokenGeneration>>,
+    /// Token lifetime in milliseconds; `None` disables rotation.
+    ttl_ms: Option<u64>,
+    /// Total rotations performed; surfaced in `GET /v1/status`.
+    rotations: AtomicU64,
+}
+
+impl TokenRotationState {
+    fn new(token: String, ttl_ms: Option<u64>) -> Self {
+        let now = unix_ms();
+        Self {
+            generations: RwLock::new(vec![TokenGeneration {
+                token,
+                issued_at_unix_ms: now,
+                superseded_at_unix_ms: None,
+            }]),
+            ttl_ms,
+            rotations: AtomicU64::new(0),
+        }
+    }
+
+    const fn rotation_enabled(&self) -> bool {
+        self.ttl_ms.is_some()
+    }
+
+    /// Cutover window in milliseconds: half the token lifetime.
+    fn cutover_grace_ms(&self) -> u128 {
+        self.ttl_ms.map_or(0, |ttl| u128::from(ttl) / 2)
+    }
+
+    /// How long past the cutover window a superseded token stays
+    /// distinguishable from an unknown one: one full token lifetime.
+    fn history_retention_ms(&self) -> u128 {
+        self.ttl_ms.map_or(0, u128::from)
+    }
+
+    /// Validates a presented bearer with the wall clock.
+    fn authorize(&self, presented: &str) -> AuthVerdict {
+        self.authorize_at(presented, unix_ms())
+    }
+
+    /// Validates a presented bearer at an explicit instant (deterministic
+    /// under test; the daemon always passes the wall clock).
+    fn authorize_at(&self, presented: &str, now_unix_ms: u128) -> AuthVerdict {
+        let presented = presented.as_bytes();
+        let generations = self
+            .generations
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let grace_ms = self.cutover_grace_ms();
+        let retention_ms = self.history_retention_ms();
+        for generation in generations.iter().rev() {
+            if constant_time_eq(generation.token.as_bytes(), presented) {
+                return match generation.superseded_at_unix_ms {
+                    None => AuthVerdict::Authorized,
+                    Some(superseded_at) if now_unix_ms < superseded_at + grace_ms => {
+                        AuthVerdict::Authorized
+                    }
+                    Some(superseded_at)
+                        if now_unix_ms < superseded_at + grace_ms + retention_ms =>
+                    {
+                        AuthVerdict::Superseded
+                    }
+                    _ => AuthVerdict::Denied,
+                };
+            }
+        }
+        AuthVerdict::Denied
+    }
+
+    /// Validates the `authorization` header against the rotation state.
+    fn authorize_presented(&self, headers: &HashMap<String, String>) -> AuthVerdict {
+        let presented = headers
+            .get("authorization")
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .unwrap_or("");
+        self.authorize(presented)
+    }
+
+    /// Commits a rotation at an explicit instant: the current generation is
+    /// superseded and `token` becomes current. Prunes generations that aged
+    /// out of the bounded history so memory stays proportional to the token
+    /// lifetime, not daemon uptime.
+    fn commit_rotation_at(&self, token: String, now_unix_ms: u128) {
+        let grace_ms = self.cutover_grace_ms();
+        let retention_ms = self.history_retention_ms();
+        {
+            let mut generations = self
+                .generations
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            generations.retain(|generation| {
+                generation
+                    .superseded_at_unix_ms
+                    .is_none_or(|superseded_at| {
+                        now_unix_ms < superseded_at + grace_ms + retention_ms
+                    })
+            });
+            if let Some(current) = generations.last_mut() {
+                current.superseded_at_unix_ms = Some(now_unix_ms);
+            }
+            generations.push(TokenGeneration {
+                token,
+                issued_at_unix_ms: now_unix_ms,
+                superseded_at_unix_ms: None,
+            });
+        }
+        self.rotations.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Unix milliseconds when the current token rotates, or `None` when
+    /// rotation is disabled. Published in `egregored.json` and `GET /v1/status`.
+    fn current_expiry_unix_ms(&self) -> Option<u128> {
+        let ttl_ms = self.ttl_ms?;
+        let generations = self
+            .generations
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        generations
+            .last()
+            .map(|current| current.issued_at_unix_ms + u128::from(ttl_ms))
+    }
+
+    fn rotation_count(&self) -> u64 {
+        self.rotations.load(Ordering::SeqCst)
+    }
+
+    /// Rotation block for `GET /v1/status`: expiry state and rotation status
+    /// only — never token material (issue #70 redaction policy).
+    fn status_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "enabled": self.rotation_enabled(),
+            "token_expires_at_unix_ms": self.current_expiry_unix_ms(),
+            "cutover_grace_ms": self.ttl_ms.map(|ttl| ttl / 2),
+            "rotations": self.rotation_count(),
+        })
+    }
 }
 
 struct WriteCommand {
     idempotency_key: String,
     payload_hash: String,
     records: Vec<GraphRecord>,
+    /// Dangling-citation policy for this write (issue #241).
+    dangling_citation_policy: DanglingCitationPolicy,
     response_tx: mpsc::Sender<WriteResult>,
 }
 
@@ -885,8 +1120,9 @@ enum ErrorCode {
     /// Reserved by #18: daemon startup refused to create or keep runtime files
     /// with unsafe permissions.
     RuntimePermissionsUnsafe,
-    /// Reserved by #18: future token rotation asks clients to re-read
-    /// `egregored.json` and retry with the fresh token.
+    /// Added by #70: the presented bearer token was superseded by a rotation
+    /// past the documented cutover window. Clients must re-read
+    /// `egregored.json` and retry once with the fresh token.
     TokenRotated,
     /// Added by #14 (project graph schema): a verified `AcceptanceCriterion` is
     /// missing the verification record that closed it.
@@ -930,6 +1166,18 @@ enum ErrorCode {
     /// [`Self::BadRequest`] so a caller can tell "not a number" from
     /// "out of range", matching the CLI's `invalid_limit` diagnostic code.
     InvalidLimit,
+    /// Added by #160 (`resolve_record` verb): no record matches the cited
+    /// handle in the requested view. The CLI maps this to its `dangling_handle`
+    /// envelope and exit 2.
+    DanglingHandle,
+    /// Added by #160 (`resolve_record` verb): `params.record_id` is not a
+    /// `codegraph:vN:<suffix>` handle at all. The CLI maps this to its
+    /// `malformed_handle` envelope and exit 1.
+    MalformedHandle,
+    /// Added by #160 (`resolve_record` verb): `params.record_id` is a
+    /// well-formed handle from another id domain. The CLI maps this to its
+    /// `unsupported_handle_domain` envelope and exit 1.
+    UnsupportedHandleDomain,
 }
 
 impl ErrorCode {
@@ -970,6 +1218,9 @@ impl ErrorCode {
             Self::UnknownRepositorySelector => "unknown_repository_selector",
             Self::AmbiguousRepositorySelector => "ambiguous_repository_selector",
             Self::InvalidLimit => "invalid_limit",
+            Self::DanglingHandle => "dangling_handle",
+            Self::MalformedHandle => "malformed_handle",
+            Self::UnsupportedHandleDomain => "unsupported_handle_domain",
         }
     }
 
@@ -983,9 +1234,11 @@ impl ErrorCode {
             | Self::AmbiguousCommitPrefix
             | Self::UnknownRepositorySelector
             | Self::AmbiguousRepositorySelector
+            | Self::MalformedHandle
+            | Self::UnsupportedHandleDomain
             | Self::InvalidLimit => 400,
             Self::IdempotencyConflict => 409,
-            Self::NotFound => 404,
+            Self::NotFound | Self::DanglingHandle => 404,
             Self::PayloadTooLarge => 413,
             Self::QueueFull => 429,
             Self::QueryTimeout => 408,
@@ -1051,6 +1304,16 @@ impl ApiError {
 
     fn unauthorized() -> Self {
         Self::new(ErrorCode::Unauthorized, "missing or invalid bearer token")
+    }
+
+    /// The presented bearer is a daemon token superseded past the cutover
+    /// window (issue #70). The message names the recovery step and never
+    /// carries token material.
+    fn token_rotated() -> Self {
+        Self::new(
+            ErrorCode::TokenRotated,
+            "daemon access token was rotated; re-read egregored.json and retry with the fresh token",
+        )
     }
 
     fn bad_request(message: impl Into<String>) -> Self {
@@ -1316,6 +1579,10 @@ struct RequestEnvelope {
 #[derive(Debug, Deserialize)]
 struct IngestPayload {
     records: Vec<GraphRecord>,
+    /// Optional dangling-citation policy (issue #241): `"quarantine"` (default)
+    /// or `"reject-batch"`. Unknown values are a 400.
+    #[serde(default)]
+    dangling_citation_policy: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1450,6 +1717,9 @@ pub fn start_background(config: &DaemonConfig) -> Result<DaemonMetadata> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(token_ttl_ms) = config.token_ttl_ms {
+        command.arg("--token-ttl-ms").arg(token_ttl_ms.to_string());
+    }
 
     #[cfg(windows)]
     {
@@ -1461,13 +1731,115 @@ pub fn start_background(config: &DaemonConfig) -> Result<DaemonMetadata> {
     wait_until_running(&config.data_dir)
 }
 
+/// Shared connection state for the foreground daemon plus the handles the
+/// accept loop keeps after the write worker is spawned.
+struct ForegroundShared {
+    state: Arc<ServerState>,
+    idempotency: Arc<Mutex<IdempotencyStore>>,
+    shutdown: Arc<AtomicBool>,
+    pressure: Arc<PressureTracker>,
+}
+
+/// Builds the shared [`ServerState`] handed to each accepted connection.
+///
+/// # Errors
+///
+/// Returns an error if the idempotency store cannot be loaded from the
+/// runtime directory.
+fn build_server_state(
+    config: &DaemonConfig,
+    tokens: &Arc<TokenRotationState>,
+    sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
+    write_tx: mpsc::SyncSender<WriteCommand>,
+    storage_mode: String,
+    key_source: Option<String>,
+) -> Result<ForegroundShared> {
+    let idempotency_path = runtime_dir(&config.data_dir).join(IDEMPOTENCY_FILE);
+    let idempotency = Arc::new(Mutex::new(IdempotencyStore::load(idempotency_path)?));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let pressure = Arc::new(PressureTracker::new(config.write_queue_capacity));
+    let state = Arc::new(ServerState {
+        tokens: Arc::clone(tokens),
+        store_identity: store_identity_text(&config.data_dir),
+        sink: Arc::clone(sink),
+        write_tx,
+        jobs: Arc::new(Mutex::new(BTreeMap::new())),
+        agents: Arc::new(Mutex::new(BTreeMap::new())),
+        idempotency: Arc::clone(&idempotency),
+        shutdown: Arc::clone(&shutdown),
+        pressure: Arc::clone(&pressure),
+        error_counters: Arc::new(ErrorCounters::new()),
+        storage_mode,
+        key_source,
+    });
+    Ok(ForegroundShared {
+        state,
+        idempotency,
+        shutdown,
+        pressure,
+    })
+}
+
+/// Runs one scheduled token rotation when its instant has passed (issue #70).
+///
+/// Commits the new token to the in-memory rotation state FIRST (the old token
+/// stays valid through the cutover window), then publishes the new metadata.
+/// If the metadata write fails, the schedule does not advance: the next
+/// accept-loop pass retries the same publish.
+fn maybe_rotate_token(
+    config: &DaemonConfig,
+    tokens: &TokenRotationState,
+    metadata: &mut DaemonMetadata,
+    lease: &mut StoreLease,
+    next_rotation_at_unix_ms: &mut Option<u128>,
+) {
+    let Some(rotation_at) = *next_rotation_at_unix_ms else {
+        return;
+    };
+    let now = unix_ms();
+    if now < rotation_at {
+        return;
+    }
+    let new_token = random_token();
+    tokens.commit_rotation_at(new_token.clone(), now);
+    metadata.token = new_token;
+    metadata.token_expires_at_unix_ms = tokens.current_expiry_unix_ms();
+    match write_metadata(&config.data_dir, metadata).and_then(|()| lease.write_metadata(metadata)) {
+        Ok(()) => {
+            *next_rotation_at_unix_ms = config.token_ttl_ms.map(|ttl_ms| now + u128::from(ttl_ms));
+        }
+        Err(error) => {
+            eprintln!("egregored: token rotation metadata write failed: {error:#}");
+        }
+    }
+}
+
+/// Non-secret storage-mode descriptors for daemon metadata (issue #54).
+///
+/// Reads the Egregore storage-mode marker; returns `("plaintext", None)`
+/// when there is no marker or it cannot be read. Key material is never
+/// read here.
+fn daemon_storage_mode(data_dir: &Path) -> (String, Option<String>) {
+    match crate::encrypted_store::read_marker(data_dir) {
+        Ok(Some(marker)) => (
+            marker.storage_mode.as_str().to_owned(),
+            Some(marker.key_source.kind_str().to_owned()),
+        ),
+        Ok(None) | Err(_) => ("plaintext".to_owned(), None),
+    }
+}
+
 /// Runs the daemon in the current process.
 ///
 /// # Errors
 ///
 /// Returns an error if the store cannot be opened, the data-dir lease cannot be
 /// acquired, or the HTTP listener fails.
+#[allow(clippy::too_many_lines)] // Startup sequence; was already at the lint threshold on trunk.
 pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
+    if config.token_ttl_ms.is_some_and(|ttl_ms| ttl_ms == 0) {
+        anyhow::bail!("--token-ttl-ms must be positive when token rotation is enabled");
+    }
     fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("failed to create {}", config.data_dir.display()))?;
     if let Some(metadata) = active_metadata(&config.data_dir)? {
@@ -1496,6 +1868,11 @@ pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
             config.data_dir.display()
         )
     })?;
+    // Issue #54: the sink open resolved the storage mode (marker vs engine
+    // authority, fail-closed). Surface the non-secret mode + key-source type
+    // in the daemon metadata so `eg daemon status` and GET /v1/status report
+    // it. Key material is never read here.
+    let (storage_mode, key_source) = daemon_storage_mode(&config.data_dir);
     let listener = TcpListener::bind((config.host.as_str(), config.port))
         .with_context(|| format!("failed to bind {}:{}", config.host, config.port))?;
     listener
@@ -1506,44 +1883,49 @@ pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
         .context("failed to read daemon listener address")?
         .to_string();
     let token = random_token();
-    let metadata = DaemonMetadata {
+    let tokens = Arc::new(TokenRotationState::new(token.clone(), config.token_ttl_ms));
+    let started_at_unix_ms = unix_ms();
+    let mut metadata = DaemonMetadata {
         schema_version: DAEMON_RUNTIME_SCHEMA_VERSION,
         pid: std::process::id(),
         address,
-        token: token.clone(),
+        token,
         data_dir: store_identity_dir(&config.data_dir),
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        started_at_unix_ms: unix_ms(),
+        started_at_unix_ms,
         state: DaemonState::Running,
         api_version: None,
         transports: None,
-        token_expires_at_unix_ms: None,
+        token_expires_at_unix_ms: tokens.current_expiry_unix_ms(),
         daemons_index_url: None,
+        storage_mode: storage_mode.clone(),
+        key_source: key_source.clone(),
     };
     write_metadata(&config.data_dir, &metadata)?;
     lease.write_metadata(&metadata)?;
 
     let sink = Arc::new(RwLock::new(sink));
     let (write_tx, write_rx) = mpsc::sync_channel(config.write_queue_capacity);
-    let idempotency_path = runtime_dir(&config.data_dir).join(IDEMPOTENCY_FILE);
-    let idempotency = Arc::new(Mutex::new(IdempotencyStore::load(idempotency_path)?));
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let pressure = Arc::new(PressureTracker::new(config.write_queue_capacity));
-    let state = Arc::new(ServerState {
-        token,
-        store_identity: store_identity_text(&config.data_dir),
-        sink: Arc::clone(&sink),
-        write_tx,
-        jobs: Arc::new(Mutex::new(BTreeMap::new())),
-        agents: Arc::new(Mutex::new(BTreeMap::new())),
-        idempotency: Arc::clone(&idempotency),
-        shutdown: Arc::clone(&shutdown),
-        pressure: Arc::clone(&pressure),
-        error_counters: Arc::new(ErrorCounters::new()),
-    });
-    let worker = spawn_write_worker(write_rx, sink, idempotency, pressure);
+    let shared = build_server_state(config, &tokens, &sink, write_tx, storage_mode, key_source)?;
+    let state = shared.state;
+    let shutdown = shared.shutdown;
+    let worker = spawn_write_worker(write_rx, sink, shared.idempotency, shared.pressure);
+
+    // Token-rotation schedule (issue #70): when rotation is enabled, the next
+    // rotation instant is tracked here and checked every accept-loop pass
+    // (see `maybe_rotate_token`).
+    let mut next_rotation_at_unix_ms = config
+        .token_ttl_ms
+        .map(|ttl_ms| started_at_unix_ms + u128::from(ttl_ms));
 
     while !shutdown.load(Ordering::SeqCst) {
+        maybe_rotate_token(
+            config,
+            &tokens,
+            &mut metadata,
+            &mut lease,
+            &mut next_rotation_at_unix_ms,
+        );
         match listener.accept() {
             Ok((stream, _)) => {
                 let state = Arc::clone(&state);
@@ -1704,7 +2086,52 @@ impl DaemonClient {
         Ok(Self::for_data_dir(metadata, data_dir))
     }
 
+    /// Re-reads `egregored.json` through the documented runtime discovery flow
+    /// and returns a client bound to the fresh metadata (issue #70).
+    ///
+    /// This runs the same staleness (runtime-lock) and liveness checks as the
+    /// initial connect, so rotation never weakens stale-file detection or
+    /// daemon ownership guarantees: a stopped, crashed, copied, or tampered
+    /// metadata file fails closed here instead of yielding a trusted token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata is missing, stale, or unreadable.
+    fn refreshed(&self) -> Result<Self> {
+        Self::from_data_dir(&self.metadata.data_dir)
+    }
+
+    /// Sends a request, retrying exactly once after a `token_rotated`
+    /// rejection (issue #70).
+    ///
+    /// On the first `token_rotated` response the client re-reads runtime
+    /// metadata (with the lock + liveness checks from [`Self::refreshed`])
+    /// and retries the identical request — same body, same `request_id`,
+    /// same idempotency key — with the fresh token. The retry result is
+    /// returned as-is: a second `token_rotated` (or any other failure)
+    /// surfaces to the caller, never a third attempt.
+    fn request_with_rotation_retry(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+        timeout: Duration,
+        include_auth: bool,
+    ) -> Result<(u16, String)> {
+        let (status, response_body) =
+            self.request(method, path, body.clone(), timeout, include_auth)?;
+        if !response_is_token_rotated(status, &response_body) {
+            return Ok((status, response_body));
+        }
+        let fresh = self
+            .refreshed()
+            .context("daemon rotated its access token but runtime metadata could not be re-read")?;
+        fresh.request(method, path, body, timeout, include_auth)
+    }
+
     /// Sends graph records to the daemon.
+    ///
+    /// The records are ingested under the `codegraph` domain.
     ///
     /// # Errors
     ///
@@ -1715,6 +2142,64 @@ impl DaemonClient {
         agent_id: &str,
         session_id: &str,
         idempotency_key: &str,
+        dangling_citation_policy: DanglingCitationPolicy,
+    ) -> Result<DaemonIngestResponse> {
+        self.ingest_records_in_domain(
+            records,
+            agent_id,
+            session_id,
+            idempotency_key,
+            dangling_citation_policy,
+            "codegraph",
+        )
+    }
+
+    /// Sends agent-memory records to the daemon.
+    ///
+    /// The domain is hardcoded to `agent_memory`: the MCP `record_observation`
+    /// tool (issue #183) has no domain parameter of its own, so
+    /// agent-authored observations cannot land in the deterministic
+    /// `codegraph` domain. The daemon validates every record ID against the
+    /// domain (`ensure_record_ids_match_domain`) as a second line of defense.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the daemon rejects the request or cannot be reached.
+    pub fn ingest_agent_memory_records(
+        &self,
+        records: &[GraphRecord],
+        agent_id: &str,
+        session_id: &str,
+        idempotency_key: &str,
+        dangling_citation_policy: DanglingCitationPolicy,
+    ) -> Result<DaemonIngestResponse> {
+        self.ingest_records_in_domain(
+            records,
+            agent_id,
+            session_id,
+            idempotency_key,
+            dangling_citation_policy,
+            "agent_memory",
+        )
+    }
+
+    /// Sends graph records to the daemon under an explicit ingest domain.
+    ///
+    /// Private: domain selection is a per-caller-type decision, so each
+    /// caller type gets its own hardcoded-domain wrapper (`ingest_records`
+    /// for `codegraph`, `ingest_agent_memory_records` for `agent_memory`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the daemon rejects the request or cannot be reached.
+    fn ingest_records_in_domain(
+        &self,
+        records: &[GraphRecord],
+        agent_id: &str,
+        session_id: &str,
+        idempotency_key: &str,
+        dangling_citation_policy: DanglingCitationPolicy,
+        domain: &str,
     ) -> Result<DaemonIngestResponse> {
         self.health()
             .context("daemon health validation failed before ingest")?;
@@ -1723,11 +2208,14 @@ impl DaemonClient {
             "agent_id": agent_id,
             "session_id": session_id,
             "idempotency_key": idempotency_key,
-            "domain": "codegraph",
+            "domain": domain,
             "created_at": chrono::Utc::now().to_rfc3339(),
-            "payload": { "records": records },
+            "payload": {
+                "records": records,
+                "dangling_citation_policy": dangling_citation_policy.as_str(),
+            },
         });
-        let (status, body) = self.request(
+        let (status, body) = self.request_with_rotation_retry(
             "POST",
             "/v1/records/ingest",
             Some(body),
@@ -1786,6 +2274,29 @@ impl DaemonClient {
         serde_json::from_str(&body).context("failed to parse daemon status response")
     }
 
+    /// Fetches the daemon's capability manifest: the live query verbs with
+    /// `implemented`/`reserved` statuses, the query schema version, and the
+    /// accepted record `(domain, kind, schema_version)` tuples — the
+    /// discovery surface integration bridges (MCP/SDK) negotiate against at
+    /// startup instead of hard-coding the verb list.
+    ///
+    /// The returned JSON is the stable `GET /v1/capabilities` contract
+    /// documented in `docs/schema/daemon-query.md`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the daemon does not respond successfully or the
+    /// response cannot be parsed.
+    pub fn capabilities(&self) -> Result<serde_json::Value> {
+        let (status, body) = self.request("GET", "/v1/capabilities", None, CLIENT_TIMEOUT, true)?;
+        if status != 200 {
+            return Err(anyhow!(
+                "daemon capabilities failed with HTTP {status}: {body}"
+            ));
+        }
+        serde_json::from_str(&body).context("failed to parse daemon capabilities response")
+    }
+
     /// Fetches all records from the daemon.
     ///
     /// # Errors
@@ -1793,8 +2304,13 @@ impl DaemonClient {
     /// Returns an error if the daemon does not respond successfully or the
     /// response cannot be parsed.
     pub fn get_all_records(&self) -> Result<(Vec<GraphRecord>, Vec<UnknownSchemaVersion>, String)> {
-        let (status, body) =
-            self.request("GET", "/v1/records", None, CLIENT_OPERATION_TIMEOUT, true)?;
+        let (status, body) = self.request_with_rotation_retry(
+            "GET",
+            "/v1/records",
+            None,
+            CLIENT_OPERATION_TIMEOUT,
+            true,
+        )?;
         if status != 200 {
             return Err(anyhow!(
                 "daemon get_all_records failed with HTTP {status}: {body}"
@@ -1843,7 +2359,7 @@ impl DaemonClient {
             "params": params,
             "as_of": as_of,
         });
-        let (status, body_str) = self.request(
+        let (status, body_str) = self.request_with_rotation_retry(
             "POST",
             "/v1/query",
             Some(body),
@@ -1896,7 +2412,7 @@ impl DaemonClient {
             "params": params,
             "as_of": as_of,
         });
-        let (status, body_str) = self.request(
+        let (status, body_str) = self.request_with_rotation_retry(
             "POST",
             "/v1/query",
             Some(body),
@@ -1950,7 +2466,7 @@ impl DaemonClient {
             "params": params,
             "as_of": as_of,
         });
-        let (status, body_str) = self.request(
+        let (status, body_str) = self.request_with_rotation_retry(
             "POST",
             "/v1/query",
             Some(body),
@@ -2046,6 +2562,26 @@ impl DaemonClient {
     }
 }
 
+/// True when a daemon response is the `token_rotated` auth diagnostic
+/// (issue #70): HTTP 401 with the stable `token_rotated` error code in the
+/// envelope. Anything else — including a bare 401 `unauthorized` — is not a
+/// rotation signal and must not trigger a metadata re-read.
+fn response_is_token_rotated(status: u16, body: &str) -> bool {
+    if status != 401 {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|envelope| {
+            envelope
+                .get("error")?
+                .get("code")?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .is_some_and(|code| code == ErrorCode::TokenRotated.as_str())
+}
+
 fn spawn_write_worker(
     write_rx: mpsc::Receiver<WriteCommand>,
     sink: Arc<RwLock<EmbeddedAletheiaSink>>,
@@ -2110,8 +2646,12 @@ fn recover_pending_write_pre_validation(
         succeeded: pending_record_ids.len(),
         failed: 0,
         failures: Vec::new(),
-        record_ids: pending_record_ids,
+        record_ids: pending_record_ids.clone(),
         idempotent: true,
+        // Recovery verified every record already matches the store: nothing
+        // new was written by this call (issue #130).
+        inserted: 0,
+        unchanged: pending_record_ids.len(),
     };
     complete_idempotency_entry(
         &command.idempotency_key,
@@ -2252,7 +2792,8 @@ fn apply_write(
         let mut sink = sink
             .write()
             .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
-        let report = ingest_records(&all_records, &mut *sink);
+        let report =
+            ingest_records_with_policy(&all_records, &mut *sink, command.dangling_citation_policy);
         if report.succeeded > 0 {
             sink.persist_indexes()
                 .map_err(|error| ApiError::internal(error.to_string()))?;
@@ -2322,6 +2863,10 @@ fn recover_pending_write(
             .map(|record| record.id().to_owned())
             .collect::<Vec<_>>(),
         idempotent: false,
+        // Every record verified Matched against the committed store: this
+        // recovery wrote nothing new (issue #130).
+        inserted: 0,
+        unchanged: records.len(),
     };
     complete_idempotency_entry(idempotency_key, payload_hash, &response, idempotency)?;
     let mut response = response;
@@ -2801,6 +3346,7 @@ const PROJECT_EDGE_LABELS: &[EdgeLabel] = &[
     EdgeLabel::ClosesAcceptanceCriterion,
     EdgeLabel::OwnedByTask,
     EdgeLabel::ExternalHandle,
+    EdgeLabel::DependsOn,
     EdgeLabel::TouchesFile,
     EdgeLabel::MergedAs,
     EdgeLabel::ReviewsCommit,
@@ -3604,6 +4150,18 @@ fn validate_project_edge(
                 &[NodeKind::ExternalLink],
             )?;
         }
+        // Task dependency edge (issue #161): Task -> Task only. Self-loops are
+        // structural input; the query surfaces them as cycle diagnostics.
+        EdgeLabel::DependsOn => {
+            validate_project_edge_kinds(
+                edge_id,
+                label,
+                source_kind,
+                &[NodeKind::Task],
+                target_kind,
+                &[NodeKind::Task],
+            )?;
+        }
         EdgeLabel::ClosesAcceptanceCriterion => {
             validate_project_edge_kinds(
                 edge_id,
@@ -3844,6 +4402,7 @@ fn project_edge(label: EdgeLabel, source: &str, target: &str, summary: &str) -> 
         frame_resolution: None,
         frame_index: None,
         basis: None,
+        call_site_spans: None,
         is_exhaustive: None,
         temporal: None,
         summary: summary.to_owned(),
@@ -5705,6 +6264,7 @@ fn user_context_edge(
         frame_resolution: None,
         frame_index: None,
         basis: None,
+        call_site_spans: None,
         is_exhaustive: None,
         temporal: None,
         summary: summary.to_owned(),
@@ -7334,8 +7894,19 @@ fn validate_and_synthesize_evidence_edges(
                 }
                 for (link_index, link) in links.iter().enumerate() {
                     let was_triple_resolved = link.target_record_id.is_none();
+                    // Issue #241: an unresolved evidence target is not a hard
+                    // 422 here; the dangling-citation policy
+                    // (quarantine/reject-batch) in ingest_records_with_policy
+                    // handles it. Other validation errors (bad domain,
+                    // non-node target, etc.) still fail fast.
                     let (target_id, routing_commit) =
-                        resolve_evidence_target(link, &sink_guard, records)?;
+                        match resolve_evidence_target(link, &sink_guard, records) {
+                            Ok(resolved) => resolved,
+                            Err(e) if e.code == ErrorCode::UnresolvedEvidenceTarget => {
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        };
                     if link.confidence.is_empty() {
                         return Err(ApiError::missing_field("evidence_links[].confidence"));
                     }
@@ -8081,6 +8652,10 @@ fn finalized_entry(payload_hash: &str, record_ids: &[String]) -> IdempotencyEntr
             failures: Vec::new(),
             record_ids: record_ids.to_vec(),
             idempotent: false,
+            // A finalized receipt describes an already-durable write: nothing
+            // new is written when it is served (issue #130).
+            inserted: 0,
+            unchanged: record_ids.len(),
         },
     }
 }
@@ -8289,7 +8864,7 @@ fn scan_under_held_lease(
 }
 
 fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) {
-    let response = match read_http_request(&mut stream, &state.token) {
+    let response = match read_http_request(&mut stream, &state.tokens) {
         Ok(request) => handle_request(&request, &state),
         Err(error) if error.to_string() == "request body too large" => {
             HttpResponse::error(ApiError::payload_too_large())
@@ -8328,8 +8903,14 @@ fn dispatch_request(request: &HttpRequest, state: &ServerState) -> HttpResponse 
             }),
         );
     }
-    if !is_authorized(request, &state.token) {
-        return HttpResponse::error(ApiError::unauthorized());
+    // Authentication is verdict-based (issue #70): a superseded token past the
+    // cutover window is rejected with `token_rotated` so the client can
+    // re-read `egregored.json` and retry once, instead of the opaque
+    // `unauthorized` a never-issued bearer gets.
+    match authorize_request(request, &state.tokens) {
+        AuthVerdict::Authorized => {}
+        AuthVerdict::Superseded => return HttpResponse::error(ApiError::token_rotated()),
+        AuthVerdict::Denied => return HttpResponse::error(ApiError::unauthorized()),
     }
     // Shutdown is handled before the gate so concurrent/retried stop calls
     // succeed even after the flag is set (idempotent drain behavior).
@@ -8343,6 +8924,7 @@ fn dispatch_request(request: &HttpRequest, state: &ServerState) -> HttpResponse 
 
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/v1/status") => handle_status(state),
+        ("GET", "/v1/capabilities") => handle_capabilities(),
         ("POST", "/v1/records/ingest") => handle_ingest(request, state),
         ("POST", "/v1/query") => handle_query(request, state),
         ("POST", "/v1/agents/register") => handle_agent_register(request, state),
@@ -8426,6 +9008,9 @@ fn handle_status(state: &ServerState) -> HttpResponse {
             "oldest_active_job": oldest_active_job,
             "error_counts": state.error_counters.snapshot_json(),
             "pressure": state.pressure.snapshot_json(),
+            "token_rotation": state.tokens.status_json(),
+            "storage_mode": state.storage_mode.as_str(),
+            "key_source": state.key_source.as_deref(),
         }),
     )
 }
@@ -8453,6 +9038,48 @@ fn handle_get_all_records(state: &ServerState) -> HttpResponse {
             "snapshot_timestamp": snapshot_timestamp,
         }),
     )
+}
+
+/// Parses the optional `dangling_citation_policy` ingest payload field
+/// (issue #241): `"quarantine"` (default) or `"reject-batch"`.
+/// Unknown values are a 400.
+fn parse_dangling_citation_policy(
+    raw: Option<&str>,
+    request_id: &str,
+) -> Result<DanglingCitationPolicy, HttpResponse> {
+    match raw {
+        None => Ok(DanglingCitationPolicy::default()),
+        Some("quarantine") => Ok(DanglingCitationPolicy::Quarantine),
+        Some("reject-batch") => Ok(DanglingCitationPolicy::RejectBatch),
+        Some(other) => Err(HttpResponse::error_with_id(
+            request_id,
+            ApiError::bad_request(format!(
+                "dangling_citation_policy must be 'quarantine' or 'reject-batch'; got '{other}'"
+            )),
+        )),
+    }
+}
+
+/// Rejects the batch when any record ID is inconsistent with the ingest
+/// domain.
+fn ensure_record_ids_match_domain(
+    records: &[GraphRecord],
+    domain: &str,
+    request_id: &str,
+) -> Result<(), HttpResponse> {
+    if let Some(bad) = records
+        .iter()
+        .find(|r| !record_id_matches_domain(r.id(), domain))
+    {
+        return Err(HttpResponse::error_with_id(
+            request_id,
+            ApiError::bad_request(format!(
+                "record '{}' has ID inconsistent with domain '{domain}'",
+                bad.id()
+            )),
+        ));
+    }
+    Ok(())
 }
 
 fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
@@ -8530,21 +9157,24 @@ fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             );
         }
     };
-    if let Some(bad) = payload
-        .records
-        .iter()
-        .find(|r| !record_id_matches_domain(r.id(), &domain))
-    {
-        return HttpResponse::error_with_id(
-            &request_id,
-            ApiError::bad_request(format!(
-                "record '{}' has ID inconsistent with domain '{domain}'",
-                bad.id()
-            )),
-        );
+    if let Err(response) = ensure_record_ids_match_domain(&payload.records, &domain, &request_id) {
+        return response;
     }
     let scoped_key = scoped_idempotency_key(&agent_id, "records/ingest", &idempotency_key);
-    match enqueue_write(state, scoped_key, payload.records, &request_id) {
+    let citation_policy = match parse_dangling_citation_policy(
+        payload.dangling_citation_policy.as_deref(),
+        &request_id,
+    ) {
+        Ok(policy) => policy,
+        Err(response) => return response,
+    };
+    match enqueue_write(
+        state,
+        scoped_key,
+        payload.records,
+        &request_id,
+        citation_policy,
+    ) {
         Ok(response) => HttpResponse::success(Some(&request_id), 200, json!(response)),
         Err(error) => HttpResponse::error_with_id(&request_id, error),
     }
@@ -8595,6 +9225,29 @@ fn verb_success_result(
             "returned": returned
         }
     })
+}
+
+/// Reports the pre-truncate pool in a verb result's `page` envelope
+/// (issue #121): `total_matches` is the candidate count before the cap
+/// narrowed the rows, `applied_limit` the effective cap. Additive — existing
+/// `page` consumers are unaffected. The CLI rebuilds each row's completeness
+/// stamp from these two fields.
+fn verb_result_with_completeness(
+    mut result: serde_json::Value,
+    total_matches: usize,
+    applied_limit: usize,
+) -> serde_json::Value {
+    if let Some(page) = result.get_mut("page").and_then(|p| p.as_object_mut()) {
+        page.insert(
+            "total_matches".to_owned(),
+            serde_json::Value::from(total_matches as u64),
+        );
+        page.insert(
+            "applied_limit".to_owned(),
+            serde_json::Value::from(applied_limit as u64),
+        );
+    }
+    result
 }
 
 /// Loads all records from the embedded sink, respecting the read budget.
@@ -9426,6 +10079,179 @@ fn handle_verb_symbol_at_commit(
     )
 }
 
+// ── Verb handler: resolve_record ────────────────────────────────────────────
+
+/// Serializes one dereferenced record to the citation fields the
+/// `resolve_record` verb returns for it.
+fn resolve_record_to_query_json(record_id: &str, record: &GraphRecord) -> serde_json::Value {
+    let fields = crate::query::resolve::resolved_record_fields(record);
+    serde_json::json!({
+        "record_id": record_id,
+        "kind": fields.kind,
+        "name": fields.name,
+        "repo_relative_path": fields.repo_relative_path,
+        "span": fields.span,
+        "git_commit": fields.git_commit,
+        "valid_time": fields.valid_time,
+    })
+}
+
+/// Resolves a cited `codegraph:vN:<suffix>` record-id handle to its live
+/// source record with a drift verdict (issue #160), server-side.
+///
+/// Params: `record_id` (required), `at` (optional commit SHA prefix),
+/// `as_of` (optional RFC 3339 valid-time instant). `at` and `as_of` are
+/// mutually exclusive. The response `records` array holds exactly one object
+/// with the citation fields plus `verdict` (`valid` | `drifted` | `dangling`
+/// semantics) and, for `drifted`, `detail`, `current_repo_relative_path`,
+/// and `current_span`. A dangling handle answers `dangling_handle` (HTTP
+/// 404); a malformed handle `malformed_handle` and a foreign id domain
+/// `unsupported_handle_domain` (both HTTP 400); an ambiguous `at` prefix
+/// `ambiguous_commit_prefix` (HTTP 400).
+#[allow(clippy::too_many_lines)]
+fn handle_verb_resolve_record(
+    request_id: &str,
+    params: &serde_json::Value,
+    started: Instant,
+    budget: Option<Duration>,
+    domain: &str,
+    state: &ServerState,
+) -> HttpResponse {
+    use crate::query::resolve as resolve_core;
+
+    let Some(record_id) = params.get("record_id").and_then(serde_json::Value::as_str) else {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::missing_field("params.record_id"),
+        );
+    };
+    let at = params.get("at").and_then(serde_json::Value::as_str);
+    let as_of = params.get("as_of").and_then(serde_json::Value::as_str);
+    if at.is_some() && as_of.is_some() {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::new(
+                ErrorCode::BadRequest,
+                "params.at and params.as_of are mutually exclusive",
+            ),
+        );
+    }
+    match resolve_core::validate_resolve_handle(record_id) {
+        Ok(()) => {}
+        Err(resolve_core::ResolveHandleError::Malformed) => {
+            return HttpResponse::error_with_id(
+                request_id,
+                ApiError::new(
+                    ErrorCode::MalformedHandle,
+                    format!(
+                        "malformed record-id handle '{record_id}': expected codegraph:vN:<suffix>"
+                    ),
+                ),
+            );
+        }
+        Err(resolve_core::ResolveHandleError::UnsupportedDomain) => {
+            return HttpResponse::error_with_id(
+                request_id,
+                ApiError::new(
+                    ErrorCode::UnsupportedHandleDomain,
+                    format!(
+                        "unsupported handle domain for '{record_id}': this verb resolves codegraph handles only"
+                    ),
+                ),
+            );
+        }
+    }
+
+    let (records, snapshot, _, _) =
+        match load_all_records_for_verb(state, started, budget, domain, false) {
+            Ok(r) => r,
+            Err(e) => return HttpResponse::error_with_id(request_id, e),
+        };
+    if let Err(e) = check_query_budget(started, budget) {
+        return HttpResponse::error_with_id(request_id, e);
+    }
+
+    // Tombstone sets: ordinary `forget` tombstones keep the issue #231
+    // temporal exemption; repository-eviction tombstones suppress everywhere
+    // (issue #472). `read_all_records` already drops stale tombstone records,
+    // so every tombstone present here is active.
+    let deleted = resolve_core::forget_tombstoned_ids(&records);
+    let evicted: std::collections::HashSet<String> = records
+        .iter()
+        .filter_map(|record| match record {
+            GraphRecord::Tombstone { deleted_id, .. }
+                if crate::repo_evict::is_eviction_tombstone(record) =>
+            {
+                Some(deleted_id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+
+    // The pinned record: current view, or the `--at`/`--as-of` snapshot.
+    let pinned = if let Some(commit_prefix) = at {
+        match resolve_core::find_record_at_commit(&records, record_id, commit_prefix, &evicted) {
+            Ok(found) => found,
+            Err(message) => {
+                return HttpResponse::error_with_id(
+                    request_id,
+                    ApiError::new(ErrorCode::AmbiguousCommitPrefix, message),
+                );
+            }
+        }
+    } else if let Some(as_of_instant) = as_of {
+        match resolve_core::find_record_as_of(&records, record_id, as_of_instant, &evicted) {
+            Ok(found) => found,
+            Err(message) => {
+                return HttpResponse::error_with_id(
+                    request_id,
+                    ApiError::new(ErrorCode::BadRequest, message),
+                );
+            }
+        }
+    } else {
+        resolve_core::find_current_record(&records, record_id, &deleted, &evicted)
+    };
+    let Some(pinned) = pinned else {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::new(
+                ErrorCode::DanglingHandle,
+                format!("no record matches handle '{record_id}' in the requested view"),
+            ),
+        );
+    };
+
+    // The verdict: temporal pins compare against the HEAD-anchored current
+    // view, exactly like the CLI transport.
+    let (verdict, detail, current) = if at.is_some() || as_of.is_some() {
+        let current = resolve_core::find_current_record(&records, record_id, &deleted, &evicted);
+        let (verdict, detail) = resolve_core::drift_verdict_for(pinned, current);
+        (verdict, detail, current)
+    } else {
+        (resolve_core::ResolveVerdict::Valid, None, None)
+    };
+
+    let mut answer = resolve_record_to_query_json(record_id, pinned);
+    answer["verdict"] = serde_json::json!(verdict.as_str());
+    if let Some(detail) = detail {
+        answer["detail"] = serde_json::json!(detail);
+    }
+    if verdict == resolve_core::ResolveVerdict::Drifted
+        && let Some(current) = current
+    {
+        let current_fields = resolve_core::resolved_record_fields(current);
+        answer["current_repo_relative_path"] = serde_json::json!(current_fields.repo_relative_path);
+        answer["current_span"] = serde_json::json!(current_fields.span);
+    }
+
+    HttpResponse::success(
+        Some(request_id),
+        200,
+        verb_success_result("resolve_record", &snapshot, &[answer]),
+    )
+}
+
 // ── Verb handler: file_defines ────────────────────────────────────────────────
 
 /// Collects the symbols defined in `path` as of `as_of_dt`.
@@ -9747,6 +10573,337 @@ fn handle_verb_file_defines(
     HttpResponse::success(Some(request_id), 200, result)
 }
 
+// ── Verb handler: locate ────────────────────────────────────────────────────
+
+/// Positional query: resolve the symbol and evidence at a `file:line`
+/// (issue #212).
+///
+/// Params: `repo_relative_path` (required string), `line` (required positive
+/// integer, 1-based), `repo` (optional repository selector, resolved exactly
+/// like every other verb), `at` (optional commit prefix), `as_of` (optional
+/// RFC3339 instant), `supersession` (optional `"exclude"` /
+/// `"include-but-flag"`, default `"exclude"`).
+///
+/// `at` and `as_of` are mutually exclusive and reuse the same
+/// `file_symbols_at_point` machinery as the CLI `--at`/`--as-of` flags, so the
+/// temporal + repository-collision contract is identical. The request-level
+/// `as_of` selector is not applied: temporal pins are verb params here.
+///
+/// The result carries the full `query locate` JSON envelope under
+/// `result.locate` — the located symbol, its outermost-to-innermost enclosing
+/// chain, and the same trust-separated cross-domain bundle as `query context`.
+/// The row `limit` is inapplicable (the answer is a single envelope) and is
+/// ignored.
+///
+/// Typed positional failures are returned as `ok:false` bodies carrying the
+/// same `error.code` values the CLI prints (`no_match`,
+/// `no_enclosing_symbol`, `line_out_of_range`, `ambiguous_repository`, and
+/// the temporal codes), plus a human-readable `message`, so CLI clients can
+/// re-emit the cold path's machine-readable envelope.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn handle_verb_locate(
+    request_id: &str,
+    params: &serde_json::Value,
+    _limit: usize,
+    started: Instant,
+    budget: Option<Duration>,
+    _domain: &str,
+    state: &ServerState,
+) -> HttpResponse {
+    let path = match params
+        .get("repo_relative_path")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(p) => p.to_owned(),
+        None => {
+            return HttpResponse::error_with_id(
+                request_id,
+                ApiError::missing_field("params.repo_relative_path"),
+            );
+        }
+    };
+    let line = match params.get("line").and_then(serde_json::Value::as_u64) {
+        Some(n) if n >= 1 => n,
+        _ => {
+            return HttpResponse::error_with_id(
+                request_id,
+                ApiError::bad_request("params.line must be a positive integer (1-based)"),
+            );
+        }
+    };
+    let line = usize::try_from(line).unwrap_or(usize::MAX);
+
+    // Optional string params: reject non-string values rather than silently
+    // ignoring them.
+    let optional_param = |name: &str| -> Result<Option<String>, HttpResponse> {
+        match params.get(name) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+            Some(_) => Err(HttpResponse::error_with_id(
+                request_id,
+                ApiError::bad_request(format!("params.{name} must be a string")),
+            )),
+        }
+    };
+    let at = match optional_param("at") {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let as_of = match optional_param("as_of") {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if at.is_some() && as_of.is_some() {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::bad_request("params.at and params.as_of are mutually exclusive"),
+        );
+    }
+    let supersession = match params.get("supersession") {
+        None | Some(serde_json::Value::Null) => crate::temporal_status::SupersessionMode::Exclude,
+        Some(v) => {
+            match serde_json::from_value::<crate::temporal_status::SupersessionMode>(v.clone()) {
+                Ok(mode) => mode,
+                Err(_) => {
+                    return HttpResponse::error_with_id(
+                        request_id,
+                        ApiError::bad_request(
+                            "params.supersession must be \"exclude\" or \"include-but-flag\"",
+                        ),
+                    );
+                }
+            }
+        }
+    };
+
+    // The locate envelope carries the same cross-domain trust-separated bundle
+    // as `eg query context`, so records must be loaded from the whole store —
+    // not the domain-filtered slice the single-domain verbs use. Otherwise
+    // agent observations and other pathless evidence would silently vanish
+    // (the `Selector::ByPath` sidecar bug, issue #212, all over again). The
+    // repository index is built over the whole graph, exactly like the CLI.
+    let (records, snapshot) = match load_cross_domain_records(state, started, budget) {
+        Ok(r) => r,
+        Err(e) => return HttpResponse::error_with_id(request_id, e),
+    };
+    let index = graph_query::RepositoryIndex::build(&records);
+    let selected_repo = match resolve_verb_repo_selector(params, &index) {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::error_with_id(request_id, e),
+    };
+
+    // Enforce timeout after the in-memory load phase.
+    if let Err(e) = check_query_budget(started, budget) {
+        return HttpResponse::error_with_id(request_id, e);
+    }
+
+    let envelope = match locate_response_value(
+        &records,
+        &path,
+        line,
+        at.as_deref(),
+        as_of.as_deref(),
+        &index,
+        selected_repo.as_deref(),
+        supersession,
+    ) {
+        Ok(envelope) => envelope,
+        Err((mut error, _exit_code)) => {
+            // Translate the CLI's exit-code families to HTTP statuses; the
+            // typed `error.code` is preserved verbatim for machine clients.
+            let code = error["code"].as_str().unwrap_or("unknown");
+            let status = match code {
+                "no_match"
+                | "no_enclosing_symbol"
+                | "line_out_of_range"
+                | "missing_commit"
+                | "no_commit_at_or_before" => 404,
+                _ => 400,
+            };
+            if error.get("message").is_none() {
+                error["message"] = json!(default_locate_error_message(code, &path, line, &error));
+            }
+            return HttpResponse::json(
+                status,
+                json!({
+                    "ok": false,
+                    "request_id": request_id,
+                    "error": error,
+                }),
+            );
+        }
+    };
+
+    let result = json!({
+        "verb": "locate",
+        "snapshot": snapshot,
+        "locate": envelope,
+    });
+    HttpResponse::success(Some(request_id), 200, result)
+}
+
+/// Human-readable fallback message for a typed locate error that carries no
+/// `message` field of its own.
+fn default_locate_error_message(
+    code: &str,
+    path: &str,
+    line: usize,
+    error: &serde_json::Value,
+) -> String {
+    match code {
+        "no_match" => format!("no symbol found at {path}:{line}"),
+        "no_enclosing_symbol" => format!("line {line} of {path} is not inside any symbol"),
+        "line_out_of_range" => {
+            let max = error["max_known_line"]
+                .as_u64()
+                .map_or_else(|| "unknown".to_owned(), |m| m.to_string());
+            format!("line {line} out of range for {path} (max known line {max})")
+        }
+        "ambiguous_repository" => format!("multiple repositories contain {path}"),
+        _ => format!("locate failed ({code}) at {path}:{line}"),
+    }
+}
+
+// ── Verb handler: tests_for_symbol (issue #126) ───────────────────────────────
+
+/// The daemon face of `eg query tests <handle>`: walks inbound `CALLS` edges
+/// and returns the test symbols that can reach the target.
+fn verb_tests_for_symbol(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_tests_for_symbol(
+        args.request_id,
+        args.params,
+        args.limit,
+        args.started,
+        args.budget,
+        args.domain,
+        state,
+    )
+}
+
+#[allow(clippy::too_many_lines)] // the verb's error taxonomy, one branch per failure mode
+fn handle_verb_tests_for_symbol(
+    request_id: &str,
+    params: &serde_json::Value,
+    limit: usize,
+    started: Instant,
+    budget: Option<Duration>,
+    domain: &str,
+    state: &ServerState,
+) -> HttpResponse {
+    let handle = match params.get("handle").and_then(serde_json::Value::as_str) {
+        Some(h) => h.to_owned(),
+        None => {
+            return HttpResponse::error_with_id(
+                request_id,
+                ApiError::missing_field("params.handle"),
+            );
+        }
+    };
+    let max_depth = match params.get("max_depth") {
+        None | Some(serde_json::Value::Null) => 5,
+        Some(v) => match v.as_u64() {
+            Some(n) if n >= 1 => usize::try_from(n).unwrap_or(usize::MAX),
+            _ => {
+                return HttpResponse::error_with_id(
+                    request_id,
+                    ApiError::bad_request("params.max_depth must be a positive integer"),
+                );
+            }
+        },
+    };
+    // Optional string params: reject non-string values rather than silently
+    // ignoring them (same discipline as `handle_verb_locate`).
+    let optional_param = |name: &str| -> Result<Option<String>, HttpResponse> {
+        match params.get(name) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+            Some(_) => Err(HttpResponse::error_with_id(
+                request_id,
+                ApiError::bad_request(format!("params.{name} must be a string")),
+            )),
+        }
+    };
+    let at = match optional_param("at") {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let as_of = match optional_param("as_of") {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if at.is_some() && as_of.is_some() {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::bad_request("params.at and params.as_of are mutually exclusive"),
+        );
+    }
+
+    let (records, snapshot, _store_tx_bounds, repo_index) =
+        match load_all_records_for_verb(state, started, budget, domain, false) {
+            Ok(r) => r,
+            Err(e) => return HttpResponse::error_with_id(request_id, e),
+        };
+    let selected_repo = match resolve_verb_repo_selector(params, &repo_index) {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::error_with_id(request_id, e),
+    };
+
+    // Enforce timeout after the in-memory load phase.
+    if let Err(e) = check_query_budget(started, budget) {
+        return HttpResponse::error_with_id(request_id, e);
+    }
+
+    match covering_tests_response_value(
+        &records,
+        &handle,
+        &repo_index,
+        selected_repo.as_deref(),
+        max_depth,
+        at.as_deref(),
+        as_of.as_deref(),
+    ) {
+        Ok((header, rows)) => {
+            let rows: Vec<serde_json::Value> = rows.into_iter().take(limit).collect();
+            let mut result = verb_success_result("tests_for_symbol", &snapshot, &rows);
+            result["tests"] = header;
+            HttpResponse::success(Some(request_id), 200, result)
+        }
+        Err(failure) => {
+            // The shared failure payloads carry the typed code either at top
+            // level (`code`) or nested under `error.code`; promote the nested
+            // form to the top level so the client's `DaemonQueryRejection`
+            // extraction (`error.code`) sees the CLI's typed code verbatim.
+            let mut error = failure.payload.clone();
+            if error.get("code").is_none()
+                && let Some(code) = failure.payload.pointer("/error/code").cloned()
+                && let Some(obj) = error.as_object_mut()
+            {
+                obj.insert("code".to_owned(), code);
+            }
+            let code = error
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let status = match code {
+                "no_match"
+                | "stale_handle"
+                | "empty_history"
+                | "missing_commit"
+                | "no_commit_at_or_before" => 404,
+                _ => 400,
+            };
+            HttpResponse::json(
+                status,
+                json!({
+                    "ok": false,
+                    "request_id": request_id,
+                    "error": error,
+                }),
+            )
+        }
+    }
+}
+
 // ── Verb handler: drift_top_n ─────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -9841,6 +10998,9 @@ fn handle_verb_drift_top_n(
     if let Some(repo) = selected_repo.as_deref() {
         drifts.retain(|r| repo_index.owner_of(r.id()) == Some(repo));
     }
+    // Issue #121: bind the pre-truncate pool size before the cap narrows it —
+    // the CLI stamps every row's completeness signal from the page envelope.
+    let total_matches = drifts.len();
     drifts.truncate(effective_limit);
     let mut result_records = drifts
         .into_iter()
@@ -9856,8 +11016,147 @@ fn handle_verb_drift_top_n(
     HttpResponse::success(
         Some(request_id),
         200,
-        verb_success_result("drift_top_n", &snapshot, &result_records),
+        verb_result_with_completeness(
+            verb_success_result("drift_top_n", &snapshot, &result_records),
+            total_matches,
+            effective_limit,
+        ),
     )
+}
+
+// ── Verb handler: clone_classes (issue #216) ─────────────────────────────────
+
+/// Groups exact-duplicate Rust symbol bodies into citable clone classes: the
+/// daemon face of `eg query clones`. The classes are computed by the shared
+/// [`graph_query::clone_classes`] query layer over the store's current-state
+/// codegraph records; each class is emitted as one record, and the full
+/// report (counts, truncation signal, empty reason) rides along under
+/// `result.report` so the CLI daemon transport prints the same envelope as
+/// the local `--graph` / `--data-dir` path.
+#[allow(clippy::too_many_arguments)]
+fn handle_verb_clone_classes(
+    request_id: &str,
+    params: &serde_json::Value,
+    as_of_valid_time: Option<&str>,
+    budget_limit: usize,
+    started: Instant,
+    budget: Option<Duration>,
+    domain: &str,
+    state: &ServerState,
+) -> HttpResponse {
+    // Effective limit: min(params.limit capped at CLONES_MAX_LIMIT, budget_limit).
+    // Reject non-integer limit values rather than silently coercing to the default.
+    let params_limit = match params.get("limit") {
+        None => graph_query::CLONES_DEFAULT_LIMIT,
+        Some(v) => match v.as_u64() {
+            Some(n) => usize::try_from(n).unwrap_or(graph_query::CLONES_MAX_LIMIT),
+            None => {
+                return HttpResponse::error_with_id(
+                    request_id,
+                    ApiError::bad_request("params.limit must be a non-negative integer"),
+                );
+            }
+        },
+    }
+    .min(graph_query::CLONES_MAX_LIMIT);
+    let effective_limit = params_limit.min(budget_limit);
+
+    // Effective min_size: default 2; reject non-integers and values below 2
+    // rather than silently widening or narrowing the class definition.
+    let params_min_size = match params.get("min_size") {
+        None => graph_query::CLONES_DEFAULT_MIN_SIZE,
+        Some(v) => match v.as_u64() {
+            Some(n) => usize::try_from(n).unwrap_or(usize::MAX),
+            None => {
+                return HttpResponse::error_with_id(
+                    request_id,
+                    ApiError::bad_request("params.min_size must be a non-negative integer"),
+                );
+            }
+        },
+    };
+    if params_min_size < graph_query::CLONES_DEFAULT_MIN_SIZE {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::bad_request("params.min_size must be at least 2"),
+        );
+    }
+
+    let (mut records, snapshot, _, repo_index) =
+        match load_all_records_for_verb(state, started, budget, domain, false) {
+            Ok(r) => r,
+            Err(e) => return HttpResponse::error_with_id(request_id, e),
+        };
+    let selected_repo = match resolve_verb_repo_selector(params, &repo_index) {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::error_with_id(request_id, e),
+    };
+
+    // Valid-time point-in-time filter, same rule as `drift_top_n`: when the
+    // caller pins `as_of.valid_time`, records newer than the instant are
+    // excluded from the class computation.
+    if let Some(as_of) = as_of_valid_time {
+        let as_of_dt = match chrono::DateTime::parse_from_rfc3339(as_of) {
+            Ok(dt) => dt,
+            Err(e) => {
+                return HttpResponse::error_with_id(
+                    request_id,
+                    ApiError::bad_request(format!("invalid as_of.valid_time: {e}")),
+                );
+            }
+        };
+        records.retain(|r| match r {
+            GraphRecord::Node {
+                temporal,
+                valid_time,
+                ..
+            } => {
+                let vt_str = temporal
+                    .as_ref()
+                    .map(|t| t.valid_time.as_str())
+                    .or(valid_time.as_deref());
+                vt_str
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .is_some_and(|vt| vt <= as_of_dt)
+            }
+            GraphRecord::Edge { temporal, .. } => {
+                let vt_str = temporal.as_ref().map(|t| t.valid_time.as_str());
+                vt_str.is_some_and(|s| {
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .ok()
+                        .is_some_and(|vt| vt <= as_of_dt)
+                })
+            }
+            GraphRecord::Tombstone { .. } => true,
+        });
+    }
+
+    let report = graph_query::clone_classes(
+        &records,
+        selected_repo.as_deref(),
+        params_min_size,
+        effective_limit,
+    );
+    let result_records: Vec<serde_json::Value> = match serde_json::to_value(&report.classes) {
+        Ok(serde_json::Value::Array(classes)) => classes,
+        Ok(_) | Err(_) => {
+            return HttpResponse::error_with_id(
+                request_id,
+                ApiError::bad_request("clone class serialization failed"),
+            );
+        }
+    };
+
+    // Enforce timeout after the grouping CPU phase.
+    if let Err(e) = check_query_budget(started, budget) {
+        return HttpResponse::error_with_id(request_id, e);
+    }
+
+    let mut result = verb_success_result("clone_classes", &snapshot, &result_records);
+    // The full report (counts, truncation signal, empty reason) rides along so
+    // the CLI daemon transport prints the same envelope as the local path.
+    result["report"] = serde_json::to_value(&report).unwrap_or(serde_json::Value::Null);
+    HttpResponse::success(Some(request_id), 200, result)
 }
 
 // ── Verb handler: semantic_search (issue #59) ────────────────────────────────
@@ -10038,6 +11337,9 @@ fn handle_verb_semantic_search(
     if let Some(repo) = selected_repo.as_deref() {
         matches.retain(|m| repo_index.owner_of(&m.record_id) == Some(repo));
     }
+    // The verdict below covers the pre-truncation pool: bind the count before
+    // the response limit narrows the rows.
+    let total_candidates = matches.len();
     matches.truncate(effective_limit);
 
     // Enforce timeout after the search CPU phase.
@@ -10051,11 +11353,70 @@ fn handle_verb_semantic_search(
         .collect::<Vec<_>>();
     attach_repository_fields(&mut result_records, &repo_index);
 
-    HttpResponse::success(
-        Some(request_id),
-        200,
-        verb_success_result("semantic_search", &snapshot, &result_records),
-    )
+    let mut result = verb_success_result("semantic_search", &snapshot, &result_records);
+    // Issue #121: report the pre-truncate pool and the effective cap in the
+    // page envelope so the CLI can stamp each row's completeness signal.
+    result = verb_result_with_completeness(result, total_candidates, effective_limit);
+    // Issue #243: stamp the embedding-provenance envelope on the verb result
+    // so CLI (`--daemon`) and future MCP consumers get the same answer
+    // contract as the embedded lane. The query identity assumes the query
+    // vector came from the default local embedder — the CLI is currently the
+    // only producer of these vectors — and the index identity is read from
+    // the same store that produced the ranking above.
+    let provenance = crate::embeddings::embedding_provenance(
+        &crate::embeddings::default_embedding_model_identity(query_vector.len()),
+        &crate::embeddings::indexed_identities(&all_records),
+    );
+    // `EmbeddingProvenance` is a plain struct of strings/bools/vecs, so this
+    // serialization is infallible in practice; the error arm stays honest
+    // rather than silently degrading the answer contract.
+    let provenance_value = match serde_json::to_value(&provenance) {
+        Ok(value) => value,
+        Err(error) => {
+            return HttpResponse::error(ApiError::internal(format!(
+                "failed to serialize embedding provenance: {error}"
+            )));
+        }
+    };
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert("embedding_provenance".to_owned(), provenance_value);
+    }
+
+    // Issue #221: stamp the answer-level confidence verdict on the verb result
+    // so non-CLI consumers inherit the same contract as the CLI.
+    if let Err(e) = stamp_semantic_confidence_verdict(&mut result, &matches, total_candidates) {
+        return HttpResponse::error(e);
+    }
+
+    HttpResponse::success(Some(request_id), 200, result)
+}
+
+// Issue #221: stamp the answer-level confidence verdict on a semantic_search
+// verb result so non-CLI consumers inherit the same contract as the CLI. The
+// verdict is a pure function of the ranked score distribution — the matches
+// are canonically ordered (score descending), so the first row holds the best
+// score of the full filtered pool. An empty pool carries no verdict: the
+// empty answer is the CLI's exit-2 no-match path, not an abstention.
+fn stamp_semantic_confidence_verdict(
+    result: &mut serde_json::Value,
+    matches: &[crate::adapters::SemanticMatch],
+    total_candidates: usize,
+) -> Result<(), ApiError> {
+    let Some(best) = matches.first() else {
+        return Ok(());
+    };
+    let verdict = crate::semantic_confidence::SemanticConfidenceVerdict::new(
+        crate::semantic_confidence::SemanticConfidence::of_best(best.score),
+        best.score,
+        total_candidates,
+    );
+    let verdict_value = serde_json::to_value(&verdict).map_err(|error| {
+        ApiError::internal(format!("failed to serialize confidence verdict: {error}"))
+    })?;
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert("confidence".to_owned(), verdict_value);
+    }
+    Ok(())
 }
 
 // ── Verb handler: observations_for_symbol (issue #38) ────────────────────────
@@ -10127,6 +11488,18 @@ fn context_observation_to_json(
         )
 }
 
+/// Renders one agent-authored `Decision` record (issue #191) to JSON,
+/// reusing the shared [`graph_query::context_decision`] builder so the
+/// daemon lane emits the same row shape as the CLI and MCP lanes.
+fn context_decision_to_json(
+    record: &GraphRecord,
+    records: &[GraphRecord],
+    trust: &graph_query::TrustIndex<'_>,
+) -> Option<serde_json::Value> {
+    graph_query::context_decision(record, records, trust)
+        .and_then(|decision| serde_json::to_value(&decision).ok())
+}
+
 fn context_linked_item_to_json(
     record: &GraphRecord,
     trust: &graph_query::TrustIndex<'_>,
@@ -10194,6 +11567,7 @@ struct ContextSections {
     source_facts: Vec<serde_json::Value>,
     topology_edges: Vec<serde_json::Value>,
     observations: Vec<serde_json::Value>,
+    decisions: Vec<serde_json::Value>,
     project_state: Vec<serde_json::Value>,
     artifacts: Vec<serde_json::Value>,
     verification_evidence: Vec<serde_json::Value>,
@@ -10209,18 +11583,13 @@ fn build_context_sections(
 ) -> ContextSections {
     let mut rem = limit;
 
-    let source_facts: Vec<_> = ctx
-        .source_facts
-        .iter()
-        .take(rem)
-        .map(|r| context_source_fact_to_json(r, trust))
-        .collect();
-    rem = rem.saturating_sub(source_facts.len());
+    let source_facts = take_section(&mut rem, ctx.source_facts.iter(), |r| {
+        Some(context_source_fact_to_json(r, trust))
+    });
 
-    let topology_edges: Vec<_> = ctx
-        .topology_edges
-        .iter()
-        .filter_map(|r| {
+    let topology_edges = take_section(
+        &mut rem,
+        ctx.topology_edges.iter().filter_map(|r| {
             if let GraphRecord::Edge {
                 id,
                 label,
@@ -10242,79 +11611,75 @@ fn build_context_sections(
             } else {
                 None
             }
-        })
-        .take(rem)
-        .collect();
-    rem = rem.saturating_sub(topology_edges.len());
+        }),
+        Some,
+    );
 
-    let observations: Vec<_> = ctx
-        .observations
-        .iter()
-        .take(rem)
-        .map(|r| context_observation_to_json(r, trust))
-        .collect();
-    rem = rem.saturating_sub(observations.len());
+    let observations = take_section(&mut rem, ctx.observations.iter(), |r| {
+        Some(context_observation_to_json(r, trust))
+    });
 
-    let project_state: Vec<_> = ctx
-        .project_state
-        .iter()
-        .take(rem)
-        .map(|r| context_linked_item_to_json(r, trust))
-        .collect();
-    rem = rem.saturating_sub(project_state.len());
+    // Section contract (issue #191): decisions surface in their own
+    // section and never in `observations`.
+    let decisions = take_section(&mut rem, ctx.decisions.iter(), |r| {
+        context_decision_to_json(r, records, trust)
+    });
 
-    let artifacts: Vec<_> = ctx
-        .artifacts
-        .iter()
-        .take(rem)
-        .map(|r| context_linked_item_to_json(r, trust))
-        .collect();
-    rem = rem.saturating_sub(artifacts.len());
+    let project_state = take_section(&mut rem, ctx.project_state.iter(), |r| {
+        Some(context_linked_item_to_json(r, trust))
+    });
 
-    let verification_evidence: Vec<_> = ctx
-        .verification_evidence
-        .iter()
-        .take(rem)
-        .map(|r| context_linked_item_to_json(r, trust))
-        .collect();
-    rem = rem.saturating_sub(verification_evidence.len());
+    let artifacts = take_section(&mut rem, ctx.artifacts.iter(), |r| {
+        Some(context_linked_item_to_json(r, trust))
+    });
+
+    let verification_evidence = take_section(&mut rem, ctx.verification_evidence.iter(), |r| {
+        Some(context_linked_item_to_json(r, trust))
+    });
 
     let drift_history_records: Vec<&GraphRecord> =
         ctx.drift_history.iter().take(rem).copied().collect();
     let resolved_drift_targets =
         graph_query::resolve_drift_targets(records, &drift_history_records);
-    let drift_history: Vec<_> = drift_history_records
-        .iter()
-        .zip(resolved_drift_targets)
-        .filter_map(|(r, resolved)| context_drift_to_json(r, resolved, trust))
-        .collect();
-    rem = rem.saturating_sub(drift_history.len());
+    let drift_history = take_section(
+        &mut rem,
+        drift_history_records.iter().zip(resolved_drift_targets),
+        |(r, resolved)| context_drift_to_json(r, resolved, trust),
+    );
 
-    let unresolved: Vec<_> = ctx
-        .unresolved
-        .iter()
-        .take(rem)
-        .map(|u| {
-            json!({
-                "source_record_id": u.source_record_id,
-                "target_handle": u.target_handle,
-                "relation": u.relation,
-                "target_domain": u.target_domain,
-                "verification_status": "unresolved",
-            })
-        })
-        .collect();
+    let unresolved = take_section(&mut rem, ctx.unresolved.iter(), |u| {
+        Some(json!({
+            "source_record_id": u.source_record_id,
+            "target_handle": u.target_handle,
+            "relation": u.relation,
+            "target_domain": u.target_domain,
+            "verification_status": "unresolved",
+        }))
+    });
 
     ContextSections {
         source_facts,
         topology_edges,
         observations,
+        decisions,
         project_state,
         artifacts,
         verification_evidence,
         drift_history,
         unresolved,
     }
+}
+
+/// Takes up to `*rem` items, maps each to a JSON row, and deducts the
+/// produced count from the section budget.
+fn take_section<T>(
+    rem: &mut usize,
+    items: impl Iterator<Item = T>,
+    f: impl FnMut(T) -> Option<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let out: Vec<_> = items.take(*rem).filter_map(f).collect();
+    *rem = rem.saturating_sub(out.len());
+    out
 }
 
 fn apply_supersession_json(
@@ -10428,6 +11793,12 @@ fn handle_verb_observations_for_symbol(
         Err(e) => return HttpResponse::error_with_id(request_id, e),
     };
 
+    // Issue #196: store-level trust-domain presence, computed over the whole
+    // store BEFORE the as_of.valid_time filter below narrows the view — the
+    // signal answers "does this store contain the domain", not "does the
+    // point-in-time slice".
+    let store_coverage = graph_query::StoreCoverage::from_records(&records);
+
     // Apply as_of.valid_time: exclude records whose valid_time is after the cutoff.
     // Records with no valid_time are excluded from point-in-time queries (consistent
     // with other temporal verbs).
@@ -10529,8 +11900,13 @@ fn handle_verb_observations_for_symbol(
     let trust = graph_query::TrustIndex::build(&records);
     let s = build_context_sections(&records, &ctx, limit, &trust);
 
-    let (observations, excluded) =
+    let (observations, mut excluded) =
         apply_supersession_json(s.observations, trust.resolver(), supersession);
+    // Decisions get their own supersession pass (issue #191): same
+    // temporal-status semantics, surfaced in the decisions section.
+    let (decisions, decision_excluded) =
+        apply_supersession_json(s.decisions, trust.resolver(), supersession);
+    excluded.extend(decision_excluded);
 
     HttpResponse::success(
         Some(request_id),
@@ -10542,12 +11918,15 @@ fn handle_verb_observations_for_symbol(
             "source_facts": s.source_facts,
             "topology_edges": s.topology_edges,
             "observations": observations,
+            "decisions": decisions,
             "project_state": s.project_state,
             "artifacts": s.artifacts,
             "verification_evidence": s.verification_evidence,
             "drift_history": s.drift_history,
             "unresolved": s.unresolved,
             "excluded": excluded,
+            // Issue #196: store-level trust-domain presence (computed pre-filter above).
+            "store_coverage": store_coverage,
         }),
     )
 }
@@ -10577,6 +11956,10 @@ fn handle_verb_criteria_for_task(
         Ok(r) => r,
         Err(e) => return HttpResponse::error_with_id(request_id, e),
     };
+
+    // Issue #196: store-level trust-domain presence, computed over the whole
+    // store BEFORE the as_of.valid_time filter below narrows the view.
+    let store_coverage = graph_query::StoreCoverage::from_records(&records);
 
     if let Some(as_of) = as_of_valid_time {
         let as_of_dt = match chrono::DateTime::parse_from_rfc3339(as_of) {
@@ -10760,6 +12143,16 @@ fn handle_verb_criteria_for_task(
         .collect();
     rem = rem.saturating_sub(observations.len());
 
+    // Section contract (issue #191): decisions surface in their own
+    // section and never in `observations`.
+    let decisions: Vec<_> = ctx
+        .decisions
+        .iter()
+        .take(rem)
+        .filter_map(|r| context_decision_to_json(r, &records, &trust))
+        .collect();
+    rem = rem.saturating_sub(decisions.len());
+
     let artifacts: Vec<_> = ctx
         .artifacts
         .iter()
@@ -10818,11 +12211,14 @@ fn handle_verb_criteria_for_task(
             "acceptance_criteria": acceptance_criteria,
             "source_facts": source_facts,
             "observations": observations,
+            "decisions": decisions,
             "artifacts": artifacts,
             "verification_evidence": verification_evidence,
             "reviews": reviews,
             "external_links": external_links,
             "unresolved": unresolved,
+            // Issue #196: store-level trust-domain presence (computed pre-filter above).
+            "store_coverage": store_coverage,
         }),
     )
 }
@@ -11011,6 +12407,370 @@ fn handle_verb_agent_sessions_for_repo(
     )
 }
 
+// ── Query-verb dispatch registry (issue #166) ───────────────────────────────
+///
+// This table is the single source of truth for the query surface: both
+// `handle_query` dispatch and the `GET /v1/capabilities` manifest derive
+// from it, so the manifest cannot drift from reality. Adding a verb means
+// adding a row here — there is no other dispatch list to keep in sync.
+///
+/// Lifecycle status of a query verb in the capability manifest.
+///
+/// The closed two-value set keeps the contract stable: a verb is either
+/// callable or it is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryVerbStatus {
+    Implemented,
+    Reserved,
+}
+
+impl QueryVerbStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Implemented => "implemented",
+            Self::Reserved => "reserved",
+        }
+    }
+}
+
+/// The argument bundle threaded to every table-dispatched verb handler.
+struct QueryVerbArgs<'a> {
+    pub request_id: &'a str,
+    pub params: &'a serde_json::Value,
+    pub domain: &'a str,
+    pub limit: usize,
+    pub started: Instant,
+    pub budget: Option<Duration>,
+    pub as_of_valid_time: Option<&'a str>,
+    pub as_of_transaction_time: Option<&'a str>,
+}
+
+/// Unified handler signature for verbs invoked through [`QUERY_VERB_TABLE`].
+type QueryVerbHandler = for<'a> fn(&QueryVerbArgs<'a>, &ServerState) -> HttpResponse;
+
+/// One entry of the query-verb dispatch registry.
+///
+/// `handler` is `Some` exactly when `status` is
+/// [`QueryVerbStatus::Implemented`]; reserved verbs answer HTTP 501
+/// `not_implemented` with [`QueryVerbSpec::reserved_reason`] (or the default
+/// reserved message when it is `None`) without ever reaching a handler.
+struct QueryVerbSpec {
+    pub name: &'static str,
+    pub status: QueryVerbStatus,
+    pub reserved_reason: Option<&'static str>,
+    pub handler: Option<QueryVerbHandler>,
+}
+
+fn verb_get_records(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_get_records(
+        args.request_id,
+        args.params,
+        args.domain,
+        args.limit,
+        args.started,
+        args.budget,
+        state,
+    )
+}
+
+fn verb_symbol_by_name(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_symbol_by_name(
+        args.request_id,
+        args.params,
+        args.as_of_valid_time,
+        args.as_of_transaction_time,
+        args.limit,
+        args.started,
+        args.budget,
+        args.domain,
+        state,
+    )
+}
+
+fn verb_symbol_at_commit(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_symbol_at_commit(
+        args.request_id,
+        args.params,
+        args.limit,
+        args.started,
+        args.budget,
+        args.domain,
+        state,
+    )
+}
+
+fn verb_resolve_record(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_resolve_record(
+        args.request_id,
+        args.params,
+        args.started,
+        args.budget,
+        args.domain,
+        state,
+    )
+}
+
+fn verb_file_defines(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_file_defines(
+        args.request_id,
+        args.params,
+        args.as_of_valid_time,
+        args.limit,
+        args.started,
+        args.budget,
+        args.domain,
+        state,
+    )
+}
+
+fn verb_locate(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_locate(
+        args.request_id,
+        args.params,
+        args.limit,
+        args.started,
+        args.budget,
+        args.domain,
+        state,
+    )
+}
+
+fn verb_drift_top_n(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_drift_top_n(
+        args.request_id,
+        args.params,
+        args.as_of_valid_time,
+        args.limit,
+        args.started,
+        args.budget,
+        args.domain,
+        state,
+    )
+}
+
+fn verb_clone_classes(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_clone_classes(
+        args.request_id,
+        args.params,
+        args.as_of_valid_time,
+        args.limit,
+        args.started,
+        args.budget,
+        args.domain,
+        state,
+    )
+}
+
+#[cfg(feature = "embeddings")]
+fn verb_semantic_search(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_semantic_search(
+        args.request_id,
+        args.params,
+        args.limit,
+        args.started,
+        args.budget,
+        state,
+    )
+}
+
+fn verb_observations_for_symbol(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_observations_for_symbol(
+        args.request_id,
+        args.params,
+        args.as_of_valid_time,
+        args.limit,
+        args.started,
+        args.budget,
+        state,
+    )
+}
+
+fn verb_criteria_for_task(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_criteria_for_task(
+        args.request_id,
+        args.params,
+        args.as_of_valid_time,
+        args.limit,
+        args.started,
+        args.budget,
+        state,
+    )
+}
+
+fn verb_agent_sessions_for_repo(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_agent_sessions_for_repo(
+        args.request_id,
+        args.params,
+        args.as_of_valid_time,
+        args.limit,
+        args.started,
+        args.budget,
+        state,
+    )
+}
+
+/// Every query verb the daemon knows, in alphabetical order.
+///
+/// `semantic_search` is `implemented` only when the daemon is built with the
+/// `embeddings` feature; otherwise it is `reserved` (HTTP 501
+/// `not_implemented`), keeping the manifest byte-equal to live dispatch in
+/// every feature configuration.
+const QUERY_VERB_TABLE: &[QueryVerbSpec] = &[
+    QueryVerbSpec {
+        // The daemon face of `eg query sessions <REPO>` (issue #112).
+        name: "agent_sessions_for_repo",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_agent_sessions_for_repo),
+    },
+    QueryVerbSpec {
+        name: "clone_classes",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_clone_classes),
+    },
+    QueryVerbSpec {
+        name: "criteria_for_task",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_criteria_for_task),
+    },
+    QueryVerbSpec {
+        name: "drift",
+        status: QueryVerbStatus::Reserved,
+        reserved_reason: None,
+        handler: None,
+    },
+    QueryVerbSpec {
+        name: "drift_top_n",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_drift_top_n),
+    },
+    QueryVerbSpec {
+        name: "file_defines",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_file_defines),
+    },
+    QueryVerbSpec {
+        name: "get_records",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_get_records),
+    },
+    QueryVerbSpec {
+        name: "locate",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_locate),
+    },
+    QueryVerbSpec {
+        name: "observations_for_symbol",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_observations_for_symbol),
+    },
+    QueryVerbSpec {
+        name: "semantic_search",
+        #[cfg(feature = "embeddings")]
+        status: QueryVerbStatus::Implemented,
+        #[cfg(not(feature = "embeddings"))]
+        status: QueryVerbStatus::Reserved,
+        reserved_reason: Some(
+            "verb 'semantic_search' requires the daemon to be built with the 'embeddings' feature",
+        ),
+        #[cfg(feature = "embeddings")]
+        handler: Some(verb_semantic_search),
+        #[cfg(not(feature = "embeddings"))]
+        handler: None,
+    },
+    QueryVerbSpec {
+        name: "symbol_at_commit",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_symbol_at_commit),
+    },
+    QueryVerbSpec {
+        name: "resolve_record",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_resolve_record),
+    },
+    QueryVerbSpec {
+        name: "symbol_by_name",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_symbol_by_name),
+    },
+    QueryVerbSpec {
+        // The daemon face of `eg query tests <handle>` (issue #126).
+        name: "tests_for_symbol",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_tests_for_symbol),
+    },
+];
+
+/// Looks up a verb in the dispatch registry.
+fn query_verb_spec(verb: &str) -> Option<&'static QueryVerbSpec> {
+    QUERY_VERB_TABLE.iter().find(|spec| spec.name == verb)
+}
+
+/// Builds the `GET /v1/capabilities` discovery document (issue #166).
+///
+/// Stable contract documented in `docs/schema/daemon-query.md`:
+/// - `api_version`: the daemon API version (`"v1"`).
+/// - `daemon_query_schema_version`: the value of
+///   [`DAEMON_QUERY_SCHEMA_VERSION`].
+/// - `verbs`: every verb in [`QUERY_VERB_TABLE`], sorted by name, each with
+///   an explicit `implemented`/`reserved` status.
+/// - `accepted_record_tuples`: every `(domain, kind, schema_version)` tuple
+///   the daemon accepts on ingest/read, from [`accepted_record_tuples`]
+///   (kind is always the `*` wildcard — the gate checks `domain` +
+///   `schema_version` only).
+fn capability_manifest_json() -> serde_json::Value {
+    let mut verbs: Vec<serde_json::Value> = QUERY_VERB_TABLE
+        .iter()
+        .map(|spec| {
+            json!({
+                "name": spec.name,
+                "status": spec.status.as_str(),
+            })
+        })
+        .collect();
+    verbs.sort_by(|a, b| {
+        a["name"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["name"].as_str().unwrap_or_default())
+    });
+    let record_tuples: Vec<serde_json::Value> = accepted_record_tuples()
+        .iter()
+        .map(|tuple| {
+            json!({
+                "domain": tuple.domain,
+                "kind": tuple.kind,
+                "schema_version": tuple.version,
+            })
+        })
+        .collect();
+    json!({
+        "api_version": "v1",
+        "daemon_query_schema_version": DAEMON_QUERY_SCHEMA_VERSION,
+        "verbs": verbs,
+        "accepted_record_tuples": record_tuples,
+    })
+}
+
+/// Serves `GET /v1/capabilities` — auth required, like `GET /v1/status`.
+/// Flat JSON (no `ok`/`result` envelope), matching the observability
+/// endpoints' shape.
+fn handle_capabilities() -> HttpResponse {
+    HttpResponse::json(200, capability_manifest_json())
+}
+
 // ── Main query handler ────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
@@ -11112,106 +12872,46 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         );
     }
 
-    match verb.as_str() {
-        "get_records" => {
-            handle_verb_get_records(&request_id, &params, &domain, limit, started, budget, state)
-        }
-        "symbol_by_name" => handle_verb_symbol_by_name(
-            &request_id,
-            &params,
-            as_of_valid_time.as_deref(),
-            as_of_transaction_time.as_deref(),
-            limit,
-            started,
-            budget,
-            &domain,
-            state,
-        ),
-        "symbol_at_commit" => handle_verb_symbol_at_commit(
-            &request_id,
-            &params,
-            limit,
-            started,
-            budget,
-            &domain,
-            state,
-        ),
-        "file_defines" => handle_verb_file_defines(
-            &request_id,
-            &params,
-            as_of_valid_time.as_deref(),
-            limit,
-            started,
-            budget,
-            &domain,
-            state,
-        ),
-        "drift_top_n" => handle_verb_drift_top_n(
-            &request_id,
-            &params,
-            as_of_valid_time.as_deref(),
-            limit,
-            started,
-            budget,
-            &domain,
-            state,
-        ),
-        "observations_for_symbol" => handle_verb_observations_for_symbol(
-            &request_id,
-            &params,
-            as_of_valid_time.as_deref(),
-            limit,
-            started,
-            budget,
-            state,
-        ),
-        "criteria_for_task" => handle_verb_criteria_for_task(
-            &request_id,
-            &params,
-            as_of_valid_time.as_deref(),
-            limit,
-            started,
-            budget,
-            state,
-        ),
-        "semantic_search" => {
-            #[cfg(feature = "embeddings")]
-            {
-                handle_verb_semantic_search(&request_id, &params, limit, started, budget, state)
-            }
-            #[cfg(not(feature = "embeddings"))]
-            {
-                HttpResponse::error_with_id(
-                    &request_id,
-                    ApiError::new(
-                        ErrorCode::NotImplemented,
-                        "verb 'semantic_search' requires the daemon to be built with the 'embeddings' feature",
-                    ),
-                )
-            }
-        }
-        // The daemon face of `eg query sessions <REPO>` (issue #112).
-        "agent_sessions_for_repo" => handle_verb_agent_sessions_for_repo(
-            &request_id,
-            &params,
-            as_of_valid_time.as_deref(),
-            limit,
-            started,
-            budget,
-            state,
-        ),
-        "drift" => HttpResponse::error_with_id(
-            &request_id,
-            ApiError::new(
-                ErrorCode::NotImplemented,
-                format!("verb '{verb}' is reserved and not yet implemented"),
-            ),
-        ),
-        _ => HttpResponse::error_with_id(
+    // Dispatch through the registry (issue #166): the table is the single
+    // source of truth, so a verb cannot be added to dispatch without also
+    // appearing in the capability manifest.
+    let Some(spec) = query_verb_spec(verb.as_str()) else {
+        return HttpResponse::error_with_id(
             &request_id,
             ApiError::bad_request_field(format!("unknown verb '{verb}'"), "verb"),
-        ),
+        );
+    };
+    if spec.status == QueryVerbStatus::Reserved {
+        let reason = spec.reserved_reason.map_or_else(
+            || format!("verb '{verb}' is reserved and not yet implemented"),
+            str::to_owned,
+        );
+        return HttpResponse::error_with_id(
+            &request_id,
+            ApiError::new(ErrorCode::NotImplemented, reason),
+        );
     }
+    let args = QueryVerbArgs {
+        request_id: &request_id,
+        params: &params,
+        domain: &domain,
+        limit,
+        started,
+        budget,
+        as_of_valid_time: as_of_valid_time.as_deref(),
+        as_of_transaction_time: as_of_transaction_time.as_deref(),
+    };
+    spec.handler.map_or_else(
+        || {
+            HttpResponse::error_with_id(
+                &request_id,
+                ApiError::internal(format!(
+                    "verb '{verb}' is marked implemented but has no handler wired"
+                )),
+            )
+        },
+        |handler| handler(&args, state),
+    )
 }
 
 fn check_query_budget(
@@ -11246,6 +12946,35 @@ fn query_sink_read(
             Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(1)),
         }
     }
+}
+
+/// Records the agent's heartbeat in the session table.
+fn insert_agent_status(
+    state: &ServerState,
+    request_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    agent_kind: &str,
+    project_scope: &str,
+) -> Result<(), HttpResponse> {
+    let agent_status = AgentStatus {
+        agent_id: agent_id.to_owned(),
+        session_id: session_id.to_owned(),
+        agent_kind: agent_kind.to_owned(),
+        project_scope: project_scope.to_owned(),
+        last_seen_unix_ms: unix_ms(),
+    };
+    let Ok(mut agents) = state.agents.lock() else {
+        return Err(HttpResponse::error_with_id(
+            request_id,
+            ApiError::internal("agents lock poisoned"),
+        ));
+    };
+    agents.insert(
+        AgentSessionKey::new(agent_id.to_owned(), session_id.to_owned()),
+        agent_status,
+    );
+    Ok(())
 }
 
 fn handle_agent_register(request: &HttpRequest, state: &ServerState) -> HttpResponse {
@@ -11309,23 +13038,15 @@ fn handle_agent_register(request: &HttpRequest, state: &ServerState) -> HttpResp
         }
     };
 
-    let agent_status = AgentStatus {
-        agent_id: agent_id.clone(),
-        session_id: session_id.clone(),
-        agent_kind: agent_kind.clone(),
-        project_scope: project_scope.clone(),
-        last_seen_unix_ms: unix_ms(),
-    };
-    if let Ok(mut agents) = state.agents.lock() {
-        agents.insert(
-            AgentSessionKey::new(agent_id.clone(), session_id.clone()),
-            agent_status,
-        );
-    } else {
-        return HttpResponse::error_with_id(
-            &request_id,
-            ApiError::internal("agents lock poisoned"),
-        );
+    if let Err(response) = insert_agent_status(
+        state,
+        &request_id,
+        &agent_id,
+        &session_id,
+        &agent_kind,
+        &project_scope,
+    ) {
+        return response;
     }
 
     let reg = AgentRegisterFull {
@@ -11337,7 +13058,13 @@ fn handle_agent_register(request: &HttpRequest, state: &ServerState) -> HttpResp
     };
     let records = agent_registration_records(&reg);
     let idempotency_key = stable_pair_key("agent-register", &reg.agent_id, &reg.session_id);
-    match enqueue_write(state, idempotency_key, records, &request_id) {
+    match enqueue_write(
+        state,
+        idempotency_key,
+        records,
+        &request_id,
+        DanglingCitationPolicy::default(),
+    ) {
         Ok(response) => HttpResponse::success(
             Some(&request_id),
             200,
@@ -11552,6 +13279,7 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
                         scoped_key_thread,
                         records_clone,
                         &request_id_thread,
+                        DanglingCitationPolicy::default(),
                     );
                     match response {
                         Ok(report) => update_job(
@@ -11572,6 +13300,8 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
                                 }],
                                 record_ids: Vec::new(),
                                 idempotent: false,
+                                inserted: 0,
+                                unchanged: 0,
                             };
                             update_job(
                                 &state_clone,
@@ -11623,7 +13353,13 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
     let request_id_for_thread = request_id.clone();
     thread::spawn(move || {
         update_job(&state, &job_id_for_thread, "running", "started", None);
-        let response = enqueue_write(&state, scoped_key, payload.records, &request_id_for_thread);
+        let response = enqueue_write(
+            &state,
+            scoped_key,
+            payload.records,
+            &request_id_for_thread,
+            DanglingCitationPolicy::default(),
+        );
         match response {
             Ok(report) => update_job(
                 &state,
@@ -11643,6 +13379,8 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
                     }],
                     record_ids: Vec::new(),
                     idempotent: false,
+                    inserted: 0,
+                    unchanged: 0,
                 };
                 update_job(&state, &job_id_for_thread, "failed", "failed", Some(report));
             }
@@ -11691,6 +13429,7 @@ fn enqueue_write(
     idempotency_key: String,
     records: Vec<GraphRecord>,
     request_id: &str,
+    dangling_citation_policy: DanglingCitationPolicy,
 ) -> WriteResult {
     let payload_hash =
         records_hash(&records).map_err(|error| ApiError::internal(error.to_string()))?;
@@ -11699,6 +13438,7 @@ fn enqueue_write(
         idempotency_key,
         payload_hash,
         records,
+        dangling_citation_policy,
         response_tx,
     };
     // Count the in-flight write before the worker can observe it, so the
@@ -11837,17 +13577,14 @@ fn parse_json<T: for<'de> Deserialize<'de>>(body: &[u8]) -> std::result::Result<
     serde_json::from_slice(body).map_err(|error| ApiError::bad_request(error.to_string()))
 }
 
-fn is_authorized(request: &HttpRequest, token: &str) -> bool {
-    headers_authorized(&request.headers, token)
+fn authorize_request(request: &HttpRequest, tokens: &TokenRotationState) -> AuthVerdict {
+    tokens.authorize_presented(&request.headers)
 }
 
-fn headers_authorized(headers: &HashMap<String, String>, token: &str) -> bool {
-    headers
-        .get("authorization")
-        .is_some_and(|header| header == &format!("Bearer {token}"))
-}
-
-fn read_http_request(stream: &mut TcpStream, token: &str) -> io::Result<HttpRequest> {
+fn read_http_request(
+    stream: &mut TcpStream,
+    tokens: &TokenRotationState,
+) -> io::Result<HttpRequest> {
     let started = Instant::now();
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 1024];
@@ -11895,7 +13632,10 @@ fn read_http_request(stream: &mut TcpStream, token: &str) -> io::Result<HttpRequ
         .get("content-length")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or_default();
-    if !headers_authorized(&headers, token) {
+    if !matches!(
+        tokens.authorize_presented(&headers),
+        AuthVerdict::Authorized
+    ) {
         return Ok(HttpRequest {
             method,
             path,
@@ -12745,6 +14485,7 @@ fn unix_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::ingest_records;
 
     /// Builds a same-id (`n:task`) Task record batch from a forward sequence of
     /// per-record importer attributions: `Some(kind)` mints a Task carrying that
@@ -12876,6 +14617,7 @@ mod tests {
                     frame_resolution: None,
                     frame_index: None,
                     basis: None,
+                    call_site_spans: None,
                     is_exhaustive: None,
                     temporal: None,
                     summary: "x edge".to_owned(),
@@ -13089,6 +14831,7 @@ mod tests {
                         frame_resolution: None,
                         frame_index: None,
                         basis: None,
+                        call_site_spans: None,
                         is_exhaustive: None,
                         temporal: None,
                         summary: "shadow".to_owned(),
@@ -13207,7 +14950,10 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("client should connect");
             let started = Instant::now();
-            let result = read_http_request(&mut stream, "test-token");
+            let result = read_http_request(
+                &mut stream,
+                &TokenRotationState::new("test-token".to_owned(), None),
+            );
             (started.elapsed(), result.map_err(|error| error.kind()))
         });
         let client = thread::spawn(move || {
@@ -13253,7 +14999,7 @@ mod tests {
             IdempotencyStore::load(idempotency_path).context("idempotency store")?,
         ));
         let state = ServerState {
-            token: "test-token".to_owned(),
+            tokens: Arc::new(TokenRotationState::new("test-token".to_owned(), None)),
             store_identity: store_identity_text(temp.path()),
             sink: Arc::clone(&sink),
             write_tx,
@@ -13263,6 +15009,8 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             pressure: Arc::new(PressureTracker::new(1)),
             error_counters: Arc::new(ErrorCounters::new()),
+            storage_mode: "plaintext".to_owned(),
+            key_source: None,
         };
         let request = HttpRequest {
             method: "POST".to_owned(),
@@ -13311,6 +15059,10 @@ mod tests {
             failures: Vec::new(),
             record_ids: vec![record.id().to_owned()],
             idempotent: false,
+            // The cached entry describes the original committed write
+            // (issue #130).
+            inserted: 1,
+            unchanged: 0,
         };
         let idempotency = Arc::new(Mutex::new(IdempotencyStore {
             path: temp.path().join("idempotency.json"),
@@ -13327,6 +15079,7 @@ mod tests {
             idempotency_key: "committed-key".to_owned(),
             payload_hash,
             records: vec![record],
+            dangling_citation_policy: DanglingCitationPolicy::default(),
             response_tx,
         };
 
@@ -13365,7 +15118,7 @@ mod tests {
             entries: BTreeMap::new(),
         }));
         let state = ServerState {
-            token: "test-token".to_owned(),
+            tokens: Arc::new(TokenRotationState::new("test-token".to_owned(), None)),
             store_identity: store_identity_text(temp.path()),
             sink,
             write_tx,
@@ -13375,6 +15128,8 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             pressure: Arc::new(PressureTracker::new(1)),
             error_counters: Arc::new(ErrorCounters::new()),
+            storage_mode: "plaintext".to_owned(),
+            key_source: None,
         };
 
         let read_response = handle_get_record(&record_id, &state);
@@ -13472,7 +15227,7 @@ mod tests {
             entries: BTreeMap::new(),
         }));
         let state = ServerState {
-            token: "test-token".to_owned(),
+            tokens: Arc::new(TokenRotationState::new("test-token".to_owned(), None)),
             store_identity: store_identity_text(temp.path()),
             sink,
             write_tx,
@@ -13482,6 +15237,8 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             pressure: Arc::new(PressureTracker::new(1)),
             error_counters: Arc::new(ErrorCounters::new()),
+            storage_mode: "plaintext".to_owned(),
+            key_source: None,
         };
 
         // Direct lookup must not serve the retracted record's content.
@@ -13597,7 +15354,7 @@ mod tests {
             entries: BTreeMap::new(),
         }));
         let state = ServerState {
-            token: "test-token".to_owned(),
+            tokens: Arc::new(TokenRotationState::new("test-token".to_owned(), None)),
             store_identity: store_identity_text(temp.path()),
             sink,
             write_tx,
@@ -13607,6 +15364,8 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             pressure: Arc::new(PressureTracker::new(1)),
             error_counters: Arc::new(ErrorCounters::new()),
+            storage_mode: "plaintext".to_owned(),
+            key_source: None,
         };
 
         let response = handle_get_all_records(&state);
@@ -13724,7 +15483,7 @@ mod tests {
             entries: BTreeMap::new(),
         }));
         let state = ServerState {
-            token: "test-token".to_owned(),
+            tokens: Arc::new(TokenRotationState::new("test-token".to_owned(), None)),
             store_identity: store_identity_text(temp.path()),
             sink,
             write_tx,
@@ -13734,6 +15493,8 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             pressure: Arc::new(PressureTracker::new(1)),
             error_counters: Arc::new(ErrorCounters::new()),
+            storage_mode: "plaintext".to_owned(),
+            key_source: None,
         };
 
         let response = handle_get_all_records(&state);
@@ -13805,6 +15566,8 @@ mod tests {
             transports: None,
             token_expires_at_unix_ms: None,
             daemons_index_url: None,
+            storage_mode: "plaintext".to_owned(),
+            key_source: None,
         };
         write_metadata(&data_dir, &metadata)?;
 
@@ -13837,6 +15600,8 @@ mod tests {
             transports: None,
             token_expires_at_unix_ms: None,
             daemons_index_url: None,
+            storage_mode: "plaintext".to_owned(),
+            key_source: None,
         };
         write_metadata(&data_dir, &metadata)?;
         let runtime_dir = runtime_dir(&data_dir);
@@ -13896,6 +15661,7 @@ mod tests {
                 idempotency_key: idempotency_key.to_owned(),
                 payload_hash: records_hash(std::slice::from_ref(&record))?,
                 records: vec![record.clone()],
+                dangling_citation_policy: DanglingCitationPolicy::default(),
                 response_tx,
             };
             let response = apply_write(&command, &sink, &idempotency)
@@ -13962,6 +15728,7 @@ mod tests {
                 idempotency_key: idempotency_key.to_owned(),
                 payload_hash: records_hash(&records)?,
                 records: records.clone(),
+                dangling_citation_policy: DanglingCitationPolicy::default(),
                 response_tx,
             };
             let response = apply_write(&command, &sink, &idempotency)
@@ -13998,7 +15765,7 @@ mod tests {
             entries: BTreeMap::new(),
         }));
         let state = ServerState {
-            token: "test-token".to_owned(),
+            tokens: Arc::new(TokenRotationState::new("test-token".to_owned(), None)),
             store_identity: store_identity_text(temp),
             sink,
             write_tx: write_tx.clone(),
@@ -14008,6 +15775,8 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             pressure: Arc::new(PressureTracker::new(capacity)),
             error_counters: Arc::new(ErrorCounters::new()),
+            storage_mode: "plaintext".to_owned(),
+            key_source: None,
         };
         // The caller keeps `write_rx` alive so the bounded channel reports
         // `Full` (not `Disconnected`) once its buffer fills.
@@ -14020,6 +15789,7 @@ mod tests {
             idempotency_key: "queue-filler".to_owned(),
             payload_hash: "queue-filler-hash".to_owned(),
             records: Vec::new(),
+            dangling_citation_policy: DanglingCitationPolicy::default(),
             response_tx,
         }
     }
@@ -14183,6 +15953,7 @@ mod tests {
             "pressure-overflow-key".to_owned(),
             vec![record],
             "req-overload",
+            DanglingCitationPolicy::default(),
         )
         .expect_err("overloaded write must be rejected");
         assert_eq!(rejection.code, ErrorCode::QueueFull);
@@ -14346,8 +16117,14 @@ mod tests {
                 .try_send(dummy_write_command())
                 .map_err(|_| anyhow!("queue filler should buffer"))?;
         }
-        let rejection = enqueue_write(&state, "overflow-key".to_owned(), Vec::new(), "req-oflow")
-            .expect_err("overloaded write must be rejected");
+        let rejection = enqueue_write(
+            &state,
+            "overflow-key".to_owned(),
+            Vec::new(),
+            "req-oflow",
+            DanglingCitationPolicy::default(),
+        )
+        .expect_err("overloaded write must be rejected");
         assert_eq!(rejection.code, ErrorCode::QueueFull);
 
         // (timeout) Real rendered envelope from the timeout constructor.
@@ -14446,9 +16223,12 @@ mod tests {
             "idempotency_store_size",
             "jobs",
             "jobs_by_state",
+            "key_source",
             "oldest_active_job",
             "pressure",
             "status",
+            "storage_mode",
+            "token_rotation",
         ];
         let actual: Vec<String> = keys.iter().map(|k| (*k).clone()).collect();
         assert_eq!(
@@ -14475,6 +16255,16 @@ mod tests {
                 "oldest_active_job.{field} must be an integer, got {value}"
             );
         }
+        // token_rotation carries rotation metadata only — never token material.
+        for (field, value) in body["token_rotation"]
+            .as_object()
+            .expect("token_rotation object")
+        {
+            assert!(
+                value.is_boolean() || value.is_u64() || value.is_i64() || value.is_null(),
+                "token_rotation.{field} must be a bool/integer/null, got {value}"
+            );
+        }
         Ok(())
     }
 
@@ -14495,8 +16285,14 @@ mod tests {
                 .try_send(dummy_write_command())
                 .map_err(|_| anyhow!("queue filler should buffer"))?;
         }
-        enqueue_write(&state, "compose-key".to_owned(), Vec::new(), "req-compose")
-            .expect_err("overloaded write must be rejected");
+        enqueue_write(
+            &state,
+            "compose-key".to_owned(),
+            Vec::new(),
+            "req-compose",
+            DanglingCitationPolicy::default(),
+        )
+        .expect_err("overloaded write must be rejected");
 
         let body = handle_status(&state).body;
         assert_eq!(body["pressure"]["state"], "saturated");
@@ -14611,6 +16407,7 @@ mod tests {
             idempotency_key: key.to_owned(),
             payload_hash,
             records: records.to_vec(),
+            dangling_citation_policy: DanglingCitationPolicy::default(),
             response_tx,
         })
     }
@@ -14711,7 +16508,7 @@ mod tests {
 
         let (write_tx, _write_rx) = mpsc::sync_channel(1);
         let state = ServerState {
-            token: "test-token".to_owned(),
+            tokens: Arc::new(TokenRotationState::new("test-token".to_owned(), None)),
             store_identity: store_identity_text(temp.path()),
             sink,
             write_tx,
@@ -14721,6 +16518,8 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             pressure: Arc::new(PressureTracker::new(1)),
             error_counters: Arc::new(ErrorCounters::new()),
+            storage_mode: "plaintext".to_owned(),
+            key_source: None,
         };
 
         let response = handle_get_record(&obs_id, &state);
@@ -15277,6 +17076,10 @@ mod tests {
                     failures: Vec::new(),
                     record_ids: vec!["codegraph:v1:clean".to_owned()],
                     idempotent: false,
+                    // The receipt describes the original committed write
+                    // (issue #130).
+                    inserted: 1,
+                    unchanged: 0,
                 },
             },
         );
@@ -15475,5 +17278,830 @@ mod tests {
         );
         assert_eq!(obj["record_id"], "semantic:v1:unresolved");
         assert_eq!(obj["score"], 0.5);
+    }
+
+    // ── Issue #166: daemon capability manifest ─────────────────────────────
+    // RED: these tests fail until the capability manifest (GET
+    // /v1/capabilities, the QUERY_VERB_TABLE registry, and
+    // schema_version::accepted_record_tuples) exists.
+
+    /// Builds an empty-store daemon state for capability tests.
+    fn capability_test_state() -> Result<(ServerState, tempfile::TempDir)> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let sink = Arc::new(RwLock::new(
+            EmbeddedAletheiaSink::open(temp.path()).map_err(|error| anyhow!(error.to_string()))?,
+        ));
+        let (write_tx, _write_rx) = mpsc::sync_channel(1);
+        let idempotency = Arc::new(Mutex::new(
+            IdempotencyStore::load(temp.path().join("idempotency.json"))
+                .context("idempotency store")?,
+        ));
+        let state = ServerState {
+            tokens: Arc::new(TokenRotationState::new("cap-test-token".to_owned(), None)),
+            store_identity: store_identity_text(temp.path()),
+            sink,
+            write_tx,
+            jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            agents: Arc::new(Mutex::new(BTreeMap::new())),
+            idempotency,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            pressure: Arc::new(PressureTracker::new(1)),
+            error_counters: Arc::new(ErrorCounters::new()),
+            storage_mode: "plaintext".to_owned(),
+            key_source: None,
+        };
+        Ok((state, temp))
+    }
+
+    /// Builds a Bearer <redacted> request for capability tests.
+    fn capability_request(method: &str, path: &str, body: &serde_json::Value) -> HttpRequest {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "authorization".to_owned(),
+            "Bearer cap-test-token".to_owned(),
+        );
+        HttpRequest {
+            method: method.to_owned(),
+            path: path.to_owned(),
+            headers,
+            body: serde_json::to_vec(&body).expect("test body serializes"),
+        }
+    }
+
+    /// Minimal per-verb params that must NOT trip `not_implemented` for an
+    /// implemented verb against an empty store. The `panic!` is deliberate: a
+    /// verb added to the dispatch table without probe params fails loudly
+    /// here instead of silently skipping the cross-check.
+    fn capability_probe_params(verb: &str) -> serde_json::Value {
+        match verb {
+            "get_records" => json!({ "record_ids": [] }),
+            "symbol_by_name" | "observations_for_symbol" => {
+                json!({ "name": "capability-probe-missing-symbol" })
+            }
+            "symbol_at_commit" => json!({
+                "name": "capability-probe-missing-symbol",
+                "commit": "deadbee",
+            }),
+            "file_defines" => json!({ "repo_relative_path": "capability-probe-missing.rs" }),
+            "locate" => json!({
+                "repo_relative_path": "capability-probe-missing.rs",
+                "line": 1,
+            }),
+            "drift_top_n" | "clone_classes" | "semantic_search" | "drift" => json!({}),
+            "criteria_for_task" => json!({ "task_id": "capability-probe-missing-task" }),
+            "agent_sessions_for_repo" => json!({ "repo": "capability-probe-missing-repo" }),
+            "tests_for_symbol" => json!({ "handle": "capability-probe-missing-symbol" }),
+            other => panic!(
+                "capability probe has no canned params for verb '{other}'; \
+                 add them to capability_probe_params"
+            ),
+        }
+    }
+
+    /// Fetches the live capability manifest through the real route.
+    fn get_capabilities(state: &ServerState) -> HttpResponse {
+        dispatch_request(
+            &capability_request("GET", "/v1/capabilities", &json!({})),
+            state,
+        )
+    }
+
+    /// AC1 + AC2: discovery needs no verb knowledge (plain GET route) and
+    /// reports the API version plus `DAEMON_QUERY_SCHEMA_VERSION`.
+    #[test]
+    fn capabilities_reports_api_and_query_schema_versions() -> Result<()> {
+        let (state, _temp) = capability_test_state()?;
+        let response = get_capabilities(&state);
+        assert_eq!(
+            response.status, 200,
+            "GET /v1/capabilities must succeed: {}",
+            response.body
+        );
+        assert_eq!(
+            response.body["api_version"].as_str(),
+            Some("v1"),
+            "manifest must report api_version \"v1\""
+        );
+        assert_eq!(
+            response.body["daemon_query_schema_version"],
+            serde_json::Value::from(DAEMON_QUERY_SCHEMA_VERSION),
+            "manifest must report the DAEMON_QUERY_SCHEMA_VERSION value"
+        );
+        Ok(())
+    }
+
+    /// AC3 + AC7: the manifest lists every verb in the dispatch registry with
+    /// an explicit `implemented`/`reserved` status, byte-equal after sorting;
+    /// every advertised verb is genuinely dispatchable (never "unknown verb").
+    #[test]
+    fn capabilities_manifest_matches_dispatch_table_without_drift() -> Result<()> {
+        let (state, _temp) = capability_test_state()?;
+        let response = get_capabilities(&state);
+        assert_eq!(response.status, 200, "{}", response.body);
+        let verbs = response.body["verbs"]
+            .as_array()
+            .expect("manifest must carry a verbs array");
+        let mut manifest: Vec<(String, String)> = verbs
+            .iter()
+            .map(|v| {
+                (
+                    v["name"].as_str().expect("verb name").to_owned(),
+                    v["status"].as_str().expect("verb status").to_owned(),
+                )
+            })
+            .collect();
+        manifest.sort();
+        let mut expected: Vec<(String, String)> = QUERY_VERB_TABLE
+            .iter()
+            .map(|spec| (spec.name.to_owned(), spec.status.as_str().to_owned()))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            manifest, expected,
+            "capability manifest must list every dispatch-table verb with its \
+             status (no silent drift either way)"
+        );
+        for (name, status) in &manifest {
+            assert!(
+                status == "implemented" || status == "reserved",
+                "verb '{name}' has unexpected status '{status}'"
+            );
+            // AC7, reverse direction: everything the manifest advertises must
+            // be dispatchable — an "unknown verb" here means the manifest and
+            // the dispatcher disagree.
+            let body = json!({
+                "request_id": format!("cap-drift-{name}"),
+                "verb": name,
+                "params": capability_probe_params(name),
+            });
+            let dispatched = handle_query(&capability_request("POST", "/v1/query", &body), &state);
+            let message = dispatched.body["error"]["message"].as_str().unwrap_or("");
+            assert!(
+                !message.contains("unknown verb"),
+                "manifest advertises verb '{name}' but dispatch rejects it: {message}"
+            );
+        }
+        Ok(())
+    }
+
+    /// AC4: the set of verbs reported `implemented` is byte-equal (after
+    /// sorting) to the set of verbs that do NOT return `not_implemented` when
+    /// actually invoked against the same daemon.
+    #[test]
+    fn capabilities_implemented_set_matches_live_dispatch() -> Result<()> {
+        let (state, _temp) = capability_test_state()?;
+        let mut live_implemented: Vec<&str> = Vec::new();
+        for spec in QUERY_VERB_TABLE {
+            let body = json!({
+                "request_id": format!("cap-probe-{}", spec.name),
+                "verb": spec.name,
+                "params": capability_probe_params(spec.name),
+            });
+            let response = handle_query(&capability_request("POST", "/v1/query", &body), &state);
+            let code = response.body["error"]["code"].as_str();
+            match spec.status {
+                QueryVerbStatus::Implemented => {
+                    assert_ne!(
+                        code,
+                        Some("not_implemented"),
+                        "verb '{}' is manifest-implemented but live dispatch \
+                         returned not_implemented: {}",
+                        spec.name,
+                        response.body
+                    );
+                    live_implemented.push(spec.name);
+                }
+                QueryVerbStatus::Reserved => {
+                    assert_eq!(
+                        response.status, 501,
+                        "reserved verb '{}' must answer HTTP 501: {}",
+                        spec.name, response.body
+                    );
+                    assert_eq!(
+                        code,
+                        Some("not_implemented"),
+                        "reserved verb '{}' must return not_implemented: {}",
+                        spec.name,
+                        response.body
+                    );
+                }
+            }
+        }
+        live_implemented.sort_unstable();
+        let mut manifest_implemented: Vec<&str> = QUERY_VERB_TABLE
+            .iter()
+            .filter(|spec| spec.status == QueryVerbStatus::Implemented)
+            .map(|spec| spec.name)
+            .collect();
+        manifest_implemented.sort_unstable();
+        assert_eq!(
+            live_implemented, manifest_implemented,
+            "verbs not returning not_implemented under live dispatch must be \
+             byte-equal (after sorting) to the manifest's implemented set"
+        );
+        Ok(())
+    }
+
+    /// AC5: the manifest lists the record `(domain, kind, schema_version)`
+    /// tuples the daemon accepts, with zero drift from the real
+    /// `is_known_record_version` gate — a client can detect an
+    /// `unknown_schema_version` mismatch before sending records.
+    #[test]
+    fn capabilities_record_tuples_match_schema_gate_without_drift() -> Result<()> {
+        // Function-scoped: the lib build must not carry an import used only
+        // by this test.
+        use crate::schema_version::is_known_record_version;
+        let (state, _temp) = capability_test_state()?;
+        let response = get_capabilities(&state);
+        assert_eq!(response.status, 200, "{}", response.body);
+        let tuples = response.body["accepted_record_tuples"]
+            .as_array()
+            .expect("manifest must carry an accepted_record_tuples array");
+        assert!(
+            !tuples.is_empty(),
+            "manifest must list at least one accepted record tuple"
+        );
+        // Every manifest tuple is accepted by the real gate (kind is not
+        // gated by the daemon, so probe with a concrete kind).
+        for tuple in tuples {
+            let domain = tuple["domain"].as_str().expect("tuple domain");
+            let kind = tuple["kind"].as_str().expect("tuple kind");
+            let version = u32::try_from(
+                tuple["schema_version"]
+                    .as_u64()
+                    .expect("tuple schema_version"),
+            )
+            .expect("schema_version fits in u32");
+            assert_eq!(
+                kind, "*",
+                "tuple kind must be the documented wildcard: {tuple}"
+            );
+            assert!(
+                is_known_record_version(&RecordVersion::new(domain, "ProbeKind", version)),
+                "manifest tuple ({domain}, v{version}) is rejected by \
+                 is_known_record_version"
+            );
+        }
+        // No drift either way: sweep the gate's input space and require the
+        // manifest to agree exactly.
+        let manifest_set: std::collections::BTreeSet<(String, u32)> = tuples
+            .iter()
+            .map(|tuple| {
+                (
+                    tuple["domain"].as_str().expect("tuple domain").to_owned(),
+                    u32::try_from(
+                        tuple["schema_version"]
+                            .as_u64()
+                            .expect("tuple schema_version"),
+                    )
+                    .expect("schema_version fits in u32"),
+                )
+            })
+            .collect();
+        // Sanity: the builder and the manifest agree (the response is built
+        // from `accepted_record_tuples`).
+        let built_set: std::collections::BTreeSet<(String, u32)> = accepted_record_tuples()
+            .iter()
+            .map(|tuple| (tuple.domain.clone(), tuple.version))
+            .collect();
+        assert_eq!(
+            manifest_set, built_set,
+            "GET /v1/capabilities must be built from accepted_record_tuples"
+        );
+        let max_probe = crate::ir::SCHEMA_VERSION + 2;
+        for domain in [
+            "codegraph",
+            "agent_memory",
+            "verification",
+            "artifact",
+            "project",
+            "semantic",
+            "user_context",
+            "log",
+            "control_catalog",
+            "bogus_domain",
+        ] {
+            for version in 0..=max_probe {
+                let known =
+                    is_known_record_version(&RecordVersion::new(domain, "ProbeKind", version));
+                let listed = manifest_set.contains(&(domain.to_owned(), version));
+                assert_eq!(
+                    known, listed,
+                    "manifest disagrees with is_known_record_version for \
+                     ({domain}, v{version})"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn depends_on_edge_validation_requires_task_endpoints() -> Result<()> {
+        // Issue #161: the daemon admits DEPENDS_ON only as Task -> Task.
+        // Self-loops pass validation as structural input; the query lane
+        // reports them as cycle diagnostics.
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let sink =
+            EmbeddedAletheiaSink::open(temp.path()).map_err(|error| anyhow!(error.to_string()))?;
+        let records = vec![
+            GraphRecord::node(
+                "t:1".to_owned(),
+                NodeKind::Task,
+                None,
+                None,
+                None,
+                "task one".to_owned(),
+            ),
+            GraphRecord::node(
+                "t:2".to_owned(),
+                NodeKind::Task,
+                None,
+                None,
+                None,
+                "task two".to_owned(),
+            ),
+            GraphRecord::node(
+                "ac:1".to_owned(),
+                NodeKind::AcceptanceCriterion,
+                None,
+                None,
+                None,
+                "criterion".to_owned(),
+            ),
+        ];
+        let validate = |source: &str, target: &str| {
+            validate_project_edge(
+                "edge:probe",
+                PROJECT_SCHEMA_VERSION,
+                EdgeLabel::DependsOn,
+                source,
+                target,
+                None,
+                &records,
+                &sink,
+            )
+        };
+
+        assert!(
+            validate("t:1", "t:2").is_ok(),
+            "Task -> Task DEPENDS_ON must be accepted"
+        );
+        assert!(
+            validate("t:1", "t:1").is_ok(),
+            "self-loop DEPENDS_ON must pass validation as structural input"
+        );
+
+        let err = validate("t:1", "ac:1")
+            .expect_err("Task -> AcceptanceCriterion DEPENDS_ON must be rejected");
+        assert!(
+            err.message.contains("invalid target kind"),
+            "unexpected rejection message: {}",
+            err.message
+        );
+
+        let err = validate("ac:1", "t:1")
+            .expect_err("AcceptanceCriterion -> Task DEPENDS_ON must be rejected");
+        assert!(
+            err.message.contains("invalid source kind"),
+            "unexpected rejection message: {}",
+            err.message
+        );
+
+        let err = validate("t:1", "missing").expect_err("dangling target must be rejected");
+        assert!(
+            err.message.contains("target not found"),
+            "unexpected rejection message: {}",
+            err.message
+        );
+        Ok(())
+    }
+
+    // ---- Issue #70: daemon access-token rotation ----
+    //
+    // RED tests: these reference the rotation API (`TokenRotationState`,
+    // `AuthVerdict`, `constant_time_eq`, `ApiError::token_rotated`,
+    // `DaemonConfig::token_ttl_ms`, `DaemonClient::refreshed`) before it
+    // exists. They must fail to compile until the implementation lands.
+
+    #[test]
+    fn token_constant_time_eq_matches_only_identical_bytes() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"ab", b"abc"));
+        assert!(!constant_time_eq(b"", b"a"));
+    }
+
+    #[test]
+    fn token_rotation_authorize_verdicts() {
+        // ttl 60_000 ms -> cutover grace = 30_000 ms, history retention = 60_000 ms.
+        let state = TokenRotationState::new("current-token".to_owned(), Some(60_000));
+        assert!(state.rotation_enabled());
+        assert_eq!(state.rotation_count(), 0);
+        assert_eq!(
+            state.authorize_at("current-token", 1_000),
+            AuthVerdict::Authorized
+        );
+        assert_eq!(
+            state.authorize_at("never-issued", 1_000),
+            AuthVerdict::Denied
+        );
+        assert_eq!(state.authorize_at("", 1_000), AuthVerdict::Denied);
+
+        // Rotate at t=2_000: the old token enters the cutover window.
+        state.commit_rotation_at("next-token".to_owned(), 2_000);
+        assert_eq!(state.rotation_count(), 1);
+        assert_eq!(
+            state.authorize_at("next-token", 2_001),
+            AuthVerdict::Authorized
+        );
+        assert_eq!(
+            state.authorize_at("current-token", 2_001),
+            AuthVerdict::Authorized,
+            "superseded token must stay valid inside the cutover window"
+        );
+        // Past the cutover window (t + grace): the old token is superseded.
+        assert_eq!(
+            state.authorize_at("current-token", 2_000 + 30_000),
+            AuthVerdict::Superseded
+        );
+        assert_eq!(
+            state.authorize_at("current-token", 2_000 + 30_000 + 59_999),
+            AuthVerdict::Superseded
+        );
+        // Unknown tokens are never reported as rotated.
+        assert_eq!(
+            state.authorize_at("never-issued", 40_000),
+            AuthVerdict::Denied
+        );
+        // Past history retention (t + grace + ttl): the old token is
+        // indistinguishable from an unknown one and fails closed.
+        assert_eq!(
+            state.authorize_at("current-token", 2_000 + 30_000 + 60_000),
+            AuthVerdict::Denied
+        );
+    }
+
+    #[test]
+    fn token_rotation_tracks_expiry() {
+        let before = unix_ms();
+        let state = TokenRotationState::new("t0".to_owned(), Some(10_000));
+        let expiry = state
+            .current_expiry_unix_ms()
+            .expect("rotation enabled: expiry must be bounded");
+        assert!(
+            expiry >= before + 10_000,
+            "expiry must be issued-at + ttl, got {expiry}"
+        );
+        state.commit_rotation_at("t1".to_owned(), before + 10_000);
+        assert_eq!(
+            state.current_expiry_unix_ms(),
+            Some(before + 20_000),
+            "expiry must advance one full ttl per rotation"
+        );
+
+        let disabled = TokenRotationState::new("t0".to_owned(), None);
+        assert!(!disabled.rotation_enabled());
+        assert_eq!(disabled.current_expiry_unix_ms(), None);
+        assert_eq!(
+            disabled.authorize_at("t0", before + 1_000_000),
+            AuthVerdict::Authorized,
+            "without rotation the single token never expires"
+        );
+    }
+
+    #[test]
+    fn token_rotated_error_is_stable_and_redacted() {
+        let response = HttpResponse::error(ApiError::token_rotated());
+        assert_eq!(response.status, 401);
+        assert_eq!(response.body["error"]["code"], "token_rotated");
+        let message = response.body["error"]["message"]
+            .as_str()
+            .expect("token_rotated carries a message");
+        assert!(
+            message.contains("re-read"),
+            "diagnostic must name the recovery step, got: {message}"
+        );
+        let wire = serde_json::to_string(&response.body).expect("envelope serializes");
+        assert!(
+            !wire.contains("Bearer"),
+            "error envelope must never carry token material: {wire}"
+        );
+    }
+
+    #[test]
+    fn token_rotated_response_detection() {
+        let rotated =
+            json!({"ok": false, "error": {"code": "token_rotated", "message": "rotated"}})
+                .to_string();
+        assert!(response_is_token_rotated(401, &rotated));
+        let unauthorized =
+            json!({"ok": false, "error": {"code": "unauthorized", "message": "nope"}}).to_string();
+        assert!(!response_is_token_rotated(401, &unauthorized));
+        assert!(!response_is_token_rotated(200, &rotated));
+        assert!(!response_is_token_rotated(401, "not json"));
+        assert!(!response_is_token_rotated(401, "{}"));
+    }
+
+    #[test]
+    fn daemon_client_errors_never_carry_token_material() -> Result<()> {
+        let sentinel = "SENTINEL-TOKEN-MUST-NOT-LEAK-12345";
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let metadata = DaemonMetadata {
+            schema_version: DAEMON_RUNTIME_SCHEMA_VERSION,
+            pid: 1,
+            address: "127.0.0.1:1".to_owned(),
+            token: sentinel.to_owned(),
+            data_dir: temp.path().to_path_buf(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            started_at_unix_ms: 0,
+            state: DaemonState::Running,
+            api_version: None,
+            transports: None,
+            token_expires_at_unix_ms: None,
+            daemons_index_url: None,
+            storage_mode: "plaintext".to_owned(),
+            key_source: None,
+        };
+        let client = DaemonClient::new(metadata);
+        let error = client
+            .status()
+            .expect_err("dead port must fail the status request");
+        let rendered = format!("{error:?}");
+        assert!(
+            !rendered.contains(sentinel),
+            "client error leaked token material: {rendered}"
+        );
+        Ok(())
+    }
+
+    /// Spawns a real daemon via `run_foreground` in a background thread and
+    /// waits until it is healthy. The caller must shut it down with
+    /// [`stop_foreground_daemon`].
+    fn spawn_foreground_daemon(
+        data_dir: &Path,
+        token_ttl_ms: Option<u64>,
+    ) -> Result<(thread::JoinHandle<Result<()>>, DaemonMetadata)> {
+        let mut config = DaemonConfig::new(data_dir.to_path_buf());
+        config.host = "127.0.0.1".to_owned();
+        config.port = 0;
+        config.token_ttl_ms = token_ttl_ms;
+        let handle = thread::spawn(move || run_foreground(&config));
+        let metadata = wait_until_running(data_dir)?;
+        Ok((handle, metadata))
+    }
+
+    fn stop_foreground_daemon(
+        handle: thread::JoinHandle<Result<()>>,
+        data_dir: &Path,
+    ) -> Result<()> {
+        let metadata = read_metadata(data_dir)?;
+        DaemonClient::new(metadata).shutdown()?;
+        wait_until_stopped(data_dir)?;
+        handle
+            .join()
+            .map_err(|_| anyhow!("daemon thread panicked"))?
+    }
+
+    /// Polls `egregored.json` until the daemon publishes a different token.
+    fn wait_for_token_change(data_dir: &Path, old_token: &str) -> Result<String> {
+        let start = Instant::now();
+        loop {
+            let current = read_metadata(data_dir)?.token;
+            if current != old_token {
+                return Ok(current);
+            }
+            if start.elapsed() > Duration::from_secs(15) {
+                anyhow::bail!("daemon did not rotate its token within 15s");
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn rotation_probe_record(id: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some("repo".to_owned()),
+            "rotation probe".to_owned(),
+        )
+    }
+
+    #[test]
+    fn rotation_preserves_client_continuity_across_five_cycles() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let data_dir = temp.path().join("store");
+        // ttl 1500 ms -> cutover grace 750 ms. Attempt each cycle after the
+        // old token is firmly superseded so the re-read + retry path is
+        // exercised deterministically.
+        let ttl_ms = 1_500u64;
+        let (handle, _metadata) = spawn_foreground_daemon(&data_dir, Some(ttl_ms))?;
+        let mut max_reconnect = Duration::ZERO;
+        for cycle in 0..5 {
+            // Build the client from the pre-rotation metadata so it is exactly
+            // one generation stale: the daemon reports token_rotated and the
+            // client recovers via metadata re-read. A client that never
+            // re-reads would age past the distinguishability window (one ttl
+            // past supersession) and fail closed with unauthorized by design,
+            // so the client must be refreshed to the pre-rotation token each
+            // cycle rather than reused across all five.
+            let stale_client = DaemonClient::from_data_dir(&data_dir)?;
+            let old_token = read_metadata(&data_dir)?.token;
+            wait_for_token_change(&data_dir, &old_token)?;
+            thread::sleep(Duration::from_millis(ttl_ms / 2 + 200));
+            let started = Instant::now();
+            let (records, _, _) = stale_client.get_all_records().with_context(|| {
+                format!("cycle {cycle}: stale client must recover via metadata re-read")
+            })?;
+            let elapsed = started.elapsed();
+            max_reconnect = max_reconnect.max(elapsed);
+            let _ = records;
+        }
+        assert!(
+            max_reconnect < Duration::from_secs(1),
+            "post-rotation reconnect must stay under 1s, took {max_reconnect:?}"
+        );
+        stop_foreground_daemon(handle, &data_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn superseded_token_accepted_inside_cutover_window() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let data_dir = temp.path().join("store");
+        let (handle, metadata) = spawn_foreground_daemon(&data_dir, Some(1_500))?;
+        let old_token = metadata.token;
+        wait_for_token_change(&data_dir, &old_token)?;
+        // Immediately after rotation the old token is inside the cutover
+        // window (grace = ttl / 2) and must still authenticate.
+        let stale = DaemonClient::new(DaemonMetadata {
+            token: old_token,
+            ..read_metadata(&data_dir)?
+        });
+        let (status, _) = stale.request("GET", "/v1/status", None, CLIENT_TIMEOUT, true)?;
+        assert_eq!(
+            status, 200,
+            "superseded token must authenticate inside the cutover window"
+        );
+        stop_foreground_daemon(handle, &data_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn superseded_token_rejected_after_cutover_window() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let data_dir = temp.path().join("store");
+        let ttl_ms = 1_500u64;
+        let (handle, metadata) = spawn_foreground_daemon(&data_dir, Some(ttl_ms))?;
+        let old_token = metadata.token;
+        wait_for_token_change(&data_dir, &old_token)?;
+        thread::sleep(Duration::from_millis(ttl_ms / 2 + 200));
+        let stale = DaemonClient::new(DaemonMetadata {
+            token: old_token.clone(),
+            ..read_metadata(&data_dir)?
+        });
+        for attempt in 0..10 {
+            let body_value = json!({
+                "request_id": format!("rotation-reject-{attempt}"),
+                "agent_id": "agent-1",
+                "session_id": "sess-1",
+                "idempotency_key": format!("rotation-reject-key-{attempt}"),
+                "domain": "codegraph",
+                "created_at": chrono::Utc::now().to_rfc3339(),
+                "payload": {
+                    "records": [rotation_probe_record(
+                        &format!("codegraph:v3:rotation-rejected-{attempt}")
+                    )],
+                    "dangling_citation_policy": "quarantine",
+                },
+            });
+            let (status, body) = stale.request(
+                "POST",
+                "/v1/records/ingest",
+                Some(body_value),
+                CLIENT_OPERATION_TIMEOUT,
+                true,
+            )?;
+            assert_eq!(
+                status, 401,
+                "attempt {attempt}: superseded token must be rejected"
+            );
+            let envelope: serde_json::Value =
+                serde_json::from_str(&body).context("rejection must be a JSON envelope")?;
+            assert_eq!(
+                envelope["error"]["code"], "token_rotated",
+                "attempt {attempt}: rejection must carry the stable diagnostic"
+            );
+            assert!(
+                !body.contains(&old_token),
+                "attempt {attempt}: rejection must not echo token material"
+            );
+        }
+        // None of the rejected writes may have executed.
+        let fresh = DaemonClient::from_data_dir(&data_dir)?;
+        let (records, _, _) = fresh.get_all_records()?;
+        assert!(
+            records.is_empty(),
+            "rejected writes must never execute; store holds {} records",
+            records.len()
+        );
+        stop_foreground_daemon(handle, &data_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn restart_invalidates_old_tokens_without_duplicating_writes() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let data_dir = temp.path().join("store");
+        let (handle, metadata) = spawn_foreground_daemon(&data_dir, None)?;
+        let old_token = metadata.token.clone();
+        let client = DaemonClient::new(metadata);
+        let record = rotation_probe_record("codegraph:v3:restart-once");
+        let response = client.ingest_records(
+            std::slice::from_ref(&record),
+            "agent-1",
+            "sess-1",
+            "restart-key-1",
+            DanglingCitationPolicy::default(),
+        )?;
+        assert_eq!(response.succeeded, 1);
+        stop_foreground_daemon(handle, &data_dir)?;
+
+        let (handle2, metadata2) = spawn_foreground_daemon(&data_dir, None)?;
+        assert_ne!(
+            metadata2.token, old_token,
+            "restart must issue a fresh token"
+        );
+        // The pre-restart token is unknown to the new daemon: fail closed.
+        let stale = DaemonClient::new(DaemonMetadata {
+            token: old_token,
+            ..metadata2.clone()
+        });
+        let (status, body) = stale.request("GET", "/v1/status", None, CLIENT_TIMEOUT, true)?;
+        assert_eq!(status, 401);
+        assert!(
+            body.contains("unauthorized"),
+            "restarted daemon must not report a rotated token it never issued: {body}"
+        );
+        // Replaying the same idempotency key against the new daemon must be
+        // idempotent, not a duplicate commit.
+        let fresh = DaemonClient::new(metadata2);
+        let replay = fresh.ingest_records(
+            std::slice::from_ref(&record),
+            "agent-1",
+            "sess-1",
+            "restart-key-1",
+            DanglingCitationPolicy::default(),
+        )?;
+        assert!(
+            replay.idempotent,
+            "same idempotency key after restart must replay, got: {replay:?}"
+        );
+        let (records, _, _) = fresh.get_all_records()?;
+        assert_eq!(
+            records.len(),
+            1,
+            "committed write must not be duplicated during retry"
+        );
+        stop_foreground_daemon(handle2, &data_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rotation_retry_rereads_through_staleness_checks() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let data_dir = temp.path().join("store");
+        let (handle, metadata) = spawn_foreground_daemon(&data_dir, None)?;
+        let client = DaemonClient::new(metadata);
+        // While the daemon is live, re-reading passes the lock + liveness checks.
+        let _fresh = client.refreshed()?;
+        stop_foreground_daemon(handle, &data_dir)?;
+        // After stop the metadata is stale: re-reading must fail closed and
+        // never trust the leftover token.
+        let error = client
+            .refreshed()
+            .expect_err("re-read after stop must fail closed");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("stale"),
+            "expected a stale-metadata refusal, got: {rendered}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_rejects_zero_token_ttl() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let mut config = DaemonConfig::new(temp.path().join("store"));
+        config.token_ttl_ms = Some(0);
+        let error = run_foreground(&config).expect_err("zero ttl must be refused");
+        assert!(
+            format!("{error:?}").contains("token-ttl"),
+            "refusal must name the flag, got: {error:?}"
+        );
+        Ok(())
     }
 }

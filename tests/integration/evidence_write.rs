@@ -51,6 +51,7 @@ fn observation_rejects_empty_agent_id() {
         text: "test observation".to_owned(),
         confidence: 0.9,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:abc123")],
+        supersession: None,
     };
     let err = build_observation_records(&req).expect_err("empty agent_id must be rejected");
     assert_eq!(err.code, "missing_field");
@@ -73,6 +74,7 @@ fn observation_rejects_empty_session_id() {
         text: "session check".to_owned(),
         confidence: 0.8,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:abc123")],
+        supersession: None,
     };
     let err = build_observation_records(&req).expect_err("empty session_id must be rejected");
     assert_eq!(err.code, "missing_field");
@@ -94,6 +96,7 @@ fn observation_rejects_empty_observed_at() {
         text: "time check".to_owned(),
         confidence: 0.7,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:abc123")],
+        supersession: None,
     };
     let err = build_observation_records(&req).expect_err("empty observed_at must be rejected");
     assert_eq!(err.code, "missing_field");
@@ -110,6 +113,7 @@ fn observation_rejects_missing_source_handle() {
         text: "source check".to_owned(),
         confidence: 0.6,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:abc123")],
+        supersession: None,
     };
     let err = build_observation_records(&req).expect_err("missing source_handle must be rejected");
     assert_eq!(err.code, "missing_field");
@@ -128,6 +132,7 @@ fn observation_rejects_empty_text() {
         text: String::new(),
         confidence: 0.9,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:abc123")],
+        supersession: None,
     };
     let err = build_observation_records(&req).expect_err("empty text must be rejected");
     assert_eq!(err.code, "missing_field");
@@ -141,6 +146,7 @@ fn observation_rejects_empty_evidence_links() {
         text: "valid observation".to_owned(),
         confidence: 0.9,
         evidence_links: vec![],
+        supersession: None,
     };
     let err = build_observation_records(&req).expect_err("empty evidence_links must be rejected");
     assert_eq!(err.code, "missing_field");
@@ -156,6 +162,7 @@ fn accepted_observation_produces_observation_node() {
         text: "the function has high cyclomatic complexity".to_owned(),
         confidence: 0.9,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:deadbeef")],
+        supersession: None,
     };
     let outcome = build_observation_records(&req).expect("valid observation must succeed");
 
@@ -205,6 +212,7 @@ fn accepted_observation_carries_required_provenance() {
         text: "provenance check".to_owned(),
         confidence: 0.85,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:feed1234")],
+        supersession: None,
     };
     let outcome = build_observation_records(&req).expect("valid observation must succeed");
 
@@ -470,6 +478,7 @@ fn observation_without_verification_link_is_not_marked_verified() {
         confidence: 0.7,
         // Evidence link points to a codegraph entity (code fact), not a verification record
         evidence_links: vec![dummy_evidence_link("codegraph:v4:deadbeef")],
+        supersession: None,
     };
     let outcome = build_observation_records(&req).expect("valid observation must succeed");
 
@@ -537,6 +546,7 @@ fn observation_with_verification_link_carries_validated_by() {
                 target_git_commit: None,
             },
         ],
+        supersession: None,
     };
     let outcome =
         build_observation_records(&req).expect("valid observation with verification must succeed");
@@ -583,6 +593,7 @@ fn five_identical_observation_writes_produce_same_record_ids() {
         text: "determinism test observation".to_owned(),
         confidence: 0.9,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:feed5678")],
+        supersession: None,
     };
 
     let run0 = build_observation_records(&req).expect("run 0 must succeed");
@@ -661,6 +672,7 @@ fn full_workflow_writes_all_four_evidence_types() {
         text: "complex function detected".to_owned(),
         confidence: 0.88,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:deadbeef01")],
+        supersession: None,
     };
     let obs = build_observation_records(&obs_req).expect("observation must succeed");
     assert!(obs.record_id.starts_with("agent_memory:v1:"));
@@ -758,6 +770,7 @@ fn same_inputs_produce_same_evidence_handles() {
         text: "idempotency test".to_owned(),
         confidence: 0.75,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:abcdef")],
+        supersession: None,
     };
 
     let first = build_observation_records(&req).expect("first write must succeed");
@@ -803,6 +816,7 @@ fn observation_with_invalid_confidence_is_rejected() {
         text: "invalid confidence".to_owned(),
         confidence: 1.5, // out of [0.0, 1.0]
         evidence_links: vec![dummy_evidence_link("codegraph:v4:abc123")],
+        supersession: None,
     };
     let err = build_observation_records(&req).expect_err("confidence > 1.0 must be rejected");
     assert_eq!(err.code, "invalid_field");
@@ -932,6 +946,7 @@ fn repeated_observation_writes_produce_identical_session_nodes() {
         text: text.to_owned(),
         confidence: 0.9,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:abc")],
+        supersession: None,
     };
 
     let out_a = build_observation_records(&make_req("observation one")).expect("a must succeed");
@@ -990,6 +1005,7 @@ fn observation_rejects_unknown_agent_kind() {
         text: "agent kind check".to_owned(),
         confidence: 0.9,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:abc123")],
+        supersession: None,
     };
     let err = build_observation_records(&req).expect_err("unknown agent_kind must be rejected");
     assert_eq!(err.code, "invalid_field");
@@ -1003,6 +1019,7 @@ fn repeated_observation_identical_inputs_produce_identical_session_nodes_with_re
         text: "idempotency check".to_owned(),
         confidence: 0.9,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:abc123")],
+        supersession: None,
     };
 
     let out_a = build_observation_records(&req).expect("first write must succeed");
@@ -1054,6 +1071,7 @@ fn observation_rejects_non_rfc3339_observed_at() {
         text: "timestamp check".to_owned(),
         confidence: 0.9,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:abc123")],
+        supersession: None,
     };
     let err = build_observation_records(&req).expect_err("invalid observed_at must be rejected");
     assert_eq!(err.code, "invalid_field");
@@ -1185,6 +1203,7 @@ fn evidence_writer_uses_only_existing_node_kinds() {
         text: "schema check".to_owned(),
         confidence: 0.9,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:abc")],
+        supersession: None,
     })
     .expect("observation must succeed")
     .records
@@ -1274,6 +1293,7 @@ fn agent_node_id_differs_by_agent_kind() {
         text: "obs A".to_owned(),
         confidence: 0.9,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:abc")],
+        supersession: None,
     })
     .expect("write A must succeed");
     let out_b = build_observation_records(&ObservationRequest {
@@ -1281,6 +1301,7 @@ fn agent_node_id_differs_by_agent_kind() {
         text: "obs B".to_owned(),
         confidence: 0.9,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:abc")],
+        supersession: None,
     })
     .expect("write B must succeed");
 
@@ -1389,6 +1410,7 @@ fn observation_session_of_edge_targets_emitted_agent_node() {
         text: "edge target check".to_owned(),
         confidence: 0.9,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:abc123")],
+        supersession: None,
     };
     let outcome = build_observation_records(&req).expect("observation must succeed");
 
@@ -1462,6 +1484,7 @@ fn agent_session_id_differs_by_agent_kind() {
         text: "session id check a".to_owned(),
         confidence: 0.9,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:abc")],
+        supersession: None,
     })
     .expect("write A must succeed");
     let out_b = build_observation_records(&ObservationRequest {
@@ -1469,6 +1492,7 @@ fn agent_session_id_differs_by_agent_kind() {
         text: "session id check b".to_owned(),
         confidence: 0.9,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:abc")],
+        supersession: None,
     })
     .expect("write B must succeed");
 
@@ -1608,6 +1632,7 @@ fn observation_rejects_non_numeric_evidence_link_confidence() {
             target_span: None,
             target_git_commit: None,
         }],
+        supersession: None,
     };
     let err = build_observation_records(&req)
         .expect_err("non-numeric evidence_link confidence must be rejected");
@@ -1633,6 +1658,7 @@ fn observation_rejects_out_of_range_evidence_link_confidence() {
             target_span: None,
             target_git_commit: None,
         }],
+        supersession: None,
     };
     let err = build_observation_records(&req)
         .expect_err("out-of-range evidence_link confidence must be rejected");
@@ -1680,12 +1706,14 @@ fn distinct_evidence_target_produces_distinct_observation_ids() {
         text: "same text".to_owned(),
         confidence: 0.9,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:target-A")],
+        supersession: None,
     };
     let id_a = build_observation_records(&base)
         .expect("target A must succeed")
         .record_id;
     let req_b = ObservationRequest {
         evidence_links: vec![dummy_evidence_link("codegraph:v4:target-B")],
+        supersession: None,
         ..base
     };
     let id_b = build_observation_records(&req_b)
@@ -1704,12 +1732,14 @@ fn distinct_confidence_produces_distinct_observation_ids() {
         text: "same text".to_owned(),
         confidence: 0.8,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:abc")],
+        supersession: None,
     };
     let id_a = build_observation_records(&base)
         .expect("confidence 0.8 must succeed")
         .record_id;
     let req_b = ObservationRequest {
         confidence: 0.5,
+        supersession: None,
         ..base
     };
     let id_b = build_observation_records(&req_b)
@@ -1728,6 +1758,7 @@ fn distinct_observed_at_produces_distinct_observation_ids() {
         text: "same text".to_owned(),
         confidence: 0.9,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:abc")],
+        supersession: None,
     };
     let id_a = build_observation_records(&base)
         .expect("observed_at A must succeed")
@@ -1737,6 +1768,7 @@ fn distinct_observed_at_produces_distinct_observation_ids() {
             observed_at: "2026-06-01T10:00:00Z".to_owned(),
             ..valid_provenance()
         },
+        supersession: None,
         ..base
     };
     let id_b = build_observation_records(&req_b)
@@ -1986,12 +2018,14 @@ fn observation_evidence_links_are_stored_in_canonical_sorted_order() {
         text: "canonical link order".to_owned(),
         confidence: 0.9,
         evidence_links: vec![link_a.clone(), link_b.clone()],
+        supersession: None,
     };
     let req_ba = ObservationRequest {
         provenance: valid_provenance(),
         text: "canonical link order".to_owned(),
         confidence: 0.9,
         evidence_links: vec![link_b, link_a],
+        supersession: None,
     };
     let out_ab = build_observation_records(&req_ab).expect("ab order must succeed");
     let out_ba = build_observation_records(&req_ba).expect("ba order must succeed");
@@ -2169,6 +2203,7 @@ fn agent_session_nodes_distinct_per_observed_at_and_each_have_valid_timestamps()
         text: "first observation".to_owned(),
         confidence: 0.9,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:abc")],
+        supersession: None,
     };
     let req_late = ObservationRequest {
         provenance: EvidenceProvenance {
@@ -2178,6 +2213,7 @@ fn agent_session_nodes_distinct_per_observed_at_and_each_have_valid_timestamps()
         text: "second observation".to_owned(),
         confidence: 0.9,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:abc")],
+        supersession: None,
     };
     let out_early = build_observation_records(&req_early).expect("early must succeed");
     let out_late = build_observation_records(&req_late).expect("late must succeed");
@@ -2216,6 +2252,7 @@ fn distinct_evidence_link_relation_produces_distinct_observation_ids() {
             target_span: None,
             target_git_commit: None,
         }],
+        supersession: None,
     };
     let req_validated = ObservationRequest {
         evidence_links: vec![EvidenceLink {
@@ -2230,6 +2267,7 @@ fn distinct_evidence_link_relation_produces_distinct_observation_ids() {
             text: "relation check".to_owned(),
             confidence: 0.9,
             evidence_links: vec![],
+            supersession: None,
         }
     };
     let id_a = build_observation_records(&req_observes)
@@ -2273,6 +2311,7 @@ fn distinct_agent_kind_produces_distinct_observation_ids() {
         text: "agent kind check".to_owned(),
         confidence: 0.9,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:abc123")],
+        supersession: None,
     };
     let req_codex = ObservationRequest {
         provenance: EvidenceProvenance {
@@ -2282,6 +2321,7 @@ fn distinct_agent_kind_produces_distinct_observation_ids() {
         text: "agent kind check".to_owned(),
         confidence: 0.9,
         evidence_links: vec![dummy_evidence_link("codegraph:v4:abc123")],
+        supersession: None,
     };
     let id_a = build_observation_records(&req_other)
         .expect("other must succeed")
@@ -2442,6 +2482,7 @@ fn observation_rejects_observes_relation_on_verification_domain() {
             target_span: None,
             target_git_commit: None,
         }],
+        supersession: None,
     };
     let err = build_observation_records(&req)
         .expect_err("OBSERVES targeting verification must be rejected");
@@ -2465,6 +2506,7 @@ fn observation_rejects_empty_evidence_link_relation() {
             target_span: None,
             target_git_commit: None,
         }],
+        supersession: None,
     };
     let err = build_observation_records(&req).expect_err("empty relation must be rejected");
     assert_eq!(err.code, "missing_field");
@@ -2487,6 +2529,7 @@ fn observation_rejects_empty_target_record_id() {
             target_span: None,
             target_git_commit: None,
         }],
+        supersession: None,
     };
     let err = build_observation_records(&req).expect_err("empty target_record_id must be rejected");
     assert_eq!(err.code, "missing_field");
@@ -2900,6 +2943,7 @@ fn observation_distinct_as_of_commit_produces_distinct_ids() {
         text: "temporal link test".to_owned(),
         confidence: 0.9,
         evidence_links: vec![link_base],
+        supersession: None,
     };
     let link_b = EvidenceLink {
         target_record_id: Some("codegraph:v4:abc".to_owned()),
@@ -2916,6 +2960,7 @@ fn observation_distinct_as_of_commit_produces_distinct_ids() {
         text: "temporal link test".to_owned(),
         confidence: 0.9,
         evidence_links: vec![link_b],
+        supersession: None,
     };
     let id_a = build_observation_records(&req_a)
         .expect("commit-a must succeed")
@@ -2945,6 +2990,7 @@ fn observation_distinct_target_git_commit_produces_distinct_ids() {
             target_span: None,
             target_git_commit: Some(git_commit.to_owned()),
         }],
+        supersession: None,
     };
     let id_a = build_observation_records(&make_req("sha-aaa"))
         .expect("sha-aaa must succeed")

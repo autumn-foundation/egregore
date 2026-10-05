@@ -1,0 +1,4 @@
+error: no such command: `llvm-cov`
+
+        View all installed commands with `cargo --list`
+        Find a package to install `llvm-cov` with `cargo search cargo-llvm-cov`

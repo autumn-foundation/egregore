@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "Store-freshness verdict for the whole store (issue #194).",
+  "properties": {
+    "freshness": {
+      "additionalProperties": true,
+      "properties": {
+        "current_dirty": {
+          "type": "boolean"
+        },
+        "current_head": {
+          "additionalProperties": true,
+          "properties": {
+            "sha": {
+              "type": "string"
+            },
+            "state": {
+              "enum": [
+                "commit",
+                "no_git",
+                "unborn_head"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        "fresh": {
+          "type": "boolean"
+        },
+        "message": {
+          "type": "string"
+        },
+        "repo_path": {
+          "type": "string"
+        },
+        "repository_id": {
+          "type": "string"
+        },
+        "stored_snapshot": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "properties": {
+                "dirty": {
+                  "type": "boolean"
+                },
+                "head": {
+                  "additionalProperties": true,
+                  "properties": {
+                    "sha": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "enum": [
+                        "commit",
+                        "no_git",
+                        "unborn_head"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "state"
+                  ],
+                  "type": "object"
+                },
+                "repository_id": {
+                  "type": "string"
+                },
+                "scanned_at": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "head",
+                "dirty",
+                "repository_id",
+                "scanned_at"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Explicit marker for a pre-stamping store — never a silent absence, never a false `fresh`.",
+              "properties": {
+                "state": {
+                  "const": "pre_stamping"
+                }
+              },
+              "required": [
+                "state"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "verdict": {
+          "enum": [
+            "fresh",
+            "stale_head",
+            "stale_dirty",
+            "unknown"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "verdict",
+        "fresh",
+        "repository_id",
+        "repo_path",
+        "stored_snapshot",
+        "current_head",
+        "current_dirty",
+        "message"
+      ],
+      "type": "object"
+    },
+    "ok": {
+      "const": true
+    }
+  },
+  "required": [
+    "ok",
+    "freshness"
+  ],
+  "title": "Egregore MCP tool response: store_freshness",
+  "type": "object"
+}

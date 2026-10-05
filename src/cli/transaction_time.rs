@@ -37,6 +37,16 @@ pub(crate) struct TxSymbolRow<'a> {
     extraction_completeness: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostics: Option<Vec<DiagnosticRef<'a>>>,
+    /// Test-vs-production role of the row's record (issue #238). Omitted for
+    /// records that predate issue #238 (role unknown, never fabricated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<&'a crate::ir::SymbolRole>,
+    /// Conditional-compilation gate chain (issue #190): the normalized
+    /// `#[cfg(...)]` / `#[cfg_attr(...)]` predicates lexically gating the
+    /// row's record, outermost gate first. Omitted for records that predate
+    /// issue #190 or are ungated (unknown-or-absent, never fabricated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cfg: Option<&'a Vec<String>>,
 }
 
 /// Response envelope for `eg query symbol --tx-as-of`.
@@ -119,6 +129,12 @@ pub(crate) fn tx_symbol_row<'a>(
         repository: repository_id.and_then(|repo| index.display_of(repo)),
         extraction_completeness: completeness,
         diagnostics: None,
+        role: record.role(),
+        // Conditional-compilation gates (issue #190): the row IS the
+        // symbol's record, so its gate chain rides along like every other
+        // `eg query symbol` field. Absent for ungated symbols and for
+        // records that predate issue #190 — never fabricated.
+        cfg: record.cfg(),
     })
 }
 
@@ -141,6 +157,7 @@ pub(crate) fn query_symbol_tx_as_of(
     format: OutputFormat,
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
+    role: RoleFilter,
 ) -> Result<()> {
     // Repository scope applies to the record set BEFORE temporal resolution,
     // not to the row list afterwards: a forked repository's descendant commits
@@ -182,11 +199,26 @@ pub(crate) fn query_symbol_tx_as_of(
         }
         Ok(result) => {
             let deleted = current_deleted_ids(records);
+            // Role scope (issue #238) narrows the projected rows, order
+            // preserved; unknown roles survive only `RoleFilter::All`. A
+            // filter that empties the answer is the lane's no-match, reported
+            // through the same error envelope the resolver uses (exit 1).
             let rows: Vec<TxSymbolRow<'_>> = result
                 .records
                 .iter()
                 .filter_map(|r| tx_symbol_row(r, index, records, &deleted))
+                .filter(|row| role.matches(row.role.copied()))
                 .collect();
+            if rows.is_empty() {
+                print_tx_error(
+                    "no_named_symbol",
+                    &format!(
+                        "no match found for symbol `{name}` with role `{}`",
+                        role.as_str()
+                    ),
+                )?;
+                std::process::exit(1);
+            }
             let envelope = TxSymbolEnvelope {
                 ok: true,
                 verb: "symbol",
@@ -211,8 +243,11 @@ pub(crate) fn query_symbol_tx_as_of(
                     for row in &envelope.records {
                         let path = row.repo_relative_path.unwrap_or("(unknown)");
                         let line = row.span.map_or(0, |s| s.start_line);
+                        let role_suffix = row
+                            .role
+                            .map_or(String::new(), |r| format!(" [{}]", r.as_str()));
                         println!(
-                            "{} (Symbol) @ {path}:{line} tx={}",
+                            "{} (Symbol) @ {path}:{line} tx={}{role_suffix}",
                             row.name, row.transaction_time
                         );
                     }
@@ -234,6 +269,7 @@ pub(crate) fn query_symbol_tx_via_daemon(
     as_of: Option<&str>,
     repo: Option<&str>,
     format: OutputFormat,
+    role: RoleFilter,
 ) -> Result<()> {
     // Validate timestamps client-side first so a malformed instant produces the
     // same `invalid_timestamp` envelope as the non-daemon path, before connecting.
@@ -280,17 +316,53 @@ pub(crate) fn query_symbol_tx_via_daemon(
             std::process::exit(1);
         }
     };
-    // `query_verb_raw_with_as_of` returns only the daemon `result` object, whose
-    // record rows already carry the tx handles. Reconstruct the same CLI
-    // `--tx-as-of` envelope the non-daemon path emits (top-level `ok`, `verb`,
-    // `name`, `as_of`, `snapshot`) so JSON consumers see one shape regardless of
+    print_symbol_tx_daemon_result(&result, name, tx_as_of, as_of, format, role)
+}
+
+/// Builds the `--tx-as-of` response envelope for the daemon path and prints it.
+///
+/// Split from `query_symbol_tx_via_daemon` (`too_many_lines`): the daemon verb
+/// predates the role selector, so role scope and the envelope shape are applied
+/// client-side here, mirroring the non-daemon path.
+#[cfg(feature = "embedded-aletheiadb")]
+fn print_symbol_tx_daemon_result(
+    result: &serde_json::Value,
+    name: &str,
+    tx_as_of: &str,
+    as_of: Option<&str>,
+    format: OutputFormat,
+    role: RoleFilter,
+) -> Result<()> {
+    // The daemon verb returns only its `result` object, whose record rows
+    // already carry the tx handles. Reconstruct the same CLI `--tx-as-of`
+    // envelope the non-daemon path emits (top-level `ok`, `verb`, `name`,
+    // `as_of`, `snapshot`) so JSON consumers see one shape regardless of
     // `--daemon`.
     let empty_records = serde_json::json!([]);
     let records = result.get("records").unwrap_or(&empty_records);
+    // Role scope (issue #238) applies client-side, like the non-tx daemon
+    // path: the daemon verb predates the selector.
+    let filtered: Vec<serde_json::Value> = records
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|rec| role.matches(daemon_record_role(rec)))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
     let empty_diags = serde_json::json!([]);
     let diagnostics = result.get("diagnostics").unwrap_or(&empty_diags);
     let default_page = serde_json::json!({ "cursor": null, "has_more": false, "returned": 0 });
-    let page = result.get("page").unwrap_or(&default_page);
+    let mut page = result.get("page").unwrap_or(&default_page).clone();
+    // Role scope (issue #238) filters client-side, after the daemon computed
+    // `page.returned`: correct the count so the envelope stays truthful.
+    if let Some(obj) = page.as_object_mut()
+        && let Some(returned) = obj.get_mut("returned")
+        && returned.is_number()
+    {
+        *returned = serde_json::json!(filtered.len());
+    }
     let envelope = serde_json::json!({
         "ok": true,
         "verb": "symbol",
@@ -298,7 +370,7 @@ pub(crate) fn query_symbol_tx_via_daemon(
         "tx_as_of": tx_as_of,
         "as_of": as_of,
         "snapshot": tx_as_of,
-        "records": records,
+        "records": filtered,
         "diagnostics": diagnostics,
         "page": page,
     });
@@ -307,7 +379,7 @@ pub(crate) fn query_symbol_tx_via_daemon(
             println!("{}", serde_json::to_string(&envelope)?);
         }
         OutputFormat::Text => {
-            if let Some(records) = records.as_array() {
+            if let Some(records) = envelope.get("records").and_then(|v| v.as_array()) {
                 for rec in records {
                     let name = rec.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     let path = rec
@@ -318,7 +390,9 @@ pub(crate) fn query_symbol_tx_via_daemon(
                         .get("transaction_time")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    println!("{name} (Symbol) @ {path} tx={tx}");
+                    let role_suffix = daemon_record_role(rec)
+                        .map_or(String::new(), |r| format!(" [{}]", r.as_str()));
+                    println!("{name} (Symbol) @ {path} tx={tx}{role_suffix}");
                 }
             }
             // Mirror the non-daemon text path: surface diagnostics so the

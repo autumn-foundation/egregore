@@ -1409,6 +1409,33 @@ pub struct PackManifest {
     /// Integrity. Present iff `min_review_coverage` is; absent on a pre-#355 pack.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_review_coverage_binding_hash: Option<String>,
+    /// BLAKE3 binding hash over the pack's section `(class, requirement)` pairs
+    /// (issue #355 GAP D), a sibling of `citation_binding_hash`. Recomputed by
+    /// `verify_pack`'s Integrity check and compared, so a hand-edited section
+    /// `requirement` (e.g. flipping a required review class to optional to make a
+    /// forged `not_applicable` review-coverage verdict look consistent) with a
+    /// stale hash fails Integrity. The bind is what makes the recomputed
+    /// review-coverage applicability trustworthy. `#[serde(default)]` keeps a
+    /// pre-#355-GAP-D pack parseable; such a pack carries an empty hash and FAILS
+    /// Integrity against the non-empty recompute, as intended — its section
+    /// requirements are unbound and cannot ground the applicability recompute
+    /// (fail-closed, like `citation_binding_hash`; a legacy pass would let a
+    /// hand-edited pack strip this field to dodge the bind).
+    #[serde(default)]
+    pub section_requirements_binding_hash: String,
+    /// BLAKE3 binding hash tying `catalog_pin` + `control_id` to the pack's
+    /// section `(class, requirement)` pairs (issue #355 follow-up, "derive on
+    /// read"). Recomputed by `verify_pack`'s Integrity from the pack's own
+    /// carried data and compared, so a hand-edited `control_id` or
+    /// `catalog_pin` (selectively relabeling the pack to another control or
+    /// catalog) with a stale hash fails Integrity. `#[serde(default)]` keeps a
+    /// pre-bind pack parseable; such a pack carries an empty hash and FAILS
+    /// Integrity against the non-empty recompute, as intended — its
+    /// catalog/control claim is unbound (fail-closed, like
+    /// `section_requirements_binding_hash`; a legacy pass would let a
+    /// hand-edited pack strip this field to dodge the bind).
+    #[serde(default)]
+    pub control_catalog_binding_hash: String,
     /// The verbatim always-present disclaimer.
     pub disclaimer: String,
 }
@@ -3060,6 +3087,115 @@ fn hash_min_review_coverage(min_review_coverage: f64) -> String {
     blake3::hash(serialized.as_bytes()).to_string()
 }
 
+/// Canonical BLAKE3 binding hash over a pack's section `(class, requirement)`
+/// pairs (issue #355 GAP D), a sibling of [`hash_citation_verdict`]. Computed
+/// at assemble into `PackManifest::section_requirements_binding_hash` and
+/// recomputed by `verify_pack`'s Integrity so a hand-edited section
+/// `requirement` with a stale hash is caught — the integrity anchor that lets
+/// `verify_pack` recompute review-coverage applicability from the sections
+/// instead of trusting the artifact's self-declared verdict field. Pairs are
+/// sorted by class so the hash is independent of section order; a domain tag
+/// keeps the hash distinct from any other bind. Uses the same
+/// `serde_json::to_string` canonicalization as `hash_citation_verdict`, so
+/// byte-stability holds across runs.
+fn hash_section_requirements(sections: &[EvidenceSection]) -> String {
+    let mut pairs: Vec<(&str, &str)> = sections
+        .iter()
+        .map(|s| (s.class.as_str(), s.requirement.as_str()))
+        .collect();
+    pairs.sort_unstable();
+    let payload = ("section_requirements_v1", pairs);
+    let serialized = serde_json::to_string(&payload).unwrap_or_default();
+    blake3::hash(serialized.as_bytes()).to_string()
+}
+
+/// Canonical BLAKE3 binding hash tying the pack's catalog pin and anchoring
+/// control to its section `(class, requirement)` pairs (issue #355 follow-up:
+/// `catalog_pin` re-derivation, "derive on read"). Computed at assemble into
+/// `PackManifest::control_catalog_binding_hash` and recomputed by
+/// `verify_pack`'s Integrity from the pack's OWN carried data — the pin's
+/// identity fields, `manifest.control_id`, and the bound section pairs — so an
+/// offline verify never needs the external catalog. A hand-edited `control_id`
+/// or `catalog_pin` field (selectively relabeling the pack to a different
+/// control or catalog) with a stale hash fails Integrity. Pairs are sorted by
+/// class so the hash is independent of section order; a domain tag keeps the
+/// hash distinct from any other bind. Uses the same `serde_json::to_string`
+/// canonicalization as `hash_section_requirements`, so byte-stability holds
+/// across runs.
+///
+/// Honest residual: the pin's `catalog_hash` remains an opaque echo — an
+/// offline verify cannot recompute the catalog's own hash without the catalog,
+/// so a full-recompute attacker who consistently rewrites the pin AND this
+/// binding hash achieves a self-consistent (but relabeled) pack. What the bind
+/// guarantees is no SELECTIVE relabel: `control_id`/`catalog_pin` cannot drift
+/// from the sections the verdicts were recomputed over, and no verdict can be
+/// upgraded beyond what the carried rows support.
+fn hash_control_catalog_binding(
+    pin: &CatalogPin,
+    control_id: &str,
+    sections: &[EvidenceSection],
+) -> String {
+    let mut pairs: Vec<(&str, &str)> = sections
+        .iter()
+        .map(|s| (s.class.as_str(), s.requirement.as_str()))
+        .collect();
+    pairs.sort_unstable();
+    let payload = (
+        "control_catalog_binding_v1",
+        pin.catalog_id.as_str(),
+        (
+            pin.catalog_schema_version.domain.as_str(),
+            pin.catalog_schema_version.kind.as_str(),
+            pin.catalog_schema_version.version,
+        ),
+        pin.catalog_hash.as_str(),
+        control_id,
+        pairs,
+    );
+    let serialized = serde_json::to_string(&payload).unwrap_or_default();
+    blake3::hash(serialized.as_bytes()).to_string()
+}
+
+/// Recompute review-coverage applicability from the pack's own section
+/// requirements (issue #355 GAP D) — NEVER read
+/// `pack.verdicts.review_coverage.applicable` to gate a check; it is
+/// self-declared by the artifact. Mirrors `assemble_pack`'s
+/// `control_requires(control, Reviews) || control_requires(control,
+/// ReviewCoverage)` exactly: a section's `requirement` is copied verbatim from
+/// the control's evidence-class requirement at assemble, so a `required`
+/// `reviews`/`review_coverage` section is the pack-carried equivalent of the
+/// control predicate. Callers must only use the result AFTER the
+/// `section_requirements_binding_hash` Integrity check has passed — the bind is
+/// what makes these section fields trustworthy.
+fn recomputed_review_coverage_applicable(pack: &EvidencePack) -> bool {
+    pack.sections.iter().any(|s| {
+        (s.class == EvidenceClass::Reviews.as_wire()
+            || s.class == EvidenceClass::ReviewCoverage.as_wire())
+            && s.requirement == Requirement::Required.as_wire()
+    })
+}
+
+/// Fixed `ReviewCoverageVerdict.detail` for a `not_applicable` verdict (issue #355
+/// GAP D): the neutral text `assemble_pack` emits when the control requires no
+/// review evidence. Shared so `verify_pack` recomputes it instead of trusting
+/// the artifact's copy.
+const REVIEW_COVERAGE_NOT_APPLICABLE_DETAIL: &str =
+    "review coverage not applicable: control does not require review coverage or review evidence";
+
+/// Canonical `ReviewCoverageVerdict.detail` text (issue #355 GAP D): the exact
+/// strings `assemble_pack` emits, shared so `verify_pack` recomputes the verdict
+/// detail from the bound measurement instead of trusting the artifact's copy. A
+/// gating verdict names the measured coverage against the bound threshold; a
+/// `not_applicable` verdict carries the fixed neutral text (the floats are
+/// ignored on that path).
+fn review_coverage_verdict_detail(applicable: bool, coverage: f64, min_required: f64) -> String {
+    if applicable {
+        format!("review coverage {coverage:.4} vs minimum {min_required:.4}")
+    } else {
+        REVIEW_COVERAGE_NOT_APPLICABLE_DETAIL.to_owned()
+    }
+}
+
 /// Binds a section's derived `log_summary` (issue #340) into `verify_pack`'s
 /// Integrity so a tampered summary value fails verification, mirroring the
 /// `review_coverage` `measurement` bind. Returns `Err(detail)` on any mismatch.
@@ -4376,7 +4512,7 @@ pub fn assemble_pack(
             applicable: true,
             passed: review_coverage_passed,
             not_applicable_reason: None,
-            detail: format!("review coverage {coverage:.4} vs minimum {min_review_coverage:.4}"),
+            detail: review_coverage_verdict_detail(true, coverage, min_review_coverage),
         }
     } else {
         ReviewCoverageVerdict {
@@ -4384,8 +4520,7 @@ pub fn assemble_pack(
             applicable: false,
             passed: true,
             not_applicable_reason: Some("control_does_not_require_review".to_owned()),
-            detail: "review coverage not applicable: control does not require review coverage or review evidence"
-                .to_owned(),
+            detail: review_coverage_verdict_detail(false, coverage, min_review_coverage),
         }
     };
     // A `not_applicable` verdict is vacuously `passed`, so it never fails the gate;
@@ -4419,11 +4554,12 @@ pub fn assemble_pack(
 
     diagnostics.sort_by_key(diagnostic_sort_key);
 
+    let catalog_pin = pin(catalog);
     let manifest = PackManifest {
         control_id: control.control_id.clone(),
         control_title: control.title.clone(),
         window: window.clone(),
-        catalog_pin: pin(catalog),
+        catalog_pin: catalog_pin.clone(),
         egregore_version: egregore_version.to_owned(),
         captured_at: captured_at.map(str::to_owned),
         included_record_counts,
@@ -4431,6 +4567,12 @@ pub fn assemble_pack(
         excluded_missing_valid_time,
         min_review_coverage: Some(min_review_coverage),
         min_review_coverage_binding_hash: Some(hash_min_review_coverage(min_review_coverage)),
+        section_requirements_binding_hash: hash_section_requirements(&sections),
+        control_catalog_binding_hash: hash_control_catalog_binding(
+            &catalog_pin,
+            control.control_id.as_str(),
+            &sections,
+        ),
         disclaimer: PACK_DISCLAIMER.to_owned(),
     };
 
@@ -4938,6 +5080,14 @@ fn nonrecord_text_fields(pack: &EvidencePack) -> Vec<(String, &str)> {
     if let Some(h) = m.min_review_coverage_binding_hash.as_deref() {
         out.push(("manifest.min_review_coverage_binding_hash".to_owned(), h));
     }
+    out.push((
+        "manifest.section_requirements_binding_hash".to_owned(),
+        m.section_requirements_binding_hash.as_str(),
+    ));
+    out.push((
+        "manifest.control_catalog_binding_hash".to_owned(),
+        m.control_catalog_binding_hash.as_str(),
+    ));
     out.push(("manifest.disclaimer".to_owned(), m.disclaimer.as_str()));
 
     for (i, s) in pack.sections.iter().enumerate() {
@@ -5122,6 +5272,44 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
     // Integrity: recompute per-record hash and per-section canonical ordering.
     let mut integrity_passed = true;
     let mut integrity_detail = "recomputed hashes match; sections canonically ordered".to_owned();
+    // Integrity-bind the sections' `(class, requirement)` pairs FIRST (issue
+    // #355 GAP D), before anything below reads a section `requirement`: the
+    // recomputed review-coverage applicability — and every check gated on it —
+    // is only trustworthy once these fields are bound. Fail-closed like
+    // `citation_binding_hash`: a pre-GAP-D pack (empty stored hash) fails
+    // against the non-empty recompute, as intended.
+    if hash_section_requirements(&pack.sections) != pack.manifest.section_requirements_binding_hash
+    {
+        integrity_passed = false;
+        "section_requirements_binding_hash does not bind the manifest sections' \
+         (class, requirement) pairs (section requirements tampered or unbound)"
+            .clone_into(&mut integrity_detail);
+    }
+    // Control/catalog binding (issue #355 follow-up: `catalog_pin` re-derivation,
+    // "derive on read"), recomputed from the pack's OWN carried data — no
+    // external catalog needed. Fail closed like `section_requirements_binding_hash`:
+    // a relabeled `control_id` or swapped `catalog_pin` with a stale hash is a
+    // selective-relabel forgery, and a pre-bind pack (empty stored hash) fails
+    // against the non-empty recompute, as intended.
+    if hash_control_catalog_binding(
+        &pack.manifest.catalog_pin,
+        &pack.manifest.control_id,
+        &pack.sections,
+    ) != pack.manifest.control_catalog_binding_hash
+    {
+        integrity_passed = false;
+        "control_catalog_binding_hash does not bind the manifest control_id and \
+         catalog pin to the sections' (class, requirement) pairs (control or \
+         catalog relabeled, or binding absent)"
+            .clone_into(&mut integrity_detail);
+    }
+    // Review-coverage applicability recomputed from the pack's own BOUND section
+    // requirements (issue #355 GAP D) — never the artifact's self-declared
+    // `verdicts.review_coverage.applicable`. The binding check above gates every
+    // use below: with bound requirements this exactly mirrors assemble's
+    // `control_requires(control, Reviews) || control_requires(control,
+    // ReviewCoverage)`.
+    let recomputed_applicable = recomputed_review_coverage_applicable(pack);
     'integrity: for section in &pack.sections {
         if section.record_count != section.records.len() {
             integrity_passed = false;
@@ -5475,23 +5663,30 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                 //     round-18 Finding 1). Assemble ALWAYS fills
                 //     `unapproved_pr_ids` (merged minus approved), while it emits
                 //     the `merged_pr_without_approving_review` gaps only for a
-                //     control that requires PR/review evidence. The pack's own
-                //     discriminator is the round-8 review_coverage verdict's
-                //     `applicable` flag: gaps are emitted whenever the verdict is
-                //     applicable/gating (a required-review control), so the
+                //     control that requires PR/review evidence. The discriminator
+                //     is the RECOMPUTED applicability (issue #355 GAP D), derived
+                //     from the pack's own bound section requirements — NEVER the
+                //     artifact's self-declared `verdicts.review_coverage.applicable`,
+                //     which a hand-edited pack can flip to `false` while stripping
+                //     the gap rows to make the required gap evidence vanish while
+                //     Integrity still passes. With bound requirements the
+                //     recomputed value exactly mirrors assemble's
+                //     `control_requires(control, Reviews) ||
+                //     control_requires(control, ReviewCoverage)`, so the
                 //     `unapproved_pr_ids == gap set` equality holds and is
-                //     enforced there. When the verdict is NOT applicable (a
+                //     enforced there. When the recomputed value is false (a
                 //     control that maps `review_coverage` merely OPTIONAL, or none
                 //     at all), no such gap is emitted even though
                 //     `unapproved_pr_ids` may be non-empty, so binding to the
                 //     (empty) gap set would wrongly fail a freshly-assembled
                 //     pack — skip it. This is a safe subset of the exact
                 //     gap-emission condition (`requires_pull_requests ||
-                //     requires_review`): whenever `applicable` is true the
-                //     equality holds, and skipping only relaxes the check, never
-                //     producing a false failure. The arithmetic/coverage/passed
-                //     rechecks below still run in EVERY case.
-                if pack.verdicts.review_coverage.applicable {
+                //     requires_review`): whenever the recomputed applicability is
+                //     true the equality holds, and skipping only relaxes the
+                //     check, never producing a false failure. The
+                //     arithmetic/coverage/passed rechecks below still run in
+                //     EVERY case.
+                if recomputed_applicable {
                     let gap_unapproved: BTreeSet<&str> = pack
                         .gaps
                         .iter()
@@ -5913,6 +6108,98 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
             }
         }
     }
+    // Bind the `review_coverage` verdict to the recomputed applicability and the
+    // bound measurement (issue #355 GAP D). Every field of the verdict is a pure
+    // function of (recomputed applicability, measurement), so any divergence is
+    // a hand-edited artifact. This closes the self-declared-verdict forge
+    // vectors: flipping `applicable` to dodge the gap bind above, flipping
+    // `passed` to claim a passed gate over a failing measurement, or rewriting
+    // `status` / `not_applicable_reason` / `detail` to mislead a consumer
+    // reading the verdicts.
+    if integrity_passed {
+        let v = &pack.verdicts.review_coverage;
+        // (1) `applicable` must equal the recomputed value — never trust the
+        // artifact's self-declared flag (the folded-in #355 vector).
+        if v.applicable != recomputed_applicable {
+            integrity_passed = false;
+            "verdicts.review_coverage.applicable contradicts the applicability \
+             recomputed from the pack's bound section requirements (verdict \
+             tampered)"
+                .clone_into(&mut integrity_detail);
+        }
+        // (2) `status` is the closed value matching the recomputed applicability.
+        let expected_status = if recomputed_applicable {
+            "gating"
+        } else {
+            "not_applicable"
+        };
+        if integrity_passed && v.status != expected_status {
+            integrity_passed = false;
+            integrity_detail = format!(
+                "verdicts.review_coverage.status {:?} contradicts the recomputed \
+                 applicability (expected {:?})",
+                bounded_catalog_field(&v.status),
+                expected_status,
+            );
+        }
+        // (3) `not_applicable_reason` is closed-set: present iff not applicable.
+        let expected_reason: Option<&str> = if recomputed_applicable {
+            None
+        } else {
+            Some("control_does_not_require_review")
+        };
+        if integrity_passed && v.not_applicable_reason.as_deref() != expected_reason {
+            integrity_passed = false;
+            "verdicts.review_coverage.not_applicable_reason contradicts the \
+             recomputed applicability (must be control_does_not_require_review iff \
+             not applicable)"
+                .clone_into(&mut integrity_detail);
+        }
+        // (4) `passed` and `detail` are bound to the measurement. When applicable
+        // the verdict's `passed` must equal the measurement's recomputed
+        // `passed`; when not applicable the verdict is vacuously `passed` and
+        // carries the fixed neutral detail. The measurement rides the
+        // `review_coverage` section; a control that requires review evidence but
+        // maps no `review_coverage` class emits no measurement (degenerate
+        // custom-catalog corner) — there `passed`/`detail` have no bound
+        // measurement to check against and the checks are skipped.
+        let measurement = pack.sections.iter().find_map(|s| s.measurement.as_ref());
+        if integrity_passed {
+            if recomputed_applicable {
+                if let Some(m) = measurement {
+                    if v.passed != m.passed {
+                        integrity_passed = false;
+                        "verdicts.review_coverage.passed contradicts the \
+                         review_coverage measurement's recomputed passed flag \
+                         (verdict tampered)"
+                            .clone_into(&mut integrity_detail);
+                    }
+                    if integrity_passed
+                        && v.detail
+                            != review_coverage_verdict_detail(true, m.coverage, m.min_required)
+                    {
+                        integrity_passed = false;
+                        "verdicts.review_coverage.detail contradicts the recomputed \
+                         verdict detail (coverage vs bound threshold)"
+                            .clone_into(&mut integrity_detail);
+                    }
+                }
+            } else {
+                if !v.passed {
+                    integrity_passed = false;
+                    "verdicts.review_coverage.passed must be vacuously true for a \
+                     not_applicable verdict"
+                        .clone_into(&mut integrity_detail);
+                }
+                if integrity_passed && v.detail != REVIEW_COVERAGE_NOT_APPLICABLE_DETAIL {
+                    integrity_passed = false;
+                    "verdicts.review_coverage.detail contradicts the fixed \
+                     not_applicable verdict detail"
+                        .clone_into(&mut integrity_detail);
+                }
+            }
+        }
+    }
     // Verbatim disclaimer bind (issue #355 GAP B): the always-present disclaimer
     // must equal `PACK_DISCLAIMER` byte-for-byte. The per-artifact safety scan only
     // rejects a disclaimer that leaks a secret, so a weakened or blanked disclaimer
@@ -6063,7 +6350,11 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
         }
         if integrity_passed {
             let v = &pack.verdicts;
-            let review_coverage_gate_ok = !v.review_coverage.applicable || v.review_coverage.passed;
+            // Gate on the RECOMPUTED applicability (issue #355 GAP D), never the
+            // artifact's self-declared verdict field. Integrity above already
+            // enforces declared == recomputed, so this is belt-and-braces; the
+            // verdict's `passed` is likewise bound to the measurement there.
+            let review_coverage_gate_ok = !recomputed_applicable || v.review_coverage.passed;
             let expected_ok = v.required_classes.passed
                 && v.citation.passed
                 && review_coverage_gate_ok
@@ -6077,8 +6368,12 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
             }
         }
     }
-    // TODO(#355): `catalog_pin` re-derivation and `review_coverage.applicable`
-    // recomputation are deliberately out of scope for this hardening pass.
+    // Issue #355 follow-up ("derive on read"): `catalog_pin` re-derivation is
+    // DONE — `manifest.control_catalog_binding_hash` binds `manifest.control_id`
+    // and the catalog pin's identity fields to the bound section
+    // `(class, requirement)` pairs, recomputed by `verify_pack` from the
+    // pack's own carried data (no external catalog needed). `review_coverage`
+    // recomputation (GAP D) keys on the bound section requirements.
     let integrity = VerificationVerdict {
         passed: integrity_passed,
         detail: integrity_detail,
@@ -10957,6 +11252,284 @@ mod pack338_tests {
             report.integrity.detail
         );
         assert!(!report.ok, "overall verdict fails");
+    }
+
+    // ── Issue #355 GAP D: `review_coverage.applicable` is recomputed from the
+    //    pack's own bound section requirements, never trusted from the artifact ──
+
+    /// Issue #355 GAP D (the folded-in post-cap vector): `verify_pack` must not
+    /// trust the self-declared `verdicts.review_coverage.applicable` to decide
+    /// whether `unapproved_pr_ids` must match the
+    /// `merged_pr_without_approving_review` gap rows. A hand-edited pack that
+    /// strips the required gap evidence, rewrites the measurement into a
+    /// self-consistent clean story, and flips the verdict to `not_applicable`
+    /// must FAIL Integrity — applicability is recomputed from the pack's own
+    /// bound section requirements.
+    #[test]
+    fn verify_fails_when_applicable_flipped_and_gap_evidence_stripped() {
+        let mut pack = assemble_cc81();
+        // Sanity: the fixture really does gate on unapproved merged PRs.
+        assert!(pack.verdicts.review_coverage.applicable);
+        assert!(!pack.verdicts.review_coverage.passed);
+        assert!(
+            pack.gaps
+                .iter()
+                .any(|g| g.gap_class == "merged_pr_without_approving_review"),
+            "fixture must carry merged_pr_without_approving_review gaps"
+        );
+
+        // Strip the required gap evidence...
+        pack.gaps
+            .retain(|g| g.gap_class != "merged_pr_without_approving_review");
+        // ...rewrite the measurement into a self-consistent clean story...
+        let m = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == "review_coverage")
+            .and_then(|s| s.measurement.as_mut())
+            .expect("review_coverage measurement");
+        let approved = m.approved_pr_count;
+        m.unapproved_pr_ids.clear();
+        m.merged_pr_count = approved;
+        // approved/approved is exactly 1.0 (vacuously 1.0 when none merged).
+        m.coverage = 1.0;
+        m.passed = true;
+        // ...and flip the verdict to not_applicable with a passing overall ok.
+        let v = &mut pack.verdicts.review_coverage;
+        v.applicable = false;
+        v.status = "not_applicable".to_owned();
+        v.passed = true;
+        v.not_applicable_reason = Some("control_does_not_require_review".to_owned());
+        v.detail =
+            "review coverage not applicable: control does not require review coverage or review evidence"
+                .to_owned();
+        pack.verdicts.ok = true;
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a pack with stripped gap evidence and a flipped applicable verdict must \
+             fail Integrity: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "the tampered pack must not verify ok");
+    }
+
+    /// Issue #355 GAP D: the `review_coverage` verdict's `passed` is bound to the
+    /// measurement's recomputed `passed` — flipping the verdict to claim a passed
+    /// gate over a failing measurement must FAIL Integrity.
+    #[test]
+    fn verify_fails_when_review_coverage_verdict_passed_flipped() {
+        let mut pack = assemble_cc81();
+        assert!(
+            !pack.verdicts.review_coverage.passed,
+            "baseline 3-of-6 coverage fails the gate"
+        );
+        pack.verdicts.review_coverage.passed = true;
+        pack.verdicts.ok = true;
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a review_coverage verdict.passed contradicting the measurement must fail \
+             Integrity: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "the tampered pack must not verify ok");
+    }
+
+    /// Issue #355 GAP D: section `requirement` fields are bound by
+    /// `manifest.section_requirements_binding_hash` — flipping one without
+    /// recomputing the hash must FAIL Integrity. The bind is what makes the
+    /// recomputed applicability trustworthy.
+    #[test]
+    fn verify_fails_when_section_requirement_flipped() {
+        let mut pack = assemble_cc81();
+        let section = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == "reviews")
+            .expect("reviews section");
+        assert_eq!(section.requirement, "required");
+        section.requirement = "optional".to_owned();
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a flipped section requirement with a stale binding hash must fail \
+             Integrity: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "the tampered pack must not verify ok");
+    }
+
+    /// Issue #355 GAP D: `verdicts.review_coverage.status` must agree with the
+    /// recomputed applicability — flipping it alone must FAIL Integrity.
+    #[test]
+    fn verify_fails_when_review_coverage_verdict_status_flipped() {
+        let mut pack = assemble_cc81();
+        assert_eq!(pack.verdicts.review_coverage.status, "gating");
+        pack.verdicts.review_coverage.status = "not_applicable".to_owned();
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a review_coverage status contradicting the recomputed applicability must \
+             fail Integrity: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "the tampered pack must not verify ok");
+    }
+
+    /// Issue #355 GAP D: a pre-GAP-D pack (no `section_requirements_binding_hash`)
+    /// is unbound and must FAIL Integrity closed — like `citation_binding_hash`,
+    /// an absent bind is a failure, never a legacy pass (otherwise stripping the
+    /// field would dodge the requirement bind).
+    #[test]
+    fn verify_fails_when_section_requirements_binding_hash_absent() {
+        let mut pack = assemble_cc81();
+        assert!(!pack.manifest.section_requirements_binding_hash.is_empty());
+        pack.manifest.section_requirements_binding_hash = String::new();
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a pack with no section_requirements_binding_hash must fail Integrity: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "the tampered pack must not verify ok");
+    }
+
+    /// Issue #355 follow-up ("derive on read"): `manifest.control_id` is bound
+    /// to the catalog pin and the section requirements by
+    /// `manifest.control_catalog_binding_hash` — relabeling the pack to a
+    /// different control with a stale binding hash must FAIL Integrity.
+    #[test]
+    fn verify_fails_when_control_id_relabelled_with_stale_binding_hash() {
+        let mut pack = assemble_cc81();
+        assert_eq!(pack.manifest.control_id, "CC8.1");
+        pack.manifest.control_id = "CC7.2".to_owned();
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a relabeled control_id with a stale binding hash must fail \
+             Integrity: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "the tampered pack must not verify ok");
+    }
+
+    /// Issue #355 follow-up ("derive on read"): `manifest.catalog_pin` is bound
+    /// to the control and the section requirements — swapping the pin to name
+    /// a different catalog with a stale binding hash must FAIL Integrity.
+    #[test]
+    fn verify_fails_when_catalog_pin_swapped_with_stale_binding_hash() {
+        let mut pack = assemble_cc81();
+        assert_eq!(pack.manifest.catalog_pin.catalog_id, "soc2-v1");
+        pack.manifest.catalog_pin.catalog_id = "other-catalog".to_owned();
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a swapped catalog_pin with a stale binding hash must fail \
+             Integrity: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "the tampered pack must not verify ok");
+    }
+
+    /// Issue #355 follow-up ("derive on read"): a pre-bind pack (no
+    /// `control_catalog_binding_hash`) is unbound and must FAIL Integrity
+    /// closed — like `section_requirements_binding_hash`, an absent bind is a
+    /// failure, never a legacy pass (otherwise stripping the field would dodge
+    /// the control/catalog bind).
+    #[test]
+    fn verify_fails_when_control_catalog_binding_hash_absent() {
+        let mut pack = assemble_cc81();
+        assert!(!pack.manifest.control_catalog_binding_hash.is_empty());
+        pack.manifest.control_catalog_binding_hash = String::new();
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a pack with no control_catalog_binding_hash must fail Integrity: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "the tampered pack must not verify ok");
+    }
+
+    /// Issue #355 follow-up ("derive on read"): honest residual — a
+    /// full-recompute attacker who relabels the control AND recomputes the
+    /// binding hash achieves a self-consistent pack, which still verifies.
+    /// The bind guarantees no SELECTIVE relabel, not unforgeability against a
+    /// total rewrite; the pin's `catalog_hash` remains an opaque echo an
+    /// offline verify cannot recompute.
+    #[test]
+    fn verify_passes_when_control_catalog_binding_recomputed_after_relabel() {
+        let mut pack = assemble_cc81();
+        pack.manifest.control_id = "CC7.2".to_owned();
+        pack.manifest.control_catalog_binding_hash = hash_control_catalog_binding(
+            &pack.manifest.catalog_pin,
+            pack.manifest.control_id.as_str(),
+            &pack.sections,
+        );
+
+        let report = verify_pack(&pack);
+        assert!(
+            report.integrity.passed,
+            "a consistently recomputed binding hash must pass Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    /// Issue #355 GAP D: an honestly-assembled `not_applicable` pack (a control
+    /// that requires no review evidence) still verifies clean — the recomputed
+    /// applicability agrees with the verdict and every verdict cross-check holds.
+    #[test]
+    fn verify_accepts_honest_not_applicable_review_verdict() {
+        let records = vec![fixture::pr_with_merge_time(
+            "project:v1:prMon",
+            "2026-03-15T08:00:00Z", // updated_at -> Task valid_time (in window)
+            "2026-03-15T12:00:00Z", // merged_at -> merge time (in window)
+            "cMon",
+        )];
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC7.2",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+        assert!(!pack.verdicts.review_coverage.applicable);
+        assert_eq!(pack.verdicts.review_coverage.status, "not_applicable");
+
+        let report = verify_pack(&pack);
+        assert!(
+            report.integrity.passed,
+            "an honest not_applicable pack passes Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    /// Issue #355 GAP D: a clean CC8.1 pack round-trips with the section
+    /// requirements bound — the hash is present and matches the recompute.
+    #[test]
+    fn assemble_then_verify_roundtrips_with_bound_section_requirements() {
+        let pack = assemble_cc81();
+        assert_eq!(
+            pack.manifest.section_requirements_binding_hash,
+            hash_section_requirements(&pack.sections)
+        );
+        let report = verify_pack(&pack);
+        assert!(
+            report.integrity.passed,
+            "a clean pack with bound section requirements passes Integrity: {}",
+            report.integrity.detail
+        );
     }
 
     /// Codex round-17 P2 (Finding 1): tampering `merged_pr_count` (every merged

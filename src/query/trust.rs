@@ -167,7 +167,8 @@ pub enum TrustClass {
     /// Imported external work state (`Task`, `PR`, `Review`, …). A claim made by
     /// an issue tracker, not verified by Egregore.
     ProjectState,
-    /// Produced bytes (`Artifact`, `PatchArtifact`, `FileEdit`).
+    /// Produced bytes (`Artifact`, `PatchArtifact`, `FileEdit`, and the
+    /// design-doc kinds `Adr`, `Prd`, `PlanDoc`).
     Artifact,
     /// A program's own claim about its execution (`ErrorSignature`, `LogEvent`,
     /// …): deterministically parsed but never verified.
@@ -334,8 +335,11 @@ impl<'a> TrustIndex<'a> {
             | NodeKind::PanicRiskSite
             | NodeKind::DebtMarker
             | NodeKind::UnsafeSite
+            | NodeKind::LintSuppression
             | NodeKind::DependencyDeclaration
             | NodeKind::ScanCoverage
+            | NodeKind::HistoryReplayWindow
+            | NodeKind::HistoryReplayTip
             | NodeKind::Commit
             | NodeKind::Change
             | NodeKind::SemanticDrift
@@ -367,9 +371,12 @@ impl<'a> TrustIndex<'a> {
             | NodeKind::LocalTask => TrustClass::ProjectState,
 
             // ── produced bytes ───────────────────────────────────────────────
-            NodeKind::Artifact | NodeKind::PatchArtifact | NodeKind::FileEdit => {
-                TrustClass::Artifact
-            }
+            NodeKind::Artifact
+            | NodeKind::PatchArtifact
+            | NodeKind::Adr
+            | NodeKind::Prd
+            | NodeKind::PlanDoc
+            | NodeKind::FileEdit => TrustClass::Artifact,
 
             // ── a program's own claim about its execution ────────────────────
             NodeKind::LogSource
@@ -397,7 +404,9 @@ impl<'a> TrustIndex<'a> {
             | NodeKind::Preference
             | NodeKind::WorkflowRule
             | NodeKind::NamingDecision
-            | NodeKind::Constraint => TrustClass::Other,
+            | NodeKind::Constraint
+            | NodeKind::RetirementReceipt
+            | NodeKind::ReinstatementReceipt => TrustClass::Other,
         }
     }
 
@@ -1010,6 +1019,8 @@ mod tests {
             NodeKind::UnsafeSite,
             NodeKind::DependencyDeclaration,
             NodeKind::ScanCoverage,
+            NodeKind::HistoryReplayWindow,
+            NodeKind::HistoryReplayTip,
             NodeKind::Commit,
             NodeKind::Change,
             NodeKind::SemanticDrift,
@@ -1039,6 +1050,9 @@ mod tests {
             NodeKind::CommandRun,
             NodeKind::FileEdit,
             NodeKind::PatchArtifact,
+            NodeKind::Adr,
+            NodeKind::Prd,
+            NodeKind::PlanDoc,
             NodeKind::Failure,
             NodeKind::Decision,
             NodeKind::TestRun,
@@ -1055,6 +1069,8 @@ mod tests {
             NodeKind::Constraint,
             NodeKind::CostUsage,
             NodeKind::Retraction,
+            NodeKind::RetirementReceipt,
+            NodeKind::ReinstatementReceipt,
             NodeKind::LogSource,
             NodeKind::ErrorSignature,
             NodeKind::LogEvent,

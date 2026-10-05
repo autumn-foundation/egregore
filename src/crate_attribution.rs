@@ -455,6 +455,7 @@ pub const fn carries_crate_attribution(kind: NodeKind) -> bool {
         | NodeKind::PanicRiskSite
         | NodeKind::DebtMarker
         | NodeKind::UnsafeSite
+        | NodeKind::LintSuppression
         | NodeKind::DependencyDeclaration
         // A `Change` records that one path changed in one commit, so it names a
         // file and its owning package is meaningful at that commit.
@@ -464,6 +465,8 @@ pub const fn carries_crate_attribution(kind: NodeKind) -> bool {
         NodeKind::Repository
         | NodeKind::Commit
         | NodeKind::ScanCoverage
+        | NodeKind::HistoryReplayWindow
+        | NodeKind::HistoryReplayTip
         // Every non-code-graph domain.
         | NodeKind::SemanticDrift
         | NodeKind::EmbeddingModel
@@ -492,6 +495,11 @@ pub const fn carries_crate_attribution(kind: NodeKind) -> bool {
         | NodeKind::CommandRun
         | NodeKind::FileEdit
         | NodeKind::PatchArtifact
+        // Design-doc artifacts (issue #149): artifact-domain nodes with a
+        // repo-relative doc path, not crate-attributed code-graph facts.
+        | NodeKind::Adr
+        | NodeKind::Prd
+        | NodeKind::PlanDoc
         | NodeKind::Failure
         | NodeKind::Decision
         | NodeKind::TestRun
@@ -508,6 +516,8 @@ pub const fn carries_crate_attribution(kind: NodeKind) -> bool {
         | NodeKind::Constraint
         | NodeKind::CostUsage
         | NodeKind::Retraction
+        | NodeKind::RetirementReceipt
+        | NodeKind::ReinstatementReceipt
         | NodeKind::LogSource
         | NodeKind::ErrorSignature
         | NodeKind::LogEvent

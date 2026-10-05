@@ -1171,13 +1171,24 @@ fn build_drift_classification_cache(
 // Input derivation (deterministic, from the record set)
 // ---------------------------------------------------------------------------
 
+/// Deleted-id set backing the audit's drive seeds and log-provenance reachability.
+///
+/// Latest-write-wins (issue #421): a `deleted_id` is retained only while its
+/// tombstone is the id's most recent write — a node/edge re-ingested AFTER its
+/// own tombstone is live again over an append-only `--graph`, matching the
+/// embedded `--data-dir` current-state read. Routing through
+/// [`Liveness::deleted`] (rather than raw tombstone membership) is what keeps
+/// this audit's `--graph` verdict in step with the embedded read; see
+/// `crate::query::liveness`.
 fn tombstoned_ids(records: &[GraphRecord]) -> BTreeSet<&str> {
+    let liveness = Liveness::new(records);
     records
         .iter()
         .filter_map(|r| match r {
             GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
             _ => None,
         })
+        .filter(|&id| liveness.deleted(id))
         .collect()
 }
 

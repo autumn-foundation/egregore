@@ -58,14 +58,15 @@ FFI, and cross-crate targets are outside the extraction contract).
   transitive callee (a recursive self-call is excluded).
 - **Explicit `unresolved` category:** an outbound edge whose target is an
   unresolved-call `Diagnostic` marker, carries an `unresolved` resolution
-  status, or names a record missing from the store is reported in a distinct
+  status, targets a trait-dispatch boundary marker (issue #267), or names a
+  record missing from the store is reported in a distinct
   `unresolved` category — **never silently dropped, and never counted as a
   reachable node** (AC4). Unresolved targets discovered from any source node
   within the depth bound are reported.
-- **Resolution propagation (issues #152/#134):** every path step exposes the
+- **Resolution propagation (issues #152/#134, #267):** every path step exposes the
   `resolution` label its `CALLS` edge carries (`resolved` / `ambiguous` /
-  `unresolved`), and each reachable row carries `path_resolution` — the
-  **weakest** status along its chain (`unresolved` > `ambiguous` > `resolved`).
+  `unresolved` / `unresolved_dispatch`), and each reachable row carries `path_resolution` — the
+  **weakest** status along its chain (`unresolved_dispatch` ≥ `unresolved` > `ambiguous` > `resolved`).
   A path that crosses an ambiguous edge is only as trustworthy as that edge,
   and the row says so. `path_resolution` is omitted when no step on the path is
   inside the resolution contract (e.g. a pure `IMPLEMENTS`/`IMPORTS`/
@@ -133,7 +134,7 @@ Unresolved row fields:
 |-------|------|-------------|
 | `category` | string | Always `"unresolved"`. |
 | `relation` | string | The producing edge label. |
-| `reason` | string | `unresolved_call` (Diagnostic marker or `unresolved` edge) or `missing_target` (dangling/tombstoned target). |
+| `reason` | string | `unresolved_call` (Diagnostic marker or `unresolved` edge), `unresolved_dispatch` (trait-dispatch boundary marker, issue #267), or `missing_target` (dangling/tombstoned target). |
 | `record_id` / `name` / `kind` / `repo_relative_path` / `span` | — | The Diagnostic marker's citable handle, when in-graph. |
 | `target_record_id` | string | The raw target record ID carried by the edge. |
 | `source_record_id` | string | The reachable node this unresolved edge departs from. |

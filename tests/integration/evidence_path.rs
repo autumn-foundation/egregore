@@ -23,6 +23,8 @@ fn code_symbol(id: &str, path: &str, name: &str) -> GraphRecord {
             end_byte: 10,
             start_line: 1,
             end_line: 2,
+            start_column: None,
+            end_column: None,
         }),
         Some(name.to_owned()),
         format!("symbol {name}"),

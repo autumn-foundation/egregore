@@ -10,22 +10,31 @@ use tree_sitter::{Node, Parser};
 use crate::{
     error::{CodegraphError, Result},
     fs::SourceFile,
-    ir::{EdgeLabel, Graph, GraphRecord, NodeKind, RouteAnnotation, SourceSpan, stable_id},
+    ir::{
+        DeprecationMark, EdgeLabel, EntryPointKind, EntryPointMark, Graph, GraphRecord,
+        LintSuppressionFacts, LintSuppressionScope, MAX_DEPRECATION_STRING_LEN, NodeKind,
+        RouteAnnotation, SourceSpan, SymbolRole, stable_id,
+    },
     languages::{
         common::{
-            SymbolBody, add_graph_edge, emit_reference_edges, next_symbol_ordinal, node_name,
-            path_segments, reference_text, span,
+            SymbolBody, add_graph_edge, collapse_whitespace, emit_reference_edges,
+            next_symbol_ordinal, node_name, path_segments, reference_text, span,
         },
         cross_file::{
-            CallKind, CallPathRoot, CallSiteFact, ConstructSiteFact, DefinitionFact, FileFacts,
-            ImplTargetFact, ImplTraitRelationFact, OutOfLineModFact, PendingImplFact,
-            RouteRegistrationFact, UseImportFact, crate_root_id,
+            BlockLocalDefinitionFact, CallKind, CallPathRoot, CallSiteFact, ConstructSiteFact,
+            DefinitionFact, FileFacts, ImplTargetFact, ImplTraitRelationFact, MacroDefinitionFact,
+            MacroInvocationFact, OutOfLineModFact, PendingImplFact, RouteRegistrationFact,
+            UseImportFact, crate_root_id,
         },
     },
     redaction::REDACTION_POLICY_VERSION,
 };
 
 /// Extracts Rust syntax records from one source file.
+///
+/// Line endings are normalized to LF at the parse boundary
+/// (`extract_file_source`, issue #242), so this file-read entry point agrees
+/// with the scan funnel's canonical text.
 ///
 /// Returns the file's cross-file resolution facts (issue #152) for the
 /// repo-wide `CALLS` resolution pass.
@@ -50,6 +59,13 @@ pub fn extract_file(
 
 /// Extracts Rust syntax records from supplied source text.
 ///
+/// Line endings are normalized to LF at this parse boundary (issue #242):
+/// CRLF and lone CR both become LF before Tree-sitter sees the source, so
+/// every caller — the scan funnel, the file-read entry point, history
+/// replay, and direct API users — gets byte-stable spans, symbol text,
+/// signatures, summaries, and content hashes. Idempotent: already-normalized
+/// text passes through unchanged.
+///
 /// Returns the file's cross-file resolution facts (issue #152) for the
 /// repo-wide `CALLS` resolution pass.
 ///
@@ -64,6 +80,14 @@ pub fn extract_file_source(
     repository_id: &str,
     graph: &mut Graph,
 ) -> Result<FileFacts> {
+    // Normalize line endings at the parse boundary (issue #242): CRLF and
+    // lone CR both become LF before Tree-sitter sees the source, so byte
+    // spans and content-derived fields are canonical no matter which line
+    // endings the checkout used. `normalize_line_endings` is idempotent, so
+    // callers that already normalized (the scan funnel, `extract_file`) pay
+    // only the fast path.
+    let source_lf = super::normalize_line_endings(source);
+    let source = source_lf.as_str();
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -74,11 +98,22 @@ pub fn extract_file_source(
             path: file.path.clone(),
         })?;
 
-    let mut extractor = RustExtractor::new(file, file_id, repository_id, graph, source);
+    let mut extractor = RustExtractor::new(
+        file,
+        file_id,
+        repository_id,
+        graph,
+        source,
+        file_level_cfg_gates(tree.root_node(), source),
+    );
     extractor.walk(tree.root_node());
     extractor.resolve_pending_impl_edges();
     extractor.finalize_use_imports();
     extractor.emit_reference_edges();
+    // File-level `#![cfg(...)]` gates (issue #190): the scan funnel stamps
+    // them on the `File` node it emitted before extraction, so the file's own
+    // record carries the same gate every symbol in it inherits.
+    extractor.facts.file_cfg_gates = extractor.file_cfg_gates.clone();
     Ok(extractor.facts)
 }
 
@@ -199,6 +234,7 @@ struct RustExtractor<'graph, 'source> {
     facts: FileFacts,
     panic_risk_ordinals: BTreeMap<String, u64>,
     unsafe_site_ordinals: BTreeMap<String, u64>,
+    lint_suppression_ordinals: BTreeMap<String, u64>,
     /// Inline-module segments currently enclosing the walk (out-of-line
     /// `mod x;` declarations do not push here).
     inline_module_stack: Vec<String>,
@@ -209,8 +245,14 @@ struct RustExtractor<'graph, 'source> {
     /// Depth of enclosing test scopes (`#[cfg(test)]` modules and `#[test]`
     /// functions). Non-zero means panic-risk call sites classify as `test`.
     test_scope_depth: usize,
-    /// `true` when the whole file lives under a top-level `tests/` directory.
-    file_in_tests_dir: bool,
+    /// Normalized `#[cfg(...)]` / `#[cfg_attr(...)]` predicates from `#![…]`
+    /// inner attributes at the file top level (issue #190). They gate the
+    /// whole file, so they lead every symbol's gate chain and are exported
+    /// on [`FileFacts`](cross_file::FileFacts) for the `File` node.
+    file_cfg_gates: Vec<String>,
+    /// `true` when the whole file lives under a top-level `tests/` or
+    /// `benches/` directory (Cargo's integration-test and bench roots).
+    file_in_test_root: bool,
     /// Per-function receiver-type environment (issue #441): a receiver binding
     /// identifier -> its reduced nominal type path, built from typed fn params
     /// and `let x: T` ascriptions whose binding is UNSHADOWED in the function
@@ -218,6 +260,42 @@ struct RustExtractor<'graph, 'source> {
     /// collected) and restored on exit, so `call_site_fact` can stamp a
     /// provable `receiver_type` on `x.method()` when `x` is in this map.
     type_env: BTreeMap<String, String>,
+    /// Per-function trait-dispatch environment (issue #267): a receiver binding
+    /// identifier -> the trait path as written in source, built alongside
+    /// [`type_env`](Self::type_env) for bindings provably trait-typed — a
+    /// `&dyn Trait` ascription (params and `let` bindings), or a generic type
+    /// parameter with exactly one trait bound (`fn g<T: Trait>(t: T)` / `where
+    /// T: Trait`). Same shadowing veto as `type_env`: shadowed bindings are
+    /// dropped. Set/restored with `type_env` so `call_site_fact` can stamp
+    /// `dispatch_trait` on `x.method()` when `x` is in this map.
+    dispatch_trait_env: BTreeMap<String, String>,
+    /// Symbol IDs of the lexically-enclosing functions/methods/tests currently
+    /// being extracted (issue #422). Pushed on entering `extract_function`,
+    /// popped on exit, so a block-local `fn` can record its enclosing scope's
+    /// identity for lexically-scoped call recall. Closures never push (they
+    /// are not symbols), so calls inside a closure body correctly inherit the
+    /// enclosing function's scope.
+    enclosing_fn_ids: Vec<String>,
+    /// Display names parallel to [`Self::enclosing_fn_ids`] (issue #148): the
+    /// qualified name of each enclosing function/method/test, so a macro
+    /// invocation site can record its invoking scope's human-readable name
+    /// alongside the ID.
+    enclosing_fn_names: Vec<String>,
+}
+
+/// The callee-side components of a [`CallSiteFact`]: everything the callee
+/// `function` node's kind determines, before the caller identity and span
+/// are attached. Lets [`call_site_fact`](RustExtractor::call_site_fact) stay
+/// small by delegating method-receiver resolution to
+/// [`method_call_callee`](RustExtractor::method_call_callee).
+struct CallCallee {
+    display: String,
+    segments: Vec<String>,
+    call_kind: CallKind,
+    receiver_owner: Option<String>,
+    path_root: CallPathRoot,
+    receiver_type: Option<String>,
+    dispatch_trait: Option<String>,
 }
 
 impl<'graph, 'source> RustExtractor<'graph, 'source> {
@@ -227,6 +305,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         repository_id: &'source str,
         graph: &'graph mut Graph,
         source: &'source str,
+        file_cfg_gates: Vec<String>,
     ) -> Self {
         Self {
             file,
@@ -252,13 +331,18 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             facts: FileFacts::default(),
             panic_risk_ordinals: BTreeMap::new(),
             unsafe_site_ordinals: BTreeMap::new(),
+            lint_suppression_ordinals: BTreeMap::new(),
             inline_module_stack: Vec::new(),
             inline_path_override_depth: 0,
             test_scope_depth: 0,
-            file_in_tests_dir: path_segments(&file.repo_relative_path)
+            file_cfg_gates,
+            file_in_test_root: path_segments(&file.repo_relative_path)
                 .first()
-                .is_some_and(|segment| segment == "tests"),
+                .is_some_and(|segment| segment == "tests" || segment == "benches"),
             type_env: BTreeMap::new(),
+            dispatch_trait_env: BTreeMap::new(),
+            enclosing_fn_ids: Vec::new(),
+            enclosing_fn_names: Vec::new(),
         }
     }
 
@@ -274,9 +358,11 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             "const_item" => self.extract_named_symbol(node, "const"),
             "static_item" => self.extract_named_symbol(node, "static"),
             "type_item" => self.extract_named_symbol(node, "type_alias"),
-            "macro_invocation" => self.extract_macro_diagnostic(node),
+            "macro_definition" => self.extract_macro_definition(node),
+            "macro_invocation" => self.extract_macro_invocation(node),
             "call_expression" => self.extract_call_expression(node),
             "line_comment" | "block_comment" => self.extract_comment_markers(node),
+            "attribute_item" | "inner_attribute_item" => self.extract_lint_suppression(node),
             "function_signature_item" => self.extract_function_signature(node),
             "unsafe_block" => self.extract_unsafe_block(node),
             _ => self.walk_children(node),
@@ -307,24 +393,40 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         // reachability queries (issue #213) can resolve the module chain
         // without re-parsing source. Additive per
         // `docs/schema/schema-versioning.md §2`; never an identity input.
+        let mut module_record = GraphRecord::syntax_node(
+            id.clone(),
+            NodeKind::Module,
+            self.file.repo_relative_path.clone(),
+            span(node),
+            qualified_name.clone(),
+            "rust",
+            format!("Rust module {qualified_name}"),
+        )
+        .with_declaration_surface(Some(self.symbol_visibility(node).to_owned()), None, None)
+        // Test-vs-production role (issue #238): a `#[cfg(test)] mod`
+        // declaration is itself the lexical gate, so the Module record
+        // carries the same role its member symbols get. Stamped before
+        // the scope counter is entered for the module's children.
+        .with_role(self.symbol_role(node));
+        // Conditional-compilation gates (issue #190): the module's own
+        // `#[cfg(...)]` / `#[cfg_attr(...)]` predicates plus every enclosing
+        // gated item/module, outermost first. Member symbols inherit this
+        // chain through the parent-chain walk. Stamped only when non-empty —
+        // ungated modules carry no `cfg` field. Additive, never an identity
+        // input.
+        let module_cfg_gates = self.cfg_gate_chain(node);
+        if !module_cfg_gates.is_empty() {
+            module_record = module_record.with_cfg(module_cfg_gates);
+        }
         self.graph.push(
-            GraphRecord::syntax_node(
-                id.clone(),
-                NodeKind::Module,
-                self.file.repo_relative_path.clone(),
-                span(node),
-                qualified_name.clone(),
-                "rust",
-                format!("Rust module {qualified_name}"),
-            )
-            .with_declaration_surface(Some(self.symbol_visibility(node).to_owned()), None, None)
-            // The module summary is name-only, so a body change with an
-            // unchanged name would hash identically. Stamp a compact BLAKE3
-            // handle over the normalized body so evidence-freshness drift stays
-            // content-detectable (issue #206). Inline `mod foo { .. }` covers
-            // the whole body; out-of-line `mod foo;` covers just the
-            // declaration (the target file's own records carry its body).
-            .with_content_signature(content_signature(self.node_text(node))),
+            module_record
+                // The module summary is name-only, so a body change with an
+                // unchanged name would hash identically. Stamp a compact BLAKE3
+                // handle over the normalized body so evidence-freshness drift stays
+                // content-detectable (issue #206). Inline `mod foo { .. }` covers
+                // the whole body; out-of-line `mod foo;` covers just the
+                // declaration (the target file's own records carry its body).
+                .with_content_signature(content_signature(self.node_text(node))),
         );
         self.add_edge(
             EdgeLabel::Contains,
@@ -346,6 +448,13 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 test_gated: is_test_module || self.in_test_context(),
                 path_override: self.mod_path_override(node),
                 under_inline_path_override: self.inline_path_override_depth > 0,
+                // The declaration's full gate chain (issue #190): the target
+                // file's records inherit this via the repo-wide
+                // `apply_out_of_line_cfg_gates` pass. Computed before the
+                // module-name stack is pushed — the chain is a pure function
+                // of the AST parent chain plus the file's inner attributes,
+                // so stack state is irrelevant.
+                cfg_gates: self.cfg_gate_chain(node),
             });
         }
 
@@ -658,22 +767,31 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
 
         let id = self.add_symbol(node, symbol_kind, &qualified_name);
         let is_trait_method = self.is_direct_trait_method(node);
+        // The lexically-enclosing function/method/test symbol, if any — the
+        // scope identity a block-local `fn` declared here records for
+        // lexically-scoped call recall (issue #422). Captured BEFORE this
+        // function's own id is pushed onto `enclosing_fn_ids` below.
+        let enclosing_scope_id = self.enclosing_fn_ids.last().cloned();
+        let is_block_local = Self::is_block_local_fn(node);
         // A block-local `fn` (declared inside a function/closure BODY) is
         // lexically unreachable from other scopes (issue #413 round 3, Codex
         // finding A). Its Symbol node keeps the corrected free-function identity
         // (kind `function`, module-qualified name, no false `Owner::fn` method,
         // no owner DEFINES — `add_symbol` above is intentionally NOT gated, so
         // the node + its DEFINES edge and referential closure are preserved).
-        // But it MUST NOT enter ANY call-candidate set, or a call from another
-        // scope could bind the buried item — a wrong or ambiguous edge (and a
-        // confident WRONG edge when the real target is external, leaving the
-        // block-local the sole in-repo candidate). Two candidate sets feed call
-        // resolution, so both are gated: the per-file name→id map
+        // But it MUST NOT enter ANY flat call-candidate set, or a call from
+        // another scope could bind the buried item — a wrong or ambiguous edge
+        // (and a confident WRONG edge when the real target is external, leaving
+        // the block-local the sole in-repo candidate). Two candidate sets feed
+        // call resolution, so both stay gated: the per-file name→id map
         // (`self.definitions`, read by the issue #134 `emit_reference_edges`
         // same-file pass) AND the repo-wide `FileFacts::definitions`
         // (cross-file + same-file-labeling). Lexically-scoped recall of
-        // intra-block calls is deferred to a follow-up.
-        if !Self::is_block_local_fn(node) {
+        // intra-block calls rides a THIRD, scope-gated set instead
+        // (`FileFacts::block_local_definitions`, issue #422): the def records
+        // its enclosing scope's identity, and the resolver admits it as a
+        // candidate ONLY for calls from that scope.
+        if !is_block_local {
             self.definitions.insert(local_name.clone(), id.clone());
             self.definitions.insert(qualified_name.clone(), id.clone());
             self.facts.definitions.push(DefinitionFact {
@@ -689,16 +807,40 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 is_trait_method,
                 repo_relative_path: self.file.repo_relative_path.clone(),
             });
+        } else if let Some(enclosing_scope_id) = enclosing_scope_id {
+            // Issue #422: a block-local `fn` with an enclosing function symbol
+            // joins the scope-gated candidate set (never the flat index).
+            // `local_name` is moved (not cloned): nothing below uses it.
+            self.facts
+                .block_local_definitions
+                .push(BlockLocalDefinitionFact {
+                    id: id.clone(),
+                    qualified_name: qualified_name.clone(),
+                    simple_name: local_name,
+                    symbol_kind: symbol_kind.to_owned(),
+                    enclosing_scope_id,
+                    repo_relative_path: self.file.repo_relative_path.clone(),
+                });
         }
+        // A block-local `fn` with NO enclosing function symbol (e.g. inside a
+        // `const` initializer at module level) records no scoped fact either:
+        // no call site can carry a matching caller id, so its calls stay
+        // unresolved — a MISS, never a WRONG edge.
+        self.enclosing_fn_ids.push(id.clone());
+        self.enclosing_fn_names.push(qualified_name.clone());
         // Build this function's provable receiver-type environment (issue #441)
-        // and install it for the duration of the call-site collection, then
-        // restore the caller's environment. Nested functions collect their own
-        // call sites through their own `extract_function` and build their own
-        // environment, so scopes never bleed.
-        let type_env = self.build_type_env(node);
+        // and trait-dispatch environment (issue #267) and install them for the
+        // duration of the call-site collection, then restore the caller's
+        // environments. Nested functions collect their own call sites through
+        // their own `extract_function` and build their own environments, so
+        // scopes never bleed.
+        let (type_env, dispatch_trait_env) = self.build_type_env(node);
         let outer_type_env = std::mem::replace(&mut self.type_env, type_env);
+        let outer_dispatch_env =
+            std::mem::replace(&mut self.dispatch_trait_env, dispatch_trait_env);
         self.collect_call_sites(node, &id, &qualified_name);
         self.type_env = outer_type_env;
+        self.dispatch_trait_env = outer_dispatch_env;
         self.symbol_bodies.push(SymbolBody {
             id,
             name: qualified_name,
@@ -712,6 +854,8 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         if is_test_fn {
             self.test_scope_depth -= 1;
         }
+        self.enclosing_fn_ids.pop();
+        self.enclosing_fn_names.pop();
     }
 
     /// Match segments for a callable definition: the module path, plus the
@@ -806,104 +950,139 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         if function.kind() == "generic_function" {
             function = function.child_by_field_name("function")?;
         }
-        let (display, segments, call_kind, receiver_owner, path_root, receiver_type) =
-            match function.kind() {
-                "identifier" => {
-                    let name = self.node_text(function).trim().to_owned();
-                    (
-                        name.clone(),
-                        vec![name],
-                        CallKind::Direct,
-                        None,
-                        CallPathRoot::Unqualified,
-                        None,
-                    )
+        let callee = match function.kind() {
+            "identifier" => {
+                let name = self.node_text(function).trim().to_owned();
+                CallCallee {
+                    display: name.clone(),
+                    segments: vec![name],
+                    call_kind: CallKind::Direct,
+                    receiver_owner: None,
+                    path_root: CallPathRoot::Unqualified,
+                    receiver_type: None,
+                    dispatch_trait: None,
                 }
-                "scoped_identifier" => {
-                    let display = self.node_text(function).trim().to_owned();
-                    let segments = self.normalize_call_path(&display)?;
-                    // Classify the leading crate scope BEFORE it is lost to
-                    // normalization (issue #440): a `crate`/`self`/`super` head names
-                    // the caller's own crate; any other head may name a workspace
-                    // crate, so retain the raw first segment for the registry lookup.
-                    let path_root = match display.split("::").next().map(str::trim) {
-                        Some("crate" | "self" | "super") => CallPathRoot::CurrentCrate,
-                        Some(first) if !first.is_empty() => CallPathRoot::Leading(first.to_owned()),
-                        _ => CallPathRoot::Unqualified,
-                    };
-                    (display, segments, CallKind::Path, None, path_root, None)
+            }
+            "scoped_identifier" => {
+                let display = self.node_text(function).trim().to_owned();
+                let segments = self.normalize_call_path(&display)?;
+                // Classify the leading crate scope BEFORE it is lost to
+                // normalization (issue #440): a `crate`/`self`/`super` head names
+                // the caller's own crate; any other head may name a workspace
+                // crate, so retain the raw first segment for the registry lookup.
+                let path_root = match display.split("::").next().map(str::trim) {
+                    Some("crate" | "self" | "super") => CallPathRoot::CurrentCrate,
+                    Some(first) if !first.is_empty() => CallPathRoot::Leading(first.to_owned()),
+                    _ => CallPathRoot::Unqualified,
+                };
+                CallCallee {
+                    display,
+                    segments,
+                    call_kind: CallKind::Path,
+                    receiver_owner: None,
+                    path_root,
+                    receiver_type: None,
+                    dispatch_trait: None,
                 }
-                "field_expression" => {
-                    let field = function.child_by_field_name("field")?;
-                    if field.kind() != "field_identifier" {
-                        return None;
-                    }
-                    let name = self.node_text(field).trim().to_owned();
-                    let receiver_value = function.child_by_field_name("value");
-                    let receiver_is_self =
-                        receiver_value.is_some_and(|value| value.kind() == "self");
-                    let owner = receiver_is_self
-                        .then(|| {
-                            // A `self.method()` receiver call carries the owner of
-                            // the enclosing `Self` so the SelfMethod branch can
-                            // narrow to it: the impl owner inside an impl block
-                            // (unchanged), else the enclosing trait name inside a
-                            // trait body (issue #390). Inside a trait there is no
-                            // `impl_context`, so before this the owner was None and
-                            // the call collapsed to a plain `Method` that fanned out
-                            // to every same-named trait method. `impl_context` takes
-                            // precedence when both are set (a nested impl inside a
-                            // trait default body). The trait name is the raw
-                            // `trait_context` string, matching the trait-method
-                            // owner segment in `definition_match_segments`.
-                            self.impl_context
-                                .as_ref()
-                                .and_then(|impl_context| {
-                                    normalize_impl_owner(&impl_context.method_owner)
-                                })
-                                .or_else(|| self.trait_context.clone())
-                        })
-                        .flatten();
-                    let call_kind = if owner.is_some() {
-                        CallKind::SelfMethod
-                    } else {
-                        CallKind::Method
-                    };
-                    // Provable receiver type (issue #441): for a non-`self` receiver
-                    // that is a simple `identifier` binding whose type is in this
-                    // function's unshadowed type environment, stamp the reduced
-                    // nominal type so the resolver can narrow `x.method()` to that
-                    // type's own method. A `self` receiver keeps `receiver_owner`
-                    // only; a receiver that is not a bare identifier, or whose name
-                    // is not a provable binding, gets `None` (today's fan-out).
-                    let receiver_type = (!receiver_is_self)
-                        .then(|| receiver_value.filter(|value| value.kind() == "identifier"))
-                        .flatten()
-                        .and_then(|value| self.type_env.get(self.node_text(value).trim()).cloned());
-                    (
-                        name.clone(),
-                        vec![name],
-                        call_kind,
-                        owner,
-                        CallPathRoot::Unqualified,
-                        receiver_type,
-                    )
-                }
-                _ => return None,
-            };
-        if segments.is_empty() || segments.iter().any(|segment| !is_simple_ident(segment)) {
+            }
+            "field_expression" => self.method_call_callee(function)?,
+            _ => return None,
+        };
+        if callee.segments.is_empty()
+            || callee
+                .segments
+                .iter()
+                .any(|segment| !is_simple_ident(segment))
+        {
             return None;
         }
         Some(CallSiteFact {
             caller_id: caller_id.to_owned(),
             caller_name: caller_name.to_owned(),
-            callee_display: display,
-            callee_segments: segments,
-            call_kind,
-            path_root,
-            receiver_owner,
-            receiver_type,
+            callee_display: callee.display,
+            callee_segments: callee.segments,
+            call_kind: callee.call_kind,
+            path_root: callee.path_root,
+            receiver_owner: callee.receiver_owner,
+            receiver_type: callee.receiver_type,
+            dispatch_trait: callee.dispatch_trait,
             span: span(node),
+        })
+    }
+
+    /// Resolves the callee components of a `field_expression` call
+    /// (`receiver.method()`): the method name plus the receiver-derived
+    /// narrowing facts — the `self`-receiver owner (issue #390), the provable
+    /// receiver type (issue #441), and the provable trait-dispatch binding
+    /// (issue #267). Returns `None` when the field is not a plain method
+    /// identifier.
+    fn method_call_callee(&self, function: Node<'_>) -> Option<CallCallee> {
+        let field = function.child_by_field_name("field")?;
+        if field.kind() != "field_identifier" {
+            return None;
+        }
+        let name = self.node_text(field).trim().to_owned();
+        let receiver_value = function.child_by_field_name("value");
+        let receiver_is_self = receiver_value.is_some_and(|value| value.kind() == "self");
+        let owner = receiver_is_self
+            .then(|| {
+                // A `self.method()` receiver call carries the owner of
+                // the enclosing `Self` so the SelfMethod branch can
+                // narrow to it: the impl owner inside an impl block
+                // (unchanged), else the enclosing trait name inside a
+                // trait body (issue #390). Inside a trait there is no
+                // `impl_context`, so before this the owner was None and
+                // the call collapsed to a plain `Method` that fanned out
+                // to every same-named trait method. `impl_context` takes
+                // precedence when both are set (a nested impl inside a
+                // trait default body). The trait name is the raw
+                // `trait_context` string, matching the trait-method
+                // owner segment in `definition_match_segments`.
+                self.impl_context
+                    .as_ref()
+                    .and_then(|impl_context| normalize_impl_owner(&impl_context.method_owner))
+                    .or_else(|| self.trait_context.clone())
+            })
+            .flatten();
+        let call_kind = if owner.is_some() {
+            CallKind::SelfMethod
+        } else {
+            CallKind::Method
+        };
+        // Provable receiver type (issue #441): for a non-`self` receiver
+        // that is a simple `identifier` binding whose type is in this
+        // function's unshadowed type environment, stamp the reduced
+        // nominal type so the resolver can narrow `x.method()` to that
+        // type's own method. A `self` receiver keeps `receiver_owner`
+        // only; a receiver that is not a bare identifier, or whose name
+        // is not a provable binding, gets `None` (today's fan-out).
+        let receiver_type = (!receiver_is_self)
+            .then(|| receiver_value.filter(|value| value.kind() == "identifier"))
+            .flatten()
+            .and_then(|value| self.type_env.get(self.node_text(value).trim()).cloned());
+        // Provable trait-dispatch binding (issue #267): for a
+        // non-`self` receiver that is a simple `identifier` binding
+        // whose ascribed type is provably trait-typed (`&dyn
+        // Trait`, `Box<dyn Trait>`, or a single-bound type
+        // parameter), stamp the trait path as written so the
+        // resolver can expand the call to every known in-crate
+        // implementor method.
+        let dispatch_trait = (!receiver_is_self)
+            .then(|| receiver_value.filter(|value| value.kind() == "identifier"))
+            .flatten()
+            .and_then(|value| {
+                self.dispatch_trait_env
+                    .get(self.node_text(value).trim())
+                    .cloned()
+            });
+        Some(CallCallee {
+            display: name.clone(),
+            segments: vec![name],
+            call_kind,
+            receiver_owner: owner,
+            path_root: CallPathRoot::Unqualified,
+            receiver_type,
+            dispatch_trait,
         })
     }
 
@@ -953,9 +1132,8 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         })
     }
 
-    /// Builds the per-function provable receiver-type environment (issue #441):
-    /// binding identifier -> reduced nominal type path, for a receiver whose
-    /// type is syntactically PROVABLE and UNSHADOWED in the function body.
+    /// Builds the per-function receiver-type environment (issue #441) AND the
+    /// trait-dispatch environment (issue #267).
     ///
     /// Entries come from (a) fn params with a simple-identifier pattern and a
     /// nominal type, and (b) `let x: T` declarations with a simple-identifier
@@ -963,17 +1141,35 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     /// pointer, and single-level generic types reduce to their core nominal
     /// type; anything else yields no entry ([`reduce_receiver_type`]).
     ///
+    /// The dispatch environment maps a binding to its trait path as written
+    /// when the ascribed type is provably trait-typed: a `dyn Trait` type
+    /// (directly, or inside `Box`/`Rc`/`Arc` — the std smart pointers whose
+    /// method calls deref to the trait object), or a bare type parameter with
+    /// exactly one trait bound (`fn g<T: Trait>(t: T)`, `where T: Trait`).
+    /// Multi-bound parameters and non-`dyn` types yield no dispatch entry.
+    ///
     /// SHADOWING VETO (conservative): every binding occurrence of each
     /// identifier anywhere in the body is counted — additional `let` shadows,
     /// `for x in`, closure params, `if let`/`while let`, and `match` arm
     /// bindings, including nested destructuring. Any identifier bound at MORE
-    /// THAN ONE site is non-provable and dropped, so a shadowed receiver falls
-    /// back to today's ambiguous fan-out (prefer a MISSING narrowing to a WRONG
-    /// one). Only expression-position identifiers (the receiver USE `x.m()`)
-    /// are never counted as binders, so a single typed binding survives.
-    fn build_type_env(&self, fn_node: Node<'_>) -> BTreeMap<String, String> {
-        let mut env: BTreeMap<String, String> = BTreeMap::new();
+    /// THAN ONE site is non-provable and dropped from BOTH environments, so a
+    /// shadowed receiver falls back to today's ambiguous fan-out (prefer a
+    /// MISSING narrowing to a WRONG one). Only expression-position identifiers
+    /// (the receiver USE `x.m()`) are never counted as binders, so a single
+    /// typed binding survives.
+    fn build_type_env(
+        &self,
+        fn_node: Node<'_>,
+    ) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+        let mut type_env: BTreeMap<String, String> = BTreeMap::new();
+        let mut dispatch_env: BTreeMap<String, String> = BTreeMap::new();
         let mut binder_counts: BTreeMap<String, usize> = BTreeMap::new();
+
+        // Type-parameter trait bounds for generic dispatch (issue #267): `T`
+        // -> its single trait bound's as-written path, from inline bounds and
+        // `where` clauses alike.
+        let mut type_param_bounds: BTreeMap<String, String> = BTreeMap::new();
+        self.collect_type_param_bounds(fn_node, &mut type_param_bounds);
 
         if let Some(params) = fn_node.child_by_field_name("parameters") {
             let mut cursor = params.walk();
@@ -990,21 +1186,123 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 for ident in &idents {
                     *binder_counts.entry(ident.clone()).or_default() += 1;
                 }
-                if pattern.kind() == "identifier"
-                    && let Some(type_node) = param.child_by_field_name("type")
-                    && let Some(reduced) = reduce_receiver_type(type_node, self.source)
-                {
-                    env.insert(self.node_text(pattern).trim().to_owned(), reduced);
+                if pattern.kind() != "identifier" {
+                    continue;
+                }
+                let Some(type_node) = param.child_by_field_name("type") else {
+                    continue;
+                };
+                let binding = self.node_text(pattern).trim().to_owned();
+                // Dispatch first: a `dyn Trait` ascription (even wrapped in
+                // `Box`/`Rc`/`Arc`) is trait-typed, never a nominal receiver
+                // type — `reduce_receiver_type` would reduce `Box<dyn Trait>`
+                // to the misleading `Box`.
+                if let Some(trait_path) = reduce_dispatch_trait(type_node, self.source) {
+                    dispatch_env.insert(binding, trait_path);
+                } else if let Some(reduced) = reduce_receiver_type(type_node, self.source) {
+                    type_env.insert(binding.clone(), reduced.clone());
+                    // A generic type-parameter receiver (`fn g<T: Trait>(t: T)`
+                    // or `fn g<T>(t: &T) where T: Trait`): the bound is the
+                    // dispatch trait.
+                    if let Some(bound) = type_param_bounds.get(reduced.as_str()) {
+                        dispatch_env.insert(binding, bound.clone());
+                    }
                 }
             }
         }
 
         if let Some(body) = fn_node.child_by_field_name("body") {
-            self.scan_body_binders(body, &mut env, &mut binder_counts);
+            self.scan_body_binders(
+                body,
+                &mut type_env,
+                &mut dispatch_env,
+                &type_param_bounds,
+                &mut binder_counts,
+            );
         }
 
-        env.retain(|name, _| binder_counts.get(name).copied() == Some(1));
-        env
+        type_env.retain(|name, _| binder_counts.get(name).copied() == Some(1));
+        dispatch_env.retain(|name, _| binder_counts.get(name).copied() == Some(1));
+        (type_env, dispatch_env)
+    }
+
+    /// Collects `type_parameter_name -> single trait bound path` from a
+    /// function item's inline `type_parameters` and its `where_clause`
+    /// (issue #267). Only a parameter with EXACTLY ONE DISTINCT simple trait
+    /// bound across BOTH sources is recorded: bounds accumulate per parameter
+    /// (a `T: A` inline plus a `T: B` where-clause is two bounds, not one),
+    /// and multi-bound, lifetime-only, or complex bounds yield nothing.
+    fn collect_type_param_bounds(&self, fn_node: Node<'_>, out: &mut BTreeMap<String, String>) {
+        let mut accumulated: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut push_bound = |name: String, bound: String| {
+            let entry = accumulated.entry(name).or_default();
+            if !entry.contains(&bound) {
+                entry.push(bound);
+            }
+        };
+        if let Some(params) = fn_node.child_by_field_name("type_parameters") {
+            let mut cursor = params.walk();
+            let children: Vec<Node<'_>> = params.named_children(&mut cursor).collect();
+            for param in children {
+                if param.kind() != "type_parameter" {
+                    continue;
+                }
+                let Some(name_node) = param.child_by_field_name("name") else {
+                    continue;
+                };
+                let name = node_source(name_node, self.source).trim().to_owned();
+                if name.is_empty() {
+                    continue;
+                }
+                if let Some(bounds) = param.child_by_field_name("bounds")
+                    && let Some(trait_path) = single_trait_bound_path(bounds, self.source)
+                {
+                    push_bound(name, trait_path);
+                }
+            }
+        }
+        // Where clauses: `fn g<T>(...) where T: Trait`. The grammar exposes the
+        // `where_clause` as a direct named child of the function item, not a
+        // field.
+        let where_clause = {
+            let mut cursor = fn_node.walk();
+            fn_node
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "where_clause")
+        };
+        if let Some(where_clause) = where_clause {
+            let mut cursor = where_clause.walk();
+            let children: Vec<Node<'_>> = where_clause.named_children(&mut cursor).collect();
+            for predicate in children {
+                if predicate.kind() != "where_predicate" {
+                    continue;
+                }
+                let Some(left) = predicate.child_by_field_name("left") else {
+                    continue;
+                };
+                // A bare type parameter's `left` is a `type_identifier`; a
+                // concrete type's predicate (`where Vec<T>: Clone`) is not a
+                // dispatch source.
+                if left.kind() != "type_identifier" {
+                    continue;
+                }
+                let name = node_source(left, self.source).trim().to_owned();
+                if name.is_empty() {
+                    continue;
+                }
+                if let Some(bounds) = predicate.child_by_field_name("bounds")
+                    && let Some(trait_path) = single_trait_bound_path(bounds, self.source)
+                {
+                    push_bound(name, trait_path);
+                }
+            }
+        }
+        for (name, bounds) in accumulated {
+            // Exactly one DISTINCT bound across inline and where sources.
+            if let [bound] = bounds.as_slice() {
+                out.insert(name, bound.clone());
+            }
+        }
     }
 
     /// Recursively scans a function body, recording `let x: T` type-env entries
@@ -1017,7 +1315,9 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     fn scan_body_binders(
         &self,
         node: Node<'_>,
-        env: &mut BTreeMap<String, String>,
+        type_env: &mut BTreeMap<String, String>,
+        dispatch_env: &mut BTreeMap<String, String>,
+        type_param_bounds: &BTreeMap<String, String>,
         binder_counts: &mut BTreeMap<String, usize>,
     ) {
         let kind = node.kind();
@@ -1031,9 +1331,18 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                     }
                     if pattern.kind() == "identifier"
                         && let Some(type_node) = node.child_by_field_name("type")
-                        && let Some(reduced) = reduce_receiver_type(type_node, self.source)
                     {
-                        env.insert(self.node_text(pattern).trim().to_owned(), reduced);
+                        let binding = self.node_text(pattern).trim().to_owned();
+                        // Dispatch first, mirroring the param handling above:
+                        // a `dyn Trait` ascription is trait-typed.
+                        if let Some(trait_path) = reduce_dispatch_trait(type_node, self.source) {
+                            dispatch_env.insert(binding, trait_path);
+                        } else if let Some(reduced) = reduce_receiver_type(type_node, self.source) {
+                            type_env.insert(binding.clone(), reduced.clone());
+                            if let Some(bound) = type_param_bounds.get(reduced.as_str()) {
+                                dispatch_env.insert(binding, bound.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -1071,7 +1380,13 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         let mut cursor = node.walk();
         let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
         for child in children {
-            self.scan_body_binders(child, env, binder_counts);
+            self.scan_body_binders(
+                child,
+                type_env,
+                dispatch_env,
+                type_param_bounds,
+                binder_counts,
+            );
         }
     }
 
@@ -1204,6 +1519,10 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 end_byte: comment_start_byte + marker.note_end,
                 start_line: line,
                 end_line: line,
+                // Debt-marker offsets are computed from comment byte offsets;
+                // the column within the line is not tracked (issue #463).
+                start_column: None,
+                end_column: None,
             };
             self.graph.push(
                 GraphRecord::syntax_node(
@@ -1244,26 +1563,100 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         current
     }
 
-    fn extract_macro_diagnostic(&mut self, node: Node<'_>) {
-        let invocation = macro_invocation_name(self.node_text(node));
-        let disambiguator = self.next_diagnostic_disambiguator(&invocation);
-        let id = stable_id(&[
-            "node",
-            "diagnostic",
-            self.repository_id,
-            &self.file.repo_relative_path,
-            &invocation,
-            &disambiguator.to_string(),
-        ]);
-        self.graph.push(GraphRecord::syntax_node(
+    /// Extracts a `macro_rules!` definition as a `macro` symbol (issue #148):
+    /// the Symbol record plus its DEFINES edge (via [`Self::add_symbol`]),
+    /// and a [`MacroDefinitionFact`] for the repo-wide macro-resolution
+    /// pass. `#[macro_export]` is detected from the preceding attribute
+    /// siblings and surfaces as `public` visibility; any other macro is
+    /// `private` (`macro_rules!` has no `pub` modifier of its own).
+    ///
+    /// The macro body is deliberately NOT walked: token trees are opaque to
+    /// the grammar and macro bodies are never expanded (the trust-separation
+    /// boundary — parsed source only, no expansion).
+    fn extract_macro_definition(&mut self, node: Node<'_>) {
+        let Some(local_name) = node_name(node, self.source) else {
+            return;
+        };
+        let qualified_name = self.qualify(&local_name);
+        let id = self.add_symbol(node, "macro", &qualified_name);
+        self.facts.macro_definitions.push(MacroDefinitionFact {
             id,
-            NodeKind::Diagnostic,
-            self.file.repo_relative_path.clone(),
-            span(node),
-            invocation.clone(),
-            "rust",
-            format!("unsupported macro invocation {invocation}"),
-        ));
+            simple_name: local_name,
+            qualified_name,
+            repo_relative_path: self.file.repo_relative_path.clone(),
+        });
+    }
+
+    /// `true` when an `#[macro_export]` attribute item immediately precedes
+    /// the node (comments are skipped), mirroring
+    /// [`Self::deprecation_attribute`].
+    fn has_macro_export_attribute(&self, node: Node<'_>) -> bool {
+        let mut current = node.prev_sibling();
+        while let Some(sibling) = current {
+            match sibling.kind() {
+                "attribute_item" => {
+                    let text: String = self
+                        .node_text(sibling)
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .collect();
+                    if text == "#[macro_export]" {
+                        return true;
+                    }
+                }
+                "line_comment" | "block_comment" => {}
+                _ => break,
+            }
+            current = sibling.prev_sibling();
+        }
+        false
+    }
+
+    /// Maps a `macro_rules!` definition onto the closed visibility set from
+    /// issue #124: `#[macro_export]` publishes the macro at the crate root
+    /// (effectively `public`); a plain `macro_rules!` is textually scoped to
+    /// its module (`private`). `macro_rules!` accepts no `pub` modifier, so
+    /// [`Self::symbol_visibility`] does not apply.
+    fn macro_visibility(&self, node: Node<'_>) -> &'static str {
+        if self.has_macro_export_attribute(node) {
+            "public"
+        } else {
+            "private"
+        }
+    }
+
+    /// Records a `macro_invocation` site as a [`MacroInvocationFact`] for
+    /// the repo-wide macro-resolution pass (issue #148). Nothing is emitted
+    /// here: the pass mints either a resolved `CALLS` edge to the unique
+    /// repo-defined macro or the pre-existing `unsupported macro invocation`
+    /// Diagnostic, so external macros (e.g. `println!`) keep byte-identical
+    /// diagnostics.
+    ///
+    /// The invoking scope is the lexically-enclosing function symbol when the
+    /// site sits inside one, else the enclosing module or the file itself.
+    fn extract_macro_invocation(&mut self, node: Node<'_>) {
+        let invocation = macro_invocation_name(self.node_text(node));
+        let simple_name = invocation
+            .trim_end_matches('!')
+            .rsplit("::")
+            .next()
+            .unwrap_or("")
+            .to_owned();
+        let disambiguator = self.next_diagnostic_disambiguator(&invocation);
+        let (caller_id, caller_name) =
+            match (self.enclosing_fn_ids.last(), self.enclosing_fn_names.last()) {
+                (Some(id), Some(name)) => (id.clone(), name.clone()),
+                _ => (self.owner_id(), self.owner_name()),
+            };
+        self.facts.macro_invocations.push(MacroInvocationFact {
+            caller_id,
+            caller_name,
+            invocation_display: invocation,
+            simple_name,
+            span: span(node),
+            diagnostic_disambiguator: disambiguator,
+            repo_relative_path: self.file.repo_relative_path.clone(),
+        });
     }
 
     /// Visits a `call_expression`: emits a deterministic `PanicRiskSite`
@@ -1337,10 +1730,70 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     }
 
     /// `true` when the cursor is inside any test scope: a file under a
-    /// top-level `tests/` directory, a `#[cfg(test)]` module, or a `#[test]`
-    /// function. The classification set is closed for issue #223.
+    /// top-level `tests/` or `benches/` directory, a `#[cfg(test)]` module,
+    /// or a `#[test]`-family function. The classification set is closed for
+    /// issue #223; issue #238 reuses it as signals (b) and (c).
     const fn in_test_context(&self) -> bool {
-        self.file_in_tests_dir || self.test_scope_depth > 0
+        self.file_in_test_root || self.test_scope_depth > 0
+    }
+
+    /// Derives the deterministic test-vs-production role for one symbol
+    /// (issue #238): `Test` when the item carries a test-family attribute
+    /// (signal a) or sits in a test context (signals b/c, composed by
+    /// [`Self::in_test_context`]); `Production` otherwise. A `mod` item
+    /// carrying `#[cfg(test)]` is itself `Test`: its declaration is the
+    /// lexical gate, even though the scope counter is entered only for its
+    /// children. A bare `#[cfg(test)] fn` is NOT test — the gate applies to
+    /// modules, not items. The full decision procedure is documented in
+    /// `docs/cli/test-production-roles.md`.
+    fn symbol_role(&self, node: Node<'_>) -> SymbolRole {
+        if self.has_test_family_attribute(node)
+            || self.in_test_context()
+            || (node.kind() == "mod_item" && self.has_cfg_test_attribute(node))
+        {
+            SymbolRole::Test
+        } else {
+            SymbolRole::Production
+        }
+    }
+
+    /// Builds the item's conditional-compilation gate chain (issue #190):
+    /// the file's `#![cfg(...)]` inner attributes first, then every enclosing
+    /// gated item/module outermost-first, then the item's own `#[cfg(...)]` /
+    /// `#[cfg_attr(...)]` predicates. Empty when the item is ungated — the
+    /// caller stamps nothing, so ungated records carry no `cfg` field. Pure
+    /// function of the AST: deterministic and walk-order independent.
+    fn cfg_gate_chain(&self, node: Node<'_>) -> Vec<String> {
+        let mut gates = self.file_cfg_gates.clone();
+        gates.extend(enclosing_cfg_gates(node, self.source));
+        gates.extend(own_cfg_gates(node, self.source));
+        gates
+    }
+
+    /// `true` when the item carries a test-family attribute in the attribute
+    /// items immediately preceding it: `#[test]`, `#[bench]`, or a path
+    /// attribute ending in `::test` / `::bench` (e.g. `#[tokio::test]`),
+    /// with or without arguments (issue #238 signal a). Reuses issue #240's
+    /// closed [`entry_point_kind_from_attribute`] vocabulary rather than
+    /// defining a second one; configuration attributes that merely mention
+    /// these tokens (`#[cfg(test)]`, `#[cfg_attr(test, ...)]`) never match.
+    fn has_test_family_attribute(&self, node: Node<'_>) -> bool {
+        let mut current = node.prev_sibling();
+        while let Some(sibling) = current {
+            match sibling.kind() {
+                "attribute_item" => {
+                    if entry_point_kind_from_attribute(self.node_text(sibling))
+                        == Some(EntryPointKind::Test)
+                    {
+                        return true;
+                    }
+                }
+                "line_comment" | "block_comment" => {}
+                _ => break,
+            }
+            current = sibling.prev_sibling();
+        }
+        false
     }
 
     /// `true` when the function carries a dedicated test attribute in the
@@ -1414,6 +1867,74 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         })
     }
 
+    /// Collects the `#[deprecated]` attribute facts on the item preceding
+    /// `node`, walking prev-siblings exactly like [`Self::has_test_attribute`]
+    /// (issue #249). The nearest `deprecated` attribute wins; the mark's
+    /// *presence* is the fact, so a bare `#[deprecated]` records a mark with
+    /// both payloads absent. Returns `None` when no `deprecated` attribute
+    /// precedes the item.
+    fn deprecation_attribute(&self, node: Node<'_>) -> Option<DeprecationMark> {
+        let mut current = node.prev_sibling();
+        while let Some(sibling) = current {
+            match sibling.kind() {
+                "attribute_item" => {
+                    if let Some(mark) = deprecation_from_attribute(sibling, self.source) {
+                        return Some(mark);
+                    }
+                }
+                "line_comment" | "block_comment" => {}
+                _ => break,
+            }
+            current = sibling.prev_sibling();
+        }
+        None
+    }
+
+    /// Collects the non-call entry-point facts on the item at `node` (issue
+    /// #240): `#[test]` / `#[bench]` (or a path attribute ending in
+    /// `::test` / `::bench`, e.g. `#[tokio::test]`), `#[no_mangle]` /
+    /// `#[export_name = "..."]`, and a free `fn main` in a binary crate
+    /// root. Attribute siblings are walked exactly like
+    /// [`Self::deprecation_attribute`]; the nearest matching attribute
+    /// wins. Returns `None` when the item is not a recognized entry point.
+    fn entry_point_mark(
+        &self,
+        node: Node<'_>,
+        symbol_kind: &str,
+        qualified_name: &str,
+    ) -> Option<EntryPointMark> {
+        // A free `fn main` in `src/main.rs` / `src/bin/**` is the binary's
+        // entry point. `enclosing_fn_ids` holds only lexically-enclosing
+        // functions here (the item's own id is pushed after `add_symbol`),
+        // so a non-empty stack means a nested `fn main`, not the entry.
+        // Trait-method signatures and default-bodied trait methods also
+        // arrive with `symbol_kind == "function"` but are not free items: a
+        // `trait_item` ancestor disqualifies them.
+        if symbol_kind == "function"
+            && self.enclosing_fn_ids.is_empty()
+            && qualified_name.rsplit("::").next() == Some("main")
+            && is_binary_crate_path(&self.file.repo_relative_path)
+            && !has_trait_item_ancestor(node)
+        {
+            return Some(EntryPointMark {
+                kind: EntryPointKind::BinaryEntry,
+            });
+        }
+        let mut current = node.prev_sibling();
+        while let Some(sibling) = current {
+            match sibling.kind() {
+                "attribute_item" => {
+                    if let Some(kind) = entry_point_kind_from_attribute(self.node_text(sibling)) {
+                        return Some(EntryPointMark { kind });
+                    }
+                }
+                "line_comment" | "block_comment" => {}
+                _ => break,
+            }
+            current = sibling.prev_sibling();
+        }
+        None
+    }
     /// Collects route-registration references from a `macro_invocation` when its
     /// macro name is in the closed registration set (`routes`) (issue #445).
     /// Each bare `identifier` token inside the macro's `token_tree` is recorded
@@ -1606,6 +2127,73 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         current
     }
 
+    /// Visits an `attribute_item` (`#[...]`) or `inner_attribute_item`
+    /// (`#![...]`): emits one deterministic `LintSuppression` record when the
+    /// attribute is an `allow` suppression (issue #227), then keeps walking
+    /// so any nested content (e.g. comments inside the token tree) is
+    /// visited exactly as before.
+    ///
+    /// Detection is purely AST-shaped — the attribute's own name leaf must be
+    /// exactly `allow` — so `#[allow(...)]` text inside line comments, doc
+    /// comments, block comments, and string literals can never match (those
+    /// are `line_comment` / `block_comment` / `string_literal` nodes, never
+    /// attribute nodes).
+    fn extract_lint_suppression(&mut self, node: Node<'_>) {
+        if let Some(facts) = lint_suppression_from_attribute(node, self.source) {
+            self.emit_lint_suppression(node, facts);
+        }
+        self.walk_children(node);
+    }
+
+    /// Emits one deterministic `LintSuppression` record plus the `CONTAINS`
+    /// edge from the owning file. The record's `name` carries the closed
+    /// scope string (`item` / `module` / `crate`); the sorted lint names and
+    /// the adjacent justification-comment signal ride the additive
+    /// [`LintSuppressionFacts`] payload.
+    fn emit_lint_suppression(&mut self, node: Node<'_>, facts: LintSuppressionFacts) {
+        let scope = facts.scope.as_str();
+        let disambiguator = self.next_lint_suppression_disambiguator(scope);
+        let id = stable_id(&[
+            "node",
+            "lint_suppression",
+            self.repository_id,
+            &self.file.repo_relative_path,
+            scope,
+            &disambiguator.to_string(),
+        ]);
+        self.graph.push(
+            GraphRecord::syntax_node(
+                id.clone(),
+                NodeKind::LintSuppression,
+                self.file.repo_relative_path.clone(),
+                span(node),
+                scope.to_owned(),
+                "rust",
+                format!("Rust #[allow(...)] lint suppression ({scope} scope)"),
+            )
+            .with_lint_suppression(facts),
+        );
+        self.add_edge(
+            EdgeLabel::Contains,
+            self.file_id.to_owned(),
+            id,
+            format!(
+                "{} contains #[allow(...)] lint suppression",
+                self.file.repo_relative_path
+            ),
+        );
+    }
+
+    fn next_lint_suppression_disambiguator(&mut self, scope: &str) -> u64 {
+        let disambiguator = self
+            .lint_suppression_ordinals
+            .entry(scope.to_owned())
+            .or_default();
+        let current = *disambiguator;
+        *disambiguator += 1;
+        current
+    }
+
     fn add_symbol(&mut self, node: Node<'_>, symbol_kind: &str, qualified_name: &str) -> String {
         let disambiguator = self.next_symbol_disambiguator(symbol_kind, qualified_name);
         let id = stable_id(&[
@@ -1632,8 +2220,15 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         if carries_declaration_surface(symbol_kind) {
             let doc = self.symbol_doc(node);
             let doc_present = doc.is_some();
+            // `macro_rules!` accepts no `pub` modifier: its visibility is the
+            // `#[macro_export]` signal (issue #148), not `symbol_visibility`.
+            let visibility = if symbol_kind == "macro" {
+                self.macro_visibility(node)
+            } else {
+                self.symbol_visibility(node)
+            };
             record = record.with_declaration_surface(
-                Some(self.symbol_visibility(node).to_owned()),
+                Some(visibility.to_owned()),
                 Some(self.symbol_signature(node)),
                 doc,
             );
@@ -1644,6 +2239,40 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         let route = self.route_annotations(node);
         if !route.is_empty() {
             record = record.with_route(route);
+        }
+        // Deprecation facts (issue #249): the mark's presence is the fact.
+        // The `since` / `note` payloads passed through redaction policy v1
+        // (like doc facts), so the policy version is stamped too.
+        if let Some(deprecation) = self.deprecation_attribute(node) {
+            record = record.with_deprecated(deprecation);
+            record = record.with_redaction_policy_version(REDACTION_POLICY_VERSION);
+        }
+        // Entry-point facts (issue #240): the mark's presence is the fact —
+        // a recognized non-call entry point is excluded from dead-code
+        // triage candidacy downstream. Pure attribute/path signal, never
+        // an identity input.
+        if let Some(entry_point) = self.entry_point_mark(node, symbol_kind, qualified_name) {
+            record = record.with_entry_point(entry_point);
+        }
+        // Test-vs-production role (issue #238): stamped on EVERY symbol
+        // record — the classification is total, so there is no unknown case
+        // at extraction time. Additive, never an identity input.
+        record = record.with_role(self.symbol_role(node));
+        // Conditional-compilation gates (issue #190): the item's own
+        // predicates plus every enclosing gated item/module, outermost first.
+        // Stamped only when the chain is non-empty — ungated symbols carry no
+        // `cfg` field, never a fabricated gate. Additive, never an identity
+        // input.
+        let cfg_gates = self.cfg_gate_chain(node);
+        if !cfg_gates.is_empty() {
+            record = record.with_cfg(cfg_gates);
+        }
+        // Structural complexity (issue #162): stamped on callable symbols
+        // (`function` / `method` / `test`) — a source-derived code fact, 1
+        // plus one per decision point in the item's own body. Additive,
+        // never an identity input.
+        if matches!(symbol_kind, "function" | "method" | "test") {
+            record = record.with_complexity(control_flow_complexity(node));
         }
         self.graph.push(record);
         self.add_edge(
@@ -1682,17 +2311,28 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     /// or the item header for type-defining items. The visibility modifier is
     /// excluded (it is carried by the `visibility` field), the body is
     /// excluded, and interior whitespace is collapsed via [`normalize_code`].
+    ///
+    /// A `macro_definition` has no `body` field (its rules are `macro_rule`
+    /// children): the header ends at the macro name, i.e. `macro_rules!
+    /// name`, so the (never expanded) rule bodies stay out of the signature.
     fn symbol_signature(&self, node: Node<'_>) -> String {
         let start = visibility_modifier(node).map_or_else(|| node.start_byte(), |v| v.end_byte());
-        let end = node
-            .child_by_field_name("body")
-            .filter(|body| {
-                matches!(
-                    body.kind(),
-                    "block" | "field_declaration_list" | "enum_variant_list" | "declaration_list"
-                )
-            })
-            .map_or_else(|| node.end_byte(), |body| body.start_byte());
+        let end = if node.kind() == "macro_definition" {
+            node.child_by_field_name("name")
+                .map_or_else(|| node.end_byte(), |name| name.end_byte())
+        } else {
+            node.child_by_field_name("body")
+                .filter(|body| {
+                    matches!(
+                        body.kind(),
+                        "block"
+                            | "field_declaration_list"
+                            | "enum_variant_list"
+                            | "declaration_list"
+                    )
+                })
+                .map_or_else(|| node.end_byte(), |body| body.start_byte())
+        };
         normalize_code(self.source.get(start..end).unwrap_or(""))
     }
 
@@ -1758,7 +2398,42 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     }
 
     fn emit_reference_edges(&mut self) {
-        emit_reference_edges(self.graph, &self.definitions, &self.symbol_bodies);
+        // Issue #267: (body ID, simple callee name) pairs with a trait-dispatch
+        // call site are repo-wide owned — the cross-file pass emits those
+        // pairs with their resolution labels (same-file included). The textual
+        // pass stays silent for them so its unlabeled edges never collide with
+        // (shadow) the owning pass's stable edge IDs.
+        let suppressed: BTreeSet<(String, String)> = self
+            .facts
+            .call_sites
+            .iter()
+            .filter(|call| call.dispatch_trait.is_some())
+            .filter_map(|call| {
+                call.callee_segments
+                    .last()
+                    .map(|name| (call.caller_id.clone(), name.clone()))
+            })
+            .collect();
+        // A block-local `fn` shadows its bare simple name for the enclosing
+        // body (issue #422): the text pass must not emit an edge from the
+        // enclosing body to the shadowed module-level definition — the bare
+        // call binds the block-local, whose edge the scope-gated resolver
+        // emits instead. Grouped here (after the full walk) so definitions
+        // nested anywhere in the body are all visible.
+        let mut shadowed_names: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for definition in &self.facts.block_local_definitions {
+            shadowed_names
+                .entry(definition.enclosing_scope_id.clone())
+                .or_default()
+                .push(definition.simple_name.clone());
+        }
+        emit_reference_edges(
+            self.graph,
+            &self.definitions,
+            &self.symbol_bodies,
+            &suppressed,
+            &shadowed_names,
+        );
     }
 
     /// Resolves every deferred impl trait lookup after the whole file has
@@ -2211,6 +2886,7 @@ fn carries_declaration_surface(symbol_kind: &str) -> bool {
             | "type_alias"
             | "const"
             | "static"
+            | "macro"
     )
 }
 
@@ -3091,6 +3767,105 @@ fn reduce_receiver_type(type_node: Node<'_>, source: &str) -> Option<String> {
     }
 }
 
+/// Reduces a type ascription to its dispatch-trait path (issue #267): returns
+/// `Some` when the ascribed type is provably a trait object or a single-bound
+/// generic wrapper around one — the trait path as written in source. Peels
+/// reference/pointer wrappers (`&dyn Trait`, `&mut dyn Trait`, `*const dyn
+/// Trait`) and recurses into the type arguments of the std Deref smart
+/// pointers `Box`/`Rc`/`Arc` (`Box<dyn Trait>`), because method calls on those
+/// always deref to the trait object (inherent methods on these foreign types
+/// are impossible, so no static method set can be shadowed). Any other shape
+/// — nominal types, other generic wrappers, multi-trait `dyn A + B` — yields
+/// `None`: a MISSING dispatch hint beats a WRONG one.
+fn reduce_dispatch_trait(type_node: Node<'_>, source: &str) -> Option<String> {
+    let mut core = type_node;
+    loop {
+        match core.kind() {
+            "reference_type" | "pointer_type" => {
+                core = core.child_by_field_name("type")?;
+            }
+            "generic_type" => {
+                let base = core.child_by_field_name("type")?;
+                let base_leaf = node_source(base, source)
+                    .trim()
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or_default();
+                if !matches!(base_leaf, "Box" | "Rc" | "Arc") {
+                    return None;
+                }
+                let args = core.child_by_field_name("type_arguments")?;
+                let mut cursor = args.walk();
+                let mut found: Option<String> = None;
+                for arg in args.named_children(&mut cursor) {
+                    if let Some(trait_path) = reduce_dispatch_trait(arg, source) {
+                        found = Some(trait_path);
+                        break;
+                    }
+                }
+                return found;
+            }
+            "dynamic_type" => {
+                return dispatch_trait_of_dynamic(core, source);
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// The trait path of a `dyn Trait` node (issue #267): the `trait` field's
+/// as-written path for a simple `type_identifier`/`scoped_type_identifier`;
+/// `None` for anything else (generic trait objects, `dyn A + B` shapes the
+/// grammar does not expose as a plain trait path).
+fn dispatch_trait_of_dynamic(dynamic_node: Node<'_>, source: &str) -> Option<String> {
+    let trait_node = dynamic_node.child_by_field_name("trait")?;
+    match trait_node.kind() {
+        "type_identifier" | "scoped_type_identifier" => {
+            let text = node_source(trait_node, source).trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        }
+        _ => None,
+    }
+}
+
+/// The trait path when a `trait_bounds` node carries exactly one simple trait
+/// path and no other trait bounds (issue #267); `None` otherwise. Lifetime
+/// bounds (`'static`) are ignored — they don't affect method dispatch.
+/// Multi-bound parameters refuse to guess: dispatch through one of several
+/// bounds is not provable from syntax alone.
+fn single_trait_bound_path(bounds: Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = bounds.walk();
+    let mut trait_paths: Vec<String> = Vec::new();
+    for child in bounds.named_children(&mut cursor) {
+        match child.kind() {
+            "lifetime" => {}
+            "type_identifier" | "scoped_type_identifier" => {
+                let text = node_source(child, source).trim();
+                if text.is_empty() {
+                    return None;
+                }
+                trait_paths.push(text.to_owned());
+            }
+            "generic_type" => {
+                // `T: Into<String>` — the dispatch trait is the base path.
+                let base = child.child_by_field_name("type")?;
+                if !matches!(base.kind(), "type_identifier" | "scoped_type_identifier") {
+                    return None;
+                }
+                let text = node_source(base, source).trim();
+                if text.is_empty() {
+                    return None;
+                }
+                trait_paths.push(text.to_owned());
+            }
+            _ => return None,
+        }
+    }
+    (trait_paths.len() == 1)
+        .then(|| trait_paths.into_iter().next())
+        .flatten()
+}
+
 /// Collects every binding identifier a pattern introduces (issue #441), for the
 /// shadowing veto. Pushes `identifier` and `shorthand_field_identifier` nodes;
 /// for `tuple_struct_pattern`/`struct_pattern` the constructor/type path (the
@@ -3169,6 +3944,511 @@ fn struct_literal_has_base(node: Node<'_>) -> bool {
         .any(|child| child.kind() == "base_field_initializer")
 }
 
+/// Decodes one `#[deprecated]` payload string literal: verbatim decode via
+/// [`string_literal_text`], bounded to [`MAX_DEPRECATION_STRING_LEN`]
+/// characters (a verbatim prefix — no truncation marker is synthesized),
+/// then redaction policy v1 like issue #124 doc facts. Returns `None` for
+/// anything that is not a single string literal.
+fn deprecation_literal_text(literal: Node<'_>, source: &str) -> Option<String> {
+    let decoded = string_literal_text(node_source(literal, source).trim())?;
+    let bounded: String = decoded.chars().take(MAX_DEPRECATION_STRING_LEN).collect();
+    Some(crate::redaction::redact_value(&bounded))
+}
+
+/// Parses one `attribute_item` into a [`DeprecationMark`] when its attribute
+/// name leaf is exactly `deprecated` (issue #249). The three supported forms
+/// are the bare `#[deprecated]`, the note shorthand `#[deprecated = "..."]`,
+/// and the meta form `#[deprecated(since = "...", note = "...")]`. Key/value
+/// pairs are read from the attribute's `arguments` token tree by walking
+/// named children — Tree-sitter node walking only, never regex.
+///
+/// Unknown keys, non-literal values, and unnamed literals contribute
+/// nothing: the mark's *presence* is the fact either way. Returns `None` for
+/// every other attribute.
+fn deprecation_from_attribute(attribute_item: Node<'_>, source: &str) -> Option<DeprecationMark> {
+    let attribute = first_descendant_of_kind(attribute_item, "attribute")?;
+    let name_node = attribute.named_child(0)?;
+    let raw_name = node_source(name_node, source).trim();
+    let leaf = raw_name
+        .rsplit("::")
+        .next()
+        .map_or_else(|| raw_name.trim(), str::trim);
+    if leaf != "deprecated" {
+        return None;
+    }
+    let mut since: Option<String> = None;
+    let mut note: Option<String> = None;
+    if let Some(value) = attribute.child_by_field_name("value") {
+        // `#[deprecated = "..."]`: the value expression is the note shorthand.
+        if value.kind() == "string_literal" {
+            note = deprecation_literal_text(value, source);
+        }
+    } else if let Some(arguments) = attribute.child_by_field_name("arguments") {
+        // `#[deprecated(since = "...", note = "...")]`: pair each `since` /
+        // `note` identifier key with the string literal that follows it.
+        let mut cursor = arguments.walk();
+        let named: Vec<Node<'_>> = arguments.named_children(&mut cursor).collect();
+        for (index, child) in named.iter().enumerate() {
+            if child.kind() != "identifier" {
+                continue;
+            }
+            let key = node_source(*child, source).trim();
+            if !matches!(key, "since" | "note") {
+                continue;
+            }
+            let Some(literal) = named.get(index + 1) else {
+                continue;
+            };
+            if literal.kind() != "string_literal" {
+                continue;
+            }
+            let Some(text) = deprecation_literal_text(*literal, source) else {
+                continue;
+            };
+            if key == "since" {
+                since = Some(text);
+            } else {
+                note = Some(text);
+            }
+        }
+    }
+    Some(DeprecationMark { since, note })
+}
+
+/// Splits `text` on `delimiter` at the top nesting level only, ignoring
+/// delimiters inside `(`/`[`/`{` pairs, string/character literals (with
+/// backslash escapes), and line/block comments. Yields the segments in order;
+/// deterministic. Used to isolate the predicate of a
+/// `#[cfg_attr(predicate, …)]` gate from its attribute payload without
+/// mis-splitting on commas inside nested predicates or string literals
+/// (issue #190).
+fn split_top_level(text: &str, delimiter: char) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut depth = 0usize;
+    let mut segment_start = 0usize;
+    let mut chars = text.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            '"' | '\'' => {
+                // Skip the literal body; a backslash escapes the next char.
+                let quote = ch;
+                let mut escaped = false;
+                for (_, literal_ch) in chars.by_ref() {
+                    if escaped {
+                        escaped = false;
+                    } else if literal_ch == '\\' {
+                        escaped = true;
+                    } else if literal_ch == quote {
+                        break;
+                    }
+                }
+            }
+            '/' => {
+                // Skip `//…` and `/*…*/` comments so a delimiter inside one
+                // never splits.
+                match chars.peek() {
+                    Some((_, '/')) => {
+                        for (_, comment_ch) in chars.by_ref() {
+                            if comment_ch == '\n' {
+                                break;
+                            }
+                        }
+                    }
+                    Some((_, '*')) => {
+                        chars.next();
+                        let mut previous = '\0';
+                        for (_, comment_ch) in chars.by_ref() {
+                            if previous == '*' && comment_ch == '/' {
+                                break;
+                            }
+                            previous = comment_ch;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {
+                if ch == delimiter && depth == 0 {
+                    segments.push(&text[segment_start..index]);
+                    segment_start = index + ch.len_utf8();
+                }
+            }
+        }
+    }
+    segments.push(&text[segment_start..]);
+    segments
+}
+
+/// Normalizes a `#[cfg(...)]` / `#[cfg_attr(...)]` predicate (issue #190):
+/// comment trivia is stripped first, then runs of whitespace collapse to a
+/// single space. AC8 demands the recorded gate never include comments — a
+/// predicate like `feature = /* why */ "x"` records as `feature = "x"`.
+/// String and character literals are respected by the stripper: a `//`
+/// inside `"a//b"` is predicate text, not a comment.
+fn normalize_cfg_predicate(predicate: &str) -> String {
+    collapse_whitespace(&strip_comments_keep_newlines(predicate))
+}
+
+/// Parses an `attribute` node (the inner node of a `#[…]` / `#![…]`
+/// attribute item) into its normalized cfg predicate when the attribute's own
+/// name leaf is exactly `cfg` or `cfg_attr` (issue #190). Tree-sitter node
+/// walking only, never regex.
+///
+/// The predicate is the verbatim source text of the attribute's first
+/// top-level argument — `#[cfg(feature = "embedded-aletheiadb")]` yields
+/// `feature = "embedded-aletheiadb"`, and
+/// `#[cfg_attr(feature = "x", allow(dead_code))]` yields `feature = "x"` —
+/// with comment trivia stripped and interior whitespace collapsed
+/// deterministically. It is recorded, never evaluated, satisfied, or
+/// expanded. Returns `None` for every other attribute and for malformed
+/// gates with no predicate text (`#[cfg]`, `#[cfg()]`).
+fn cfg_predicate_from_attribute_node(attribute: Node<'_>, source: &str) -> Option<String> {
+    let name_node = attribute.named_child(0)?;
+    let raw_name = node_source(name_node, source).trim();
+    let leaf = raw_name
+        .rsplit("::")
+        .next()
+        .map_or_else(|| raw_name.trim(), str::trim);
+    if !matches!(leaf, "cfg" | "cfg_attr") {
+        return None;
+    }
+    let arguments = attribute.child_by_field_name("arguments")?;
+    let arguments_text = node_source(arguments, source);
+    let inner = arguments_text
+        .strip_prefix('(')
+        .and_then(|text| text.strip_suffix(')'))?;
+    split_top_level(inner, ',')
+        .into_iter()
+        .next()
+        .map(normalize_cfg_predicate)
+        .filter(|text| !text.is_empty())
+}
+
+/// Parses one `attribute_item` (`#[…]`) into its normalized cfg predicate
+/// when it is a `#[cfg(...)]` / `#[cfg_attr(...)]` gate (issue #190).
+/// Inner `#![…]` items never match here — they apply to the enclosing item,
+/// not the following one; file-level inner attributes are collected by
+/// [`file_level_cfg_gates`].
+fn cfg_predicate_from_attribute(attribute_item: Node<'_>, source: &str) -> Option<String> {
+    if attribute_item.kind() != "attribute_item" {
+        return None;
+    }
+    let attribute = first_descendant_of_kind(attribute_item, "attribute")?;
+    cfg_predicate_from_attribute_node(attribute, source)
+}
+
+/// Collects the normalized cfg predicates from the `attribute_item` siblings
+/// immediately preceding `node`, in source order (issue #190). Comments are
+/// skipped; any other sibling terminates the scan — the same lexical rule the
+/// doc/visibility/deprecation extractors use, so one attribute block never
+/// leaks onto a neighboring item. Inner `#![…]` attributes are NOT collected
+/// here: they apply to the enclosing item, not the following one — except for
+/// an inline module's own body, whose inner attributes gate the module itself
+/// ([`module_inner_cfg_gates`]) and are appended after the outer attributes.
+fn own_cfg_gates(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut gates = Vec::new();
+    let mut current = node.prev_sibling();
+    while let Some(sibling) = current {
+        match sibling.kind() {
+            "attribute_item" => {
+                if let Some(predicate) = cfg_predicate_from_attribute(sibling, source) {
+                    gates.push(predicate);
+                }
+            }
+            "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        current = sibling.prev_sibling();
+    }
+    gates.reverse();
+    gates.extend(module_inner_cfg_gates(node, source));
+    gates
+}
+
+/// Collects the cfg predicates of every lexically enclosing item, outermost
+/// first (issue #190). Walks the Tree-sitter parent chain: each ancestor's own
+/// `#[cfg(...)]` / `#[cfg_attr(...)]` attributes contribute their predicates,
+/// so a symbol under `#[cfg(feature = "a")] mod m` inherits
+/// `feature = "a"` before its own gates. Ancestor order is reversed, but each
+/// ancestor's own attributes stay in source order — reversing the flat vector
+/// would scramble per-ancestor attribute order. Pure function of the AST —
+/// deterministic and independent of walk order.
+fn enclosing_cfg_gates(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut per_ancestor: Vec<Vec<String>> = Vec::new();
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        per_ancestor.push(own_cfg_gates(parent, source));
+        current = parent.parent();
+    }
+    per_ancestor.into_iter().rev().flatten().collect()
+}
+
+/// Collects the normalized cfg predicates from `#![cfg(...)]` /
+/// `#![cfg_attr(...)]` inner attributes in an inline module's body (issue
+/// #190). They apply to the enclosing module — `mod m { #![cfg(feature =
+/// "x")] … }` gates `m` itself — so they belong to the module's own gate
+/// chain and are inherited by its members through the parent-chain walk.
+/// Returns empty for every other node kind: inner attributes in function
+/// bodies apply to the block expression, a different semantic, and stay out
+/// of scope.
+fn module_inner_cfg_gates(node: Node<'_>, source: &str) -> Vec<String> {
+    if node.kind() != "mod_item" {
+        return Vec::new();
+    }
+    let mut gates = Vec::new();
+    let Some(body) = node.child_by_field_name("body") else {
+        return gates;
+    };
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        if child.kind() != "inner_attribute_item" {
+            continue;
+        }
+        let Some(attribute) = first_descendant_of_kind(child, "attribute") else {
+            continue;
+        };
+        if let Some(predicate) = cfg_predicate_from_attribute_node(attribute, source) {
+            gates.push(predicate);
+        }
+    }
+    gates
+}
+
+/// Collects the normalized cfg predicates from `#![cfg(...)]` /
+/// `#![cfg_attr(...)]` inner attributes that are direct children of the file
+/// root (issue #190). They gate the whole file: the extractor leads every
+/// symbol's gate chain with them and exports them on `FileFacts` for the
+/// `File` node. `#![…]` attributes nested in an inline module's body gate
+/// that module, not the file — they are collected by
+/// [`module_inner_cfg_gates`]. Inner attributes anywhere else (a function
+/// body) apply to the block expression, a different semantic, and stay out
+/// of scope.
+fn file_level_cfg_gates(root: Node<'_>, source: &str) -> Vec<String> {
+    debug_assert_eq!(root.kind(), "source_file");
+    let mut gates = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() != "inner_attribute_item" {
+            continue;
+        }
+        let Some(attribute) = first_descendant_of_kind(child, "attribute") else {
+            continue;
+        };
+        if let Some(predicate) = cfg_predicate_from_attribute_node(attribute, source) {
+            gates.push(predicate);
+        }
+    }
+    gates
+}
+
+/// Parses one `attribute_item` (`#[...]`) or `inner_attribute_item`
+/// (`#![...]`) into [`LintSuppressionFacts`] when the attribute's own name
+/// leaf is exactly `allow` (issue #227). Tree-sitter node walking only,
+/// never regex.
+///
+/// Only the attribute's own name is compared: `#[cfg_attr(test,
+/// allow(dead_code))]` never matches (the name leaf is `cfg_attr`), and the
+/// bare forms `#[allow]` / `#[allow()]` carry no lint names, so they emit no
+/// suppression fact. Returns `None` for every other attribute.
+fn lint_suppression_from_attribute(node: Node<'_>, source: &str) -> Option<LintSuppressionFacts> {
+    if !matches!(node.kind(), "attribute_item" | "inner_attribute_item") {
+        return None;
+    }
+    let attribute = first_descendant_of_kind(node, "attribute")?;
+    let name_node = attribute.named_child(0)?;
+    let raw_name = node_source(name_node, source).trim();
+    let leaf = raw_name
+        .rsplit("::")
+        .next()
+        .map_or_else(|| raw_name.trim(), str::trim);
+    if leaf != "allow" {
+        return None;
+    }
+    let arguments = attribute.child_by_field_name("arguments")?;
+    let mut lints = Vec::new();
+    collect_suppression_lint_names(arguments, source, &mut lints);
+    if lints.is_empty() {
+        return None;
+    }
+    lints.sort();
+    lints.dedup();
+    Some(LintSuppressionFacts {
+        lints,
+        scope: suppression_scope(node),
+        has_justification: suppression_has_adjacent_comment(node),
+        is_inner: node.kind() == "inner_attribute_item",
+    })
+}
+
+/// Collects lint-path tokens from an `allow` attribute's `arguments` token
+/// tree. Inside a token tree the grammar lexes paths flat — `clippy::all`
+/// arrives as `identifier("clippy")`, `::`, `identifier("all")`, not as one
+/// `scoped_identifier` — so consecutive `identifier (:: identifier)*`
+/// runs are re-joined into a single lint path (`clippy::too_many_arguments`);
+/// any other token (`,`, parens, literals, …) terminates the current path.
+/// A `scoped_identifier` node, where the grammar does produce one, still
+/// contributes as a whole. Recurses into nested token trees. Non-path tokens
+/// contribute nothing.
+fn collect_suppression_lint_names(node: Node<'_>, source: &str, out: &mut Vec<String>) {
+    fn flush(current: &mut Option<String>, out: &mut Vec<String>) {
+        if let Some(path) = current.take() {
+            // A trailing `::` with no final segment is not a lint path.
+            let path = path.strip_suffix("::").unwrap_or(&path);
+            if !path.is_empty() {
+                out.push(path.to_owned());
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    let mut current: Option<String> = None;
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "identifier" => {
+                let name = node_source(child, source).trim();
+                if name.is_empty() {
+                    continue;
+                }
+                match current.as_mut() {
+                    Some(path) if path.ends_with("::") => path.push_str(name),
+                    // Defensive: an identifier that does not continue a `::`
+                    // run starts a fresh path rather than gluing onto one.
+                    _ => {
+                        flush(&mut current, out);
+                        current = Some(name.to_owned());
+                    }
+                }
+            }
+            "::" => {
+                if let Some(path) = current.as_mut()
+                    && !path.ends_with("::")
+                {
+                    path.push_str("::");
+                }
+                // A stray leading `::` with no path under construction is
+                // not a lint name; ignore it.
+            }
+            "scoped_identifier" => {
+                flush(&mut current, out);
+                let name = node_source(child, source).trim();
+                if !name.is_empty() {
+                    out.push(name.to_owned());
+                }
+            }
+            "token_tree" => {
+                flush(&mut current, out);
+                collect_suppression_lint_names(child, source, out);
+            }
+            _ => flush(&mut current, out),
+        }
+    }
+    flush(&mut current, out);
+}
+
+/// Resolves the closed [`LintSuppressionScope`] for an allow-attribute node
+/// (issue #227): an outer `attribute_item` always annotates the following
+/// item (`item`); an `inner_attribute_item`'s scope is the item that owns the
+/// block it opens — the module when that item is a `mod_item` (`module`),
+/// the crate root (`crate`), or any other enclosing item (`item`, e.g. a
+/// function body carrying `#![allow(..)]`).
+fn suppression_scope(node: Node<'_>) -> LintSuppressionScope {
+    if node.kind() == "attribute_item" {
+        return LintSuppressionScope::Item;
+    }
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "source_file" => return LintSuppressionScope::Crate,
+            "mod_item" => return LintSuppressionScope::Module,
+            "function_item" | "closure_expression" | "const_item" | "static_item"
+            | "struct_item" | "enum_item" | "trait_item" | "impl_item" | "type_item"
+            | "foreign_mod_item" => return LintSuppressionScope::Item,
+            _ => current = parent.parent(),
+        }
+    }
+    // Unreachable for a well-formed parse (every inner attribute sits inside
+    // a `source_file`); a closed fallback keeps the lane total.
+    LintSuppressionScope::Item
+}
+
+/// `true` when a line or block comment (doc comments included) sits
+/// immediately adjacent to the attribute node: a comment ending on the line
+/// directly above it (preceding justification), or a comment starting on the
+/// same line the attribute ends on (trailing justification). Tree-sitter
+/// points only — no text scanning — so a comment separated by a blank line
+/// is not adjacent.
+fn suppression_has_adjacent_comment(node: Node<'_>) -> bool {
+    let attr_start_row = node.start_position().row;
+    let attr_end_row = node.end_position().row;
+    if let Some(prev) = node.prev_sibling()
+        && matches!(prev.kind(), "line_comment" | "block_comment")
+        && prev.end_position().row + 1 == attr_start_row
+    {
+        return true;
+    }
+    if let Some(next) = node.next_sibling()
+        && matches!(next.kind(), "line_comment" | "block_comment")
+        && next.start_position().row == attr_end_row
+    {
+        return true;
+    }
+    false
+}
+
+/// Maps one attribute item's source text onto a closed entry-point class
+/// (issue #240): `#[test]` / `#[bench]`, or a path attribute ending in
+/// `::test` / `::bench` (e.g. `#[tokio::test]`), marks a test-harness
+/// entry; `#[no_mangle]` / `#[export_name]` marks an FFI export.
+/// Configuration attributes that merely mention these tokens —
+/// `#[cfg(test)]`, `#[cfg_attr(test, ...)]` — never match: only the
+/// attribute's own name is compared, exactly like [`attribute_is_test`].
+fn entry_point_kind_from_attribute(text: &str) -> Option<EntryPointKind> {
+    let stripped: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let inner = stripped.strip_prefix("#[")?.strip_suffix(']')?;
+    let name = inner.split(['(', '=']).next().unwrap_or(inner);
+    if name == "test" || name.ends_with("::test") || name == "bench" || name.ends_with("::bench") {
+        Some(EntryPointKind::Test)
+    } else if name == "no_mangle" || name == "export_name" {
+        Some(EntryPointKind::FfiExport)
+    } else {
+        None
+    }
+}
+
+/// `true` when one of `node`'s ancestors is a `trait_item` (issue #240).
+/// Trait-method signatures and default-bodied trait methods arrive at
+/// `add_symbol` with `symbol_kind == "function"`, but a `fn main` declared
+/// in a trait is not the binary's entry point.
+fn has_trait_item_ancestor(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "trait_item" {
+            return true;
+        }
+        node = parent;
+    }
+    false
+}
+
+/// `true` when the repo-relative path is a binary crate root: `src/main.rs`
+/// or anything under `src/bin/`. A free `fn main` there is the binary's
+/// entry point; a `fn main` in a library root (`src/lib.rs`) is an ordinary
+/// function, not an entry point. Mirrors the `src/`-rooted scope of the
+/// issue #213 library-crate rule — workspace-member prefixes are out of
+/// this slice's scope.
+fn is_binary_crate_path(path: &str) -> bool {
+    let mut segments = path.split(['/', '\\']).filter(|s| !s.is_empty());
+    if segments.next() != Some("src") {
+        return false;
+    }
+    match segments.next() {
+        Some("main.rs") => segments.next().is_none(),
+        Some("bin") => true,
+        _ => false,
+    }
+}
+/// `#[test]` or a path attribute whose name ends in `::test` (such as
 /// `true` when one attribute item's source text is a dedicated test attribute:
 /// `#[test]` or a path attribute whose name ends in `::test` (such as
 /// `#[tokio::test]`), with or without arguments. Configuration attributes that
@@ -3223,6 +4503,57 @@ fn first_descendant_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node
         }
     }
     None
+}
+
+/// Computes the structural complexity score (issue #162) for a Rust
+/// `function_item` or `function_signature_item` node: 1 plus one per
+/// decision point in the item's own body.
+///
+/// A decision point is one of:
+/// - an `if_expression` (each `else if` is its own `if_expression` node),
+/// - a `for_expression`, `while_expression`, or `loop_expression`,
+/// - a `match_arm` (every arm, including catch-alls),
+/// - a `try_expression` (the `?` operator),
+/// - a `binary_expression` whose operator token is `&&` or `||`
+///   (anonymous token kinds are the literal operator text).
+///
+/// Closure bodies are part of the enclosing item's expression tree and are
+/// counted. Nested `function_item` / `function_signature_item` subtrees are
+/// NOT descended into: a nested `fn` gets its own `Symbol` node and its own
+/// score. Items without a body (signature-only trait method declarations)
+/// score the minimum 1.
+///
+/// The walk is over the Tree-sitter AST — no regexes, no text heuristics —
+/// so the score is a deterministic function of the parsed source.
+pub(crate) fn control_flow_complexity(item: Node<'_>) -> u32 {
+    let Some(body) = item.child_by_field_name("body") else {
+        return 1;
+    };
+    let mut score = 1u32;
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            // A nested `fn` gets its own symbol: skip its whole subtree so
+            // its decisions never inflate the enclosing callable's score.
+            // The `body` root is a `block`, never a `function_item`, so the
+            // outer item's own body is always walked.
+            "function_item" | "function_signature_item" => continue,
+            "if_expression" | "for_expression" | "while_expression" | "loop_expression"
+            | "match_arm" | "try_expression" => score += 1,
+            "binary_expression" => {
+                if node
+                    .child_by_field_name("operator")
+                    .is_some_and(|op| matches!(op.kind(), "&&" | "||"))
+                {
+                    score += 1;
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    score
 }
 
 fn macro_invocation_name(text: &str) -> String {
@@ -4148,6 +5479,305 @@ mod tests {
         assert!(is_route_registration_macro("routes"));
         assert!(!is_route_registration_macro("vec"));
         assert!(!is_route_registration_macro("println"));
+    }
+
+    /// Runs `deprecation_from_attribute` over the first `attribute_item` in a
+    /// real parse, mirroring the extractor's prev-sibling walk input shape
+    /// (issue #249).
+    fn dep_attr(source: &str) -> Option<DeprecationMark> {
+        let tree = parse_tree(source);
+        let attribute_item = first_descendant_of_kind(tree.root_node(), "attribute_item")?;
+        deprecation_from_attribute(attribute_item, source)
+    }
+
+    /// Runs `entry_point_kind_from_attribute` over one attribute item's
+    /// source text, mirroring the extractor's prev-sibling walk input shape
+    /// (issue #240).
+    fn entry_attr(source: &str) -> Option<EntryPointKind> {
+        let tree = parse_tree(source);
+        let attribute_item = first_descendant_of_kind(tree.root_node(), "attribute_item")?;
+        entry_point_kind_from_attribute(&source[attribute_item.byte_range()])
+    }
+
+    #[test]
+    fn entry_point_test_attributes_are_recognized() {
+        assert_eq!(
+            entry_attr("#[test]\nfn check() {}"),
+            Some(EntryPointKind::Test)
+        );
+        assert_eq!(
+            entry_attr("#[tokio::test]\nasync fn check() {}"),
+            Some(EntryPointKind::Test),
+            "path attributes ending in ::test are test-harness entries"
+        );
+        assert_eq!(
+            entry_attr("#[bench]\nfn check() {}"),
+            Some(EntryPointKind::Test)
+        );
+    }
+
+    #[test]
+    fn entry_point_ffi_attributes_are_recognized() {
+        assert_eq!(
+            entry_attr("#[no_mangle]\npub extern \"C\" fn f() {}"),
+            Some(EntryPointKind::FfiExport)
+        );
+        assert_eq!(
+            entry_attr("#[export_name = \"real_name\"]\nfn f() {}"),
+            Some(EntryPointKind::FfiExport)
+        );
+    }
+
+    #[test]
+    fn entry_point_config_attributes_are_not_entry_points() {
+        // Configuration attributes that merely mention the tokens — never
+        // the attribute's own name — must not mark the item.
+        assert_eq!(entry_attr("#[cfg(test)]\nfn check() {}"), None);
+        assert_eq!(entry_attr("#[cfg_attr(test, no_mangle)]\nfn f() {}"), None);
+        assert_eq!(entry_attr("#[allow(dead_code)]\nfn f() {}"), None);
+        assert_eq!(entry_attr("#[inline]\nfn f() {}"), None);
+    }
+
+    // ── Test vs. production symbol roles (issue #238, RED) ────────────────
+
+    /// Extracts `source` as the repo-relative `path` and returns every
+    /// `Symbol` and `Module` record's `(qualified_name, role)`. Module
+    /// declarations are included because a `#[cfg(test)] mod` declaration is
+    /// itself the lexical gate (issue #238): its record carries the role.
+    fn symbol_roles_at(source: &str, path: &str) -> Vec<(String, Option<SymbolRole>)> {
+        let file = SourceFile {
+            path: PathBuf::from(path),
+            repo_relative_path: path.to_owned(),
+        };
+        let mut graph = Graph::default();
+        extract_file_source(&file, source, "file-id", "repo-id", &mut graph)
+            .expect("source should parse");
+        graph
+            .records()
+            .iter()
+            .filter_map(|r| match r {
+                GraphRecord::Node {
+                    kind: NodeKind::Symbol | NodeKind::Module,
+                    name: Some(name),
+                    ..
+                } => Some((name.clone(), r.role().copied())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn role_of(roles: &[(String, Option<SymbolRole>)], name: &str) -> Option<SymbolRole> {
+        roles.iter().find(|(n, _)| n == name).map_or_else(
+            || panic!("symbol `{name}` should have been extracted"),
+            |(_, role)| *role,
+        )
+    }
+
+    #[test]
+    fn role_test_attribute_fn_is_test() {
+        let roles = symbol_roles_at("#[test]\nfn check() {}\n", "src/lib.rs");
+        assert_eq!(role_of(&roles, "check"), Some(SymbolRole::Test));
+    }
+
+    #[test]
+    fn role_test_family_attributes_are_test() {
+        let roles = symbol_roles_at(
+            "#[tokio::test]\nasync fn async_check() {}\n#[bench]\nfn bench_check() {}\n",
+            "src/lib.rs",
+        );
+        assert_eq!(role_of(&roles, "async_check"), Some(SymbolRole::Test));
+        assert_eq!(role_of(&roles, "bench_check"), Some(SymbolRole::Test));
+    }
+
+    #[test]
+    fn role_cfg_test_module_members_are_test() {
+        // Ancestry composition (issue #238 signal b): a symbol nested in a
+        // `#[cfg(test)]` module is test, however deep the nesting.
+        let roles = symbol_roles_at(
+            "#[cfg(test)]\nmod tests {\n    fn helper() {}\n    mod inner {\n        fn deep() {}\n    }\n}\n",
+            "src/lib.rs",
+        );
+        assert_eq!(role_of(&roles, "tests::helper"), Some(SymbolRole::Test));
+        assert_eq!(
+            role_of(&roles, "tests::inner::deep"),
+            Some(SymbolRole::Test)
+        );
+    }
+
+    #[test]
+    fn role_cfg_test_module_declaration_is_test() {
+        // The gated module's OWN declaration is the lexical gate (issue
+        // #238): it is test even though the scope counter is entered only
+        // for its children.
+        let roles = symbol_roles_at(
+            "#[cfg(test)]\nmod tests {\n    fn helper() {}\n}\n",
+            "src/lib.rs",
+        );
+        assert_eq!(role_of(&roles, "tests"), Some(SymbolRole::Test));
+        assert_eq!(role_of(&roles, "tests::helper"), Some(SymbolRole::Test));
+    }
+
+    #[test]
+    fn role_cfg_test_out_of_line_module_declaration_is_test() {
+        // Out-of-line form: the `mod name;` declaration carries the gate.
+        let roles = symbol_roles_at("#[cfg(test)]\nmod out;\n", "src/lib.rs");
+        assert_eq!(role_of(&roles, "out"), Some(SymbolRole::Test));
+    }
+
+    #[test]
+    fn role_ungated_module_declaration_is_production() {
+        // A module without the gate stays production — the gate is the
+        // `#[cfg(test)]` attribute, not module-hood.
+        let roles = symbol_roles_at("mod plain {\n    fn helper() {}\n}\n", "src/lib.rs");
+        assert_eq!(role_of(&roles, "plain"), Some(SymbolRole::Production));
+        assert_eq!(
+            role_of(&roles, "plain::helper"),
+            Some(SymbolRole::Production)
+        );
+    }
+
+    #[test]
+    fn role_production_fn_is_production() {
+        let roles = symbol_roles_at("pub fn ship() {}\n", "src/lib.rs");
+        assert_eq!(role_of(&roles, "ship"), Some(SymbolRole::Production));
+    }
+
+    #[test]
+    fn role_tests_dir_file_is_test() {
+        // Signal (c): a plain fn in an integration-test root is test.
+        let roles = symbol_roles_at("fn integration_check() {}\n", "tests/integration.rs");
+        assert_eq!(role_of(&roles, "integration_check"), Some(SymbolRole::Test));
+    }
+
+    #[test]
+    fn role_benches_dir_file_is_test() {
+        let roles = symbol_roles_at("fn bench_main() {}\n", "benches/bench.rs");
+        assert_eq!(role_of(&roles, "bench_main"), Some(SymbolRole::Test));
+    }
+
+    #[test]
+    fn role_windows_separators_still_classify_test_roots() {
+        // Separator-agnostic (issue #238): a Windows checkout reports
+        // `tests\integration.rs`; the first segment is still `tests`.
+        let roles = symbol_roles_at("fn integration_check() {}\n", "tests\\integration.rs");
+        assert_eq!(role_of(&roles, "integration_check"), Some(SymbolRole::Test));
+        let roles = symbol_roles_at("fn bench_main() {}\n", "benches\\bench.rs");
+        assert_eq!(role_of(&roles, "bench_main"), Some(SymbolRole::Test));
+        // ... and a production file keeps forward slashes working too.
+        let roles = symbol_roles_at("pub fn ship() {}\n", "src\\lib.rs");
+        assert_eq!(role_of(&roles, "ship"), Some(SymbolRole::Production));
+    }
+
+    #[test]
+    fn role_cfg_test_on_non_module_item_is_not_a_signal() {
+        // The closed signal set (issue #238): `#[cfg(test)]` on a bare fn is
+        // not a test-family attribute (a) and not module gating (b), so the
+        // symbol stays production. Documents the boundary; a later slice may
+        // extend the vocabulary.
+        let roles = symbol_roles_at("#[cfg(test)]\nfn helper() {}\n", "src/lib.rs");
+        assert_eq!(role_of(&roles, "helper"), Some(SymbolRole::Production));
+    }
+
+    #[test]
+    fn role_every_symbol_carries_a_role() {
+        let roles = symbol_roles_at(
+            "pub fn ship() {}\n#[test]\nfn check() {}\n#[cfg(test)]\nmod tests {\n    fn helper() {}\n}\n",
+            "src/lib.rs",
+        );
+        assert_eq!(roles.len(), 4, "all four symbols extracted");
+        assert!(
+            roles.iter().all(|(_, role)| role.is_some()),
+            "every Symbol record carries a role, got {roles:?}"
+        );
+    }
+
+    #[test]
+    fn binary_crate_paths_are_recognized() {
+        assert!(is_binary_crate_path("src/main.rs"));
+        assert!(is_binary_crate_path("src/bin/tool.rs"));
+        assert!(is_binary_crate_path("src/bin/nested/tool.rs"));
+        assert!(!is_binary_crate_path("src/lib.rs"));
+        assert!(!is_binary_crate_path("src/main.rs.bak"));
+        assert!(!is_binary_crate_path("tests/main.rs"));
+        // Workspace-member prefixes are out of this slice's scope.
+        assert!(!is_binary_crate_path("crates/foo/src/main.rs"));
+    }
+
+    #[test]
+    fn deprecated_bare_form_records_mark_without_payload() {
+        let mark = dep_attr("#[deprecated]\nfn old() {}").expect("bare deprecated must parse");
+        assert_eq!(mark.since, None, "absent since is None, never fabricated");
+        assert_eq!(mark.note, None, "absent note is None, never fabricated");
+    }
+
+    #[test]
+    fn deprecated_note_shorthand_is_verbatim() {
+        let mark = dep_attr("#[deprecated = \"use new() instead\"]\nfn old() {}")
+            .expect("note shorthand must parse");
+        assert_eq!(mark.since, None);
+        assert_eq!(mark.note.as_deref(), Some("use new() instead"));
+    }
+
+    #[test]
+    fn deprecated_since_and_note_meta_form() {
+        let mark = dep_attr("#[deprecated(since = \"1.2.0\", note = \"use new()\")]\nfn old() {}")
+            .expect("meta form must parse");
+        assert_eq!(mark.since.as_deref(), Some("1.2.0"));
+        assert_eq!(mark.note.as_deref(), Some("use new()"));
+    }
+
+    #[test]
+    fn deprecated_meta_form_key_order_is_free() {
+        let mark = dep_attr("#[deprecated(note = \"use new()\", since = \"1.2.0\")]\nfn old() {}")
+            .expect("reversed key order must parse");
+        assert_eq!(mark.since.as_deref(), Some("1.2.0"));
+        assert_eq!(mark.note.as_deref(), Some("use new()"));
+    }
+
+    #[test]
+    fn deprecated_other_attributes_are_ignored() {
+        assert_eq!(dep_attr("#[test]\nfn old() {}"), None);
+        assert_eq!(dep_attr("#[allow(dead_code)]\nfn old() {}"), None);
+        assert_eq!(
+            dep_attr("#[doc = \"not a deprecation\"]\nfn old() {}"),
+            None,
+            "a doc attribute with a deprecation-shaped payload is not a mark"
+        );
+    }
+
+    #[test]
+    fn deprecated_non_literal_values_are_not_captured() {
+        // A non-literal `note` value cannot be decoded, so the mark records
+        // presence with the payload absent — never a fabricated string.
+        let mark = dep_attr("#[deprecated(note = NOTE_CONST)]\nfn old() {}")
+            .expect("attribute name still marks the item");
+        assert_eq!(mark.since, None);
+        assert_eq!(mark.note, None);
+    }
+
+    #[test]
+    fn deprecated_unknown_meta_keys_are_ignored() {
+        let mark = dep_attr("#[deprecated(foo = \"bar\")]\nfn old() {}")
+            .expect("unknown keys still mark the item deprecated");
+        assert_eq!(mark.since, None);
+        assert_eq!(mark.note, None);
+    }
+
+    #[test]
+    fn deprecated_note_is_bounded() {
+        let long_note = "n".repeat(MAX_DEPRECATION_STRING_LEN + 40);
+        let source = format!("#[deprecated = \"{long_note}\"]\nfn old() {{}}");
+        let mark = dep_attr(&source).expect("long note must parse");
+        let note = mark.note.expect("note captured");
+        assert_eq!(
+            note.len(),
+            MAX_DEPRECATION_STRING_LEN,
+            "note is bounded to the documented length"
+        );
+        assert!(
+            long_note.starts_with(&note),
+            "the bound is a verbatim prefix of the attribute text"
+        );
     }
 
     #[test]
@@ -5080,6 +6710,63 @@ mod tests {
         assert_eq!(markers[0].note(), Some("real marker"));
     }
 
+    #[test]
+    fn symbol_spans_carry_tree_sitter_columns() {
+        // Issue #463: every syntax-derived symbol span records zero-based
+        // byte-offset columns, so the SCIP exporter can emit precise ranges
+        // without re-reading source. Columns must agree with the byte offsets
+        // against the source's newline positions.
+        let source = "fn top() {}\n    fn indented() {}\n";
+        let graph = extract_records(source);
+        let mut spans: Vec<SourceSpan> = graph
+            .records()
+            .iter()
+            .filter_map(|record| match record {
+                GraphRecord::Node {
+                    kind: NodeKind::Symbol,
+                    span: Some(span),
+                    ..
+                } => Some(*span),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(spans.len(), 2, "two function symbols expected");
+        spans.sort_by_key(|span| span.start_byte);
+        for span in &spans {
+            assert!(
+                span.start_column.is_some() && span.end_column.is_some(),
+                "extractor must record columns: {span:?}"
+            );
+        }
+        // The indented declaration starts four bytes into its line.
+        let indented = spans
+            .iter()
+            .find(|span| span.start_line == 2)
+            .expect("line-2 symbol");
+        assert_eq!(indented.start_column, Some(4));
+
+        let mut line_starts = vec![0usize];
+        for (index, byte) in source.bytes().enumerate() {
+            if byte == b'\n' {
+                line_starts.push(index + 1);
+            }
+        }
+        for span in &spans {
+            let start_line_start = line_starts[span.start_line - 1];
+            let end_line_start = line_starts[span.end_line - 1];
+            assert_eq!(
+                span.start_column,
+                Some(span.start_byte - start_line_start),
+                "start column is the byte offset from line start"
+            );
+            assert_eq!(
+                span.end_column,
+                Some(span.end_byte - end_line_start),
+                "end column is the byte offset from line start"
+            );
+        }
+    }
+
     /// Extracts `source` and returns the graph records (issue #206 helpers).
     fn extract_records(source: &str) -> Graph {
         let file = SourceFile {
@@ -5209,6 +6896,924 @@ pub mod inner {
         assert_eq!(
             find_node(&graph, NodeKind::Import).content_signature(),
             None
+        );
+    }
+
+    // ── Trait-dispatch extraction (issue #267) ───────────────────────────
+
+    /// Extracts `source` and returns the `(caller_simple_name,
+    /// dispatch_trait)` pairs stamped on method call sites, in source order.
+    fn dispatch_traits_in(source: &str) -> Vec<(String, Option<String>)> {
+        let file = SourceFile {
+            path: PathBuf::from("src/lib.rs"),
+            repo_relative_path: "src/lib.rs".to_owned(),
+        };
+        let mut graph = Graph::default();
+        let facts = extract_file_source(&file, source, "file-id", "repo-id", &mut graph)
+            .expect("source should parse");
+        let by_id: std::collections::BTreeMap<&str, &str> = facts
+            .definitions
+            .iter()
+            .map(|d| (d.id.as_str(), d.simple_name.as_str()))
+            .collect();
+        facts
+            .call_sites
+            .iter()
+            .filter(|call| call.call_kind == CallKind::Method)
+            .map(|call| {
+                (
+                    by_id
+                        .get(call.caller_id.as_str())
+                        .unwrap_or(&"?")
+                        .to_string(),
+                    call.dispatch_trait.clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dyn_receiver_stamps_the_dispatch_trait() {
+        let stamped = dispatch_traits_in("fn draw(item: &dyn Renderable) { item.render(); }\n");
+        assert_eq!(
+            stamped,
+            vec![("draw".to_owned(), Some("Renderable".to_owned()))],
+            "a &dyn Trait receiver must stamp its trait on the method call"
+        );
+    }
+
+    #[test]
+    fn boxed_dyn_receiver_stamps_the_dispatch_trait() {
+        let stamped = dispatch_traits_in("fn draw(item: Box<dyn Renderable>) { item.render(); }\n");
+        assert_eq!(
+            stamped,
+            vec![("draw".to_owned(), Some("Renderable".to_owned()))],
+            "a Box<dyn Trait> receiver must stamp its trait on the method call"
+        );
+    }
+
+    #[test]
+    fn generic_bound_receiver_stamps_the_dispatch_trait() {
+        let stamped = dispatch_traits_in("fn draw<T: Renderable>(item: T) { item.render(); }\n");
+        assert_eq!(
+            stamped,
+            vec![("draw".to_owned(), Some("Renderable".to_owned()))],
+            "a T: Trait bound receiver must stamp its trait on the method call"
+        );
+    }
+
+    #[test]
+    fn where_clause_bound_receiver_stamps_the_dispatch_trait() {
+        let stamped =
+            dispatch_traits_in("fn draw<T>(item: T) where T: Renderable { item.render(); }\n");
+        assert_eq!(
+            stamped,
+            vec![("draw".to_owned(), Some("Renderable".to_owned()))],
+            "a where-clause bound receiver must stamp its trait on the method call"
+        );
+    }
+
+    #[test]
+    fn let_dyn_ascription_stamps_the_dispatch_trait() {
+        let stamped = dispatch_traits_in(
+            "fn draw() { let item: &dyn Renderable = make(); item.render(); }\n",
+        );
+        assert_eq!(
+            stamped,
+            vec![("draw".to_owned(), Some("Renderable".to_owned()))],
+            "a let-bound &dyn Trait receiver must stamp its trait on the method call"
+        );
+    }
+
+    #[test]
+    fn multi_bound_receiver_stamps_nothing() {
+        // Two trait bounds: dispatch is ambiguous by construction, so the
+        // call keeps the honest legacy fan-out instead of guessing.
+        let stamped =
+            dispatch_traits_in("fn draw<T: Renderable + Clone>(item: T) { item.render(); }\n");
+        assert_eq!(
+            stamped,
+            vec![("draw".to_owned(), None)],
+            "a multi-bound receiver must not stamp any dispatch trait"
+        );
+    }
+
+    #[test]
+    fn conflicting_inline_and_where_bounds_stamp_nothing() {
+        // One bound inline and a DIFFERENT bound in the where clause is two
+        // distinct bounds: dispatch is ambiguous, so nothing is stamped.
+        let stamped = dispatch_traits_in(
+            "fn draw<T: Renderable>(item: T) where T: Clone { item.render(); }\n",
+        );
+        assert_eq!(
+            stamped,
+            vec![("draw".to_owned(), None)],
+            "conflicting inline/where bounds must not stamp any dispatch trait"
+        );
+    }
+
+    #[test]
+    fn repeated_same_bound_stamps_the_trait() {
+        // The same bound written inline and in the where clause is still one
+        // distinct bound.
+        let stamped = dispatch_traits_in(
+            "fn draw<T: Renderable>(item: T) where T: Renderable { item.render(); }\n",
+        );
+        assert_eq!(
+            stamped,
+            vec![("draw".to_owned(), Some("Renderable".to_owned()))],
+            "a repeated identical bound is still a single dispatch trait"
+        );
+    }
+
+    #[test]
+    fn concrete_receiver_stamps_no_dispatch_trait() {
+        let stamped = dispatch_traits_in("fn draw(c: &Circle) { c.render(); }\n");
+        assert_eq!(
+            stamped,
+            vec![("draw".to_owned(), None)],
+            "a concrete receiver stays on the receiver_type path (issue #441)"
+        );
+    }
+
+    #[test]
+    fn shadowed_dyn_binding_stamps_nothing() {
+        // The second `item` shadows the first: the shadowing veto drops both
+        // env entries, so the call carries no dispatch metadata.
+        let stamped =
+            dispatch_traits_in("fn draw(item: &dyn Renderable) { let item = 5; item.render(); }\n");
+        assert_eq!(
+            stamped,
+            vec![("draw".to_owned(), None)],
+            "a shadowed binding must not carry stale dispatch metadata"
+        );
+    }
+
+    // ── Lint-suppression inventory (issue #227, RED) ────────────────────────
+
+    /// Seeded fixture exercising every acceptance decoy: `#[allow(` inside a
+    /// line comment, a doc comment, and a block comment; inside a string
+    /// literal; an inner `#![allow]` at crate scope and at module scope; a
+    /// multi-lint form; and adjacent justification comments (preceding for
+    /// the module suppression, trailing for the item suppression).
+    const LINT_SUPPRESSION_FIXTURE: &str = "#![allow(unused_imports)]\n\n// Line-comment decoy: #[allow(dead_code)] is never extracted.\n/// Doc-comment decoy: #[allow(dead_code)] is never extracted.\n/** Block-comment decoy: #[allow(dead_code)] is never extracted. */\n\nmod inner {\n    // Silence the noisy lint while the API settles.\n    #![allow(clippy::too_many_arguments, dead_code)]\n\n    // This string is not a suppression: \"#[allow(dead_code)]\".\n    const MARKER: &str = \"#[allow(dead_code)]\";\n\n    #[allow(unused_variables)] // trailing justification for the fn\n    fn helper() {}\n}\n";
+
+    /// Extracts every `LintSuppression` payload in `source` as
+    /// `(sorted lints, scope, has_justification, is_inner)`, in walk order.
+    fn lint_suppressions_at(source: &str, path: &str) -> Vec<(Vec<String>, String, bool, bool)> {
+        let file = SourceFile {
+            path: PathBuf::from(path),
+            repo_relative_path: path.to_owned(),
+        };
+        let mut graph = Graph::default();
+        extract_file_source(&file, source, "file-id", "repo-id", &mut graph)
+            .expect("source should parse");
+        graph
+            .records()
+            .iter()
+            .filter_map(|r| match r {
+                GraphRecord::Node {
+                    kind: NodeKind::LintSuppression,
+                    lint_suppression: Some(facts),
+                    ..
+                } => Some((
+                    facts.lints.clone(),
+                    facts.scope.as_str().to_owned(),
+                    facts.has_justification,
+                    facts.is_inner,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lint_suppression_fixture_yields_exactly_three_suppressions() {
+        let rows = lint_suppressions_at(LINT_SUPPRESSION_FIXTURE, "src/lib.rs");
+        assert_eq!(
+            rows.len(),
+            3,
+            "comment, doc-comment, and string-literal decoys must never extract: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn lint_suppression_crate_scope_without_justification() {
+        let rows = lint_suppressions_at(LINT_SUPPRESSION_FIXTURE, "src/lib.rs");
+        assert!(
+            rows.contains(&(
+                vec!["unused_imports".to_owned()],
+                "crate".to_owned(),
+                false,
+                true
+            )),
+            "inner #![allow] at the crate root is crate scope: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn lint_suppression_module_scope_multi_lint_sorted_with_justification() {
+        let rows = lint_suppressions_at(LINT_SUPPRESSION_FIXTURE, "src/lib.rs");
+        assert!(
+            rows.contains(&(
+                vec![
+                    "clippy::too_many_arguments".to_owned(),
+                    "dead_code".to_owned()
+                ],
+                "module".to_owned(),
+                true,
+                true
+            )),
+            "multi-lint forms sort and dedup; the preceding comment justifies: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn lint_suppression_item_scope_trailing_comment_justifies() {
+        let rows = lint_suppressions_at(LINT_SUPPRESSION_FIXTURE, "src/lib.rs");
+        assert!(
+            rows.contains(&(
+                vec!["unused_variables".to_owned()],
+                "item".to_owned(),
+                true,
+                false
+            )),
+            "outer #[allow] is item scope; the same-line comment justifies: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn lint_suppression_dedups_and_sorts_lint_names() {
+        let rows = lint_suppressions_at(
+            "#[allow(dead_code, clippy::all, dead_code)]\nfn f() {}\n",
+            "src/lib.rs",
+        );
+        assert_eq!(
+            rows,
+            vec![(
+                vec!["clippy::all".to_owned(), "dead_code".to_owned()],
+                "item".to_owned(),
+                false,
+                false
+            )],
+            "duplicate lint names collapse; rustc and clippy lints sort together"
+        );
+    }
+
+    #[test]
+    fn lint_suppression_ignores_cfg_attr_wrapped_allows() {
+        let rows = lint_suppressions_at(
+            "#[cfg_attr(test, allow(dead_code))]\n#[derive(Debug)]\nstruct S;\n",
+            "src/lib.rs",
+        );
+        assert!(
+            rows.is_empty(),
+            "only the attribute's own name may match: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn lint_suppression_bare_and_empty_allow_emit_nothing() {
+        for source in ["#[allow]\nfn f() {}\n", "#[allow()]\nfn f() {}\n"] {
+            let rows = lint_suppressions_at(source, "src/lib.rs");
+            assert!(
+                rows.is_empty(),
+                "an allow silencing no lints is no suppression fact: {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lint_suppression_blank_line_breaks_comment_adjacency() {
+        let rows = lint_suppressions_at(
+            "// A comment with a blank line between it and the attribute.\n\n#[allow(dead_code)]\nfn f() {}\n",
+            "src/lib.rs",
+        );
+        assert_eq!(
+            rows,
+            vec![(
+                vec!["dead_code".to_owned()],
+                "item".to_owned(),
+                false,
+                false
+            )],
+            "only an immediately adjacent comment is a justification signal"
+        );
+    }
+
+    // ── Conditional-compilation gates (issue #190, RED) ────────────────────
+    //
+    // These tests assert the ABSENT feature: `GraphRecord::Node` carries no
+    // `cfg` field on the base tree, so every assertion expecting a gate chain
+    // FAILS until the implementation lands. They inspect serialized JSON, so
+    // they compile against the base schema. (`cfg_attr` is deliberately absent
+    // from the fixtures: its attribute decoding is issue #191's scope; issue
+    // #190 records the controlling predicate once it decodes.)
+
+    /// Fixture: a directly-gated fn, a fn inheriting its enclosing module's
+    /// gate, and an ungated fn.
+    const CFG_GATE_FIXTURE: &str = r#"#[cfg(feature = "embedded-aletheiadb")]
+fn directly_gated() {}
+
+#[cfg(feature = "mod-gate")]
+mod gated_module {
+    fn inherited_fn() {}
+}
+
+fn ungated_fn() {}
+"#;
+
+    /// Fixture: a file-inner gate, inherited by every symbol in the file.
+    const CFG_FILE_INNER_FIXTURE: &str = r#"#![cfg(feature = "file-gate")]
+
+fn file_scoped_fn() {}
+"#;
+
+    /// Extracts `source` as `path` and returns every record as serialized
+    /// JSON, so the assertions compile against the base schema while probing
+    /// for the `cfg` key the implementation adds.
+    fn cfg_json_records(source: &str, path: &str) -> Vec<serde_json::Value> {
+        let file = SourceFile {
+            path: PathBuf::from(path),
+            repo_relative_path: path.to_owned(),
+        };
+        let mut graph = Graph::default();
+        extract_file_source(&file, source, "file-id", "repo-id", &mut graph)
+            .expect("source should parse");
+        graph
+            .records()
+            .iter()
+            .map(|record| serde_json::to_value(record).expect("record serializes"))
+            .collect()
+    }
+
+    /// Returns the `cfg` string chain for the record named `name`, or `None`
+    /// when the record — or the `cfg` key — is absent. Matches the record's
+    /// simple name or its qualified name (`mod_path::name`), since nested
+    /// symbols are stamped with their qualified name.
+    fn cfg_chain_for(records: &[serde_json::Value], name: &str) -> Option<Vec<String>> {
+        let qualified_suffix = format!("::{name}");
+        records
+            .iter()
+            .find(|value| {
+                value
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|record_name| {
+                        record_name == name || record_name.ends_with(qualified_suffix.as_str())
+                    })
+            })
+            .and_then(|value| value.get("cfg"))
+            .and_then(serde_json::Value::as_array)
+            .map(|gates| {
+                gates
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+    }
+
+    /// Serializes one extraction of `source` to JSONL bytes.
+    fn cfg_jsonl_bytes(source: &str, path: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        for record in cfg_json_records(source, path) {
+            out.extend_from_slice(
+                serde_json::to_string(&record)
+                    .expect("record serializes")
+                    .as_bytes(),
+            );
+            out.push(b'\n');
+        }
+        out
+    }
+
+    #[test]
+    fn cfg_direct_gate_is_recorded_on_symbol() {
+        let records = cfg_json_records(CFG_GATE_FIXTURE, "src/lib.rs");
+        assert_eq!(
+            cfg_chain_for(&records, "directly_gated"),
+            Some(vec![r#"feature = "embedded-aletheiadb""#.to_owned()]),
+            "a #[cfg(...)] gate is recorded verbatim on the symbol"
+        );
+    }
+
+    #[test]
+    fn cfg_module_gate_is_inherited_by_members() {
+        let records = cfg_json_records(CFG_GATE_FIXTURE, "src/lib.rs");
+        assert_eq!(
+            cfg_chain_for(&records, "inherited_fn"),
+            Some(vec![r#"feature = "mod-gate""#.to_owned()]),
+            "a symbol inherits its enclosing module's gate"
+        );
+    }
+
+    #[test]
+    fn cfg_ungated_symbol_carries_no_cfg_key() {
+        let records = cfg_json_records(CFG_GATE_FIXTURE, "src/lib.rs");
+        let record = records
+            .iter()
+            .find(|value| {
+                value.get("name").and_then(serde_json::Value::as_str) == Some("ungated_fn")
+            })
+            .expect("ungated_fn is extracted");
+        assert!(
+            record.get("cfg").is_none(),
+            "an ungated symbol carries no cfg key at all: {record}"
+        );
+    }
+
+    #[test]
+    fn cfg_file_inner_gate_is_inherited_by_symbols() {
+        let records = cfg_json_records(CFG_FILE_INNER_FIXTURE, "src/lib.rs");
+        assert_eq!(
+            cfg_chain_for(&records, "file_scoped_fn"),
+            Some(vec![r#"feature = "file-gate""#.to_owned()]),
+            "a #![cfg(...)] file-inner gate is inherited by the file's symbols"
+        );
+    }
+
+    #[test]
+    fn cfg_extraction_is_byte_stable_across_five_runs() {
+        let baseline = cfg_jsonl_bytes(CFG_GATE_FIXTURE, "src/lib.rs");
+        for _ in 1..5 {
+            assert_eq!(
+                cfg_jsonl_bytes(CFG_GATE_FIXTURE, "src/lib.rs"),
+                baseline,
+                "repeated extractions are byte-identical"
+            );
+        }
+        // The stability assertion is vacuous without the feature: the chain
+        // itself must be present.
+        let records = cfg_json_records(CFG_GATE_FIXTURE, "src/lib.rs");
+        assert!(
+            cfg_chain_for(&records, "directly_gated").is_some(),
+            "the stable output actually carries cfg gates"
+        );
+    }
+
+    #[test]
+    fn cfg_gates_survive_crlf_and_path_separators() {
+        let lf = cfg_json_records(CFG_GATE_FIXTURE, "src/lib.rs");
+        let crlf_source = CFG_GATE_FIXTURE.replace('\n', "\r\n");
+        let crlf = cfg_json_records(&crlf_source, "src/lib.rs");
+        assert_eq!(
+            cfg_chain_for(&crlf, "directly_gated"),
+            cfg_chain_for(&lf, "directly_gated"),
+            "CRLF line endings yield the same gate chain as LF"
+        );
+        let backslash = cfg_json_records(CFG_GATE_FIXTURE, r"src\lib.rs");
+        assert_eq!(
+            cfg_chain_for(&backslash, "directly_gated"),
+            cfg_chain_for(&lf, "directly_gated"),
+            "backslash and slash paths yield the same gate chain"
+        );
+        assert!(
+            cfg_chain_for(&lf, "directly_gated").is_some(),
+            "the portable output actually carries cfg gates"
+        );
+    }
+
+    // ── Conditional-compilation gates (issue #190, GREEN) ───────────────────
+    //
+    // Behavior tests for the implementation: `cfg_attr` controlling
+    // predicates, comment/string decoys, multi-gate composition order, inline
+    // module inner attributes, and per-ancestor attribute order.
+
+    #[test]
+    fn cfg_attr_controlling_predicate_is_recorded() {
+        let records = cfg_json_records(
+            "#[cfg_attr(feature = \"attr-gate\", allow(dead_code))]\nfn attr_fn() {}\n",
+            "src/lib.rs",
+        );
+        assert_eq!(
+            cfg_chain_for(&records, "attr_fn"),
+            Some(vec![r#"feature = "attr-gate""#.to_owned()]),
+            "cfg_attr records its controlling predicate, not the payload"
+        );
+    }
+
+    #[test]
+    fn cfg_comment_and_string_decoys_never_mint_gates() {
+        let source = "// #[cfg(feature = \"comment-gate\")]\n/// #[cfg(feature = \"doc-gate\")]\nconst MARKER: &str = \"#[cfg(feature = \\\"string-gate\\\")]\";\nfn decoy_fn() {}\n";
+        let records = cfg_json_records(source, "src/lib.rs");
+        let record = records
+            .iter()
+            .find(|value| value.get("name").and_then(serde_json::Value::as_str) == Some("decoy_fn"))
+            .expect("decoy_fn is extracted");
+        assert!(
+            record.get("cfg").is_none(),
+            "decoys in comments and strings never mint gates: {record}"
+        );
+        for value in &records {
+            if let Some(gates) = value.get("cfg").and_then(serde_json::Value::as_array) {
+                for gate in gates {
+                    let text = gate.as_str().unwrap_or_default();
+                    assert!(
+                        !text.contains("comment-gate")
+                            && !text.contains("doc-gate")
+                            && !text.contains("string-gate"),
+                        "no decoy gate leaks into any record: {text}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cfg_doubly_gated_fn_composes_outermost_first() {
+        let records = cfg_json_records(
+            "#[cfg(feature = \"outer\")]\nmod outer_mod {\n    #[cfg(feature = \"inner\")]\n    fn double_fn() {}\n}\n",
+            "src/lib.rs",
+        );
+        assert_eq!(
+            cfg_chain_for(&records, "double_fn"),
+            Some(vec![
+                r#"feature = "outer""#.to_owned(),
+                r#"feature = "inner""#.to_owned()
+            ]),
+            "own gate composes after the inherited gate, outermost first"
+        );
+    }
+
+    #[test]
+    fn cfg_module_inner_attribute_gates_module_and_members() {
+        let records = cfg_json_records(
+            "mod inner_gated {\n    #![cfg(feature = \"inner-mod-gate\")]\n    fn member_fn() {}\n}\n",
+            "src/lib.rs",
+        );
+        assert_eq!(
+            cfg_chain_for(&records, "member_fn"),
+            Some(vec![r#"feature = "inner-mod-gate""#.to_owned()]),
+            "a member inherits its module's #![cfg] inner attribute"
+        );
+        assert_eq!(
+            cfg_chain_for(&records, "inner_gated"),
+            Some(vec![r#"feature = "inner-mod-gate""#.to_owned()]),
+            "the module record carries its own #![cfg] inner attribute"
+        );
+    }
+
+    #[test]
+    fn cfg_ancestor_attribute_order_is_preserved() {
+        // Regression: the ancestor walk must reverse ancestor order only —
+        // reversing the flat vector scrambles each ancestor's own attribute
+        // order.
+        let records = cfg_json_records(
+            "#[cfg(feature = \"a\")]\n#[cfg(feature = \"b\")]\nmod outer {\n    #[cfg(feature = \"c\")]\n    #[cfg(feature = \"d\")]\n    mod inner {\n        fn deep_fn() {}\n    }\n}\n",
+            "src/lib.rs",
+        );
+        assert_eq!(
+            cfg_chain_for(&records, "deep_fn"),
+            Some(vec![
+                r#"feature = "a""#.to_owned(),
+                r#"feature = "b""#.to_owned(),
+                r#"feature = "c""#.to_owned(),
+                r#"feature = "d""#.to_owned(),
+            ]),
+            "each ancestor's attributes stay in source order, outermost first"
+        );
+    }
+
+    #[test]
+    fn cfg_inline_comments_are_stripped_from_predicates() {
+        // AC8: the recorded gate is the predicate as written, minus comments —
+        // comment text never reaches the output. A `//` inside a string
+        // literal is predicate text, not a comment, and survives.
+        let records = cfg_json_records(
+            "#[cfg(feature = /* why gated */ \"comment-gate\")]\nfn block_commented_fn() {}\n\
+             #[cfg(\n    feature = // line comment inside the predicate\n    \"line-gate\",\n)]\nfn line_commented_fn() {}\n\
+             #[cfg(feature = \"slash//literal\")]\nfn slash_fn() {}\n",
+            "src/lib.rs",
+        );
+        assert_eq!(
+            cfg_chain_for(&records, "block_commented_fn"),
+            Some(vec![r#"feature = "comment-gate""#.to_owned()]),
+            "an inline block comment inside the predicate is stripped"
+        );
+        assert_eq!(
+            cfg_chain_for(&records, "line_commented_fn"),
+            Some(vec![r#"feature = "line-gate""#.to_owned()]),
+            "an inline line comment inside the predicate is stripped"
+        );
+        assert_eq!(
+            cfg_chain_for(&records, "slash_fn"),
+            Some(vec![r#"feature = "slash//literal""#.to_owned()]),
+            "// inside a string literal is predicate text, not a comment"
+        );
+    }
+
+    // ── Issue #162: structural complexity counting rules ──────────────────
+    //
+    // RED: `control_flow_complexity` does not exist yet.
+
+    /// Drives [`control_flow_complexity`] over a real parse of `source`,
+    /// taking the first `function_item` — the same node kind the extractor
+    /// hands to `add_symbol`.
+    fn complexity_of_fn(source: &str) -> u32 {
+        let tree = parse_tree(source);
+        let item = first_descendant_of_kind(tree.root_node(), "function_item")
+            .expect("source should contain a function_item");
+        control_flow_complexity(item)
+    }
+
+    #[test]
+    fn complexity_straight_line_scores_minimum() {
+        assert_eq!(complexity_of_fn("fn f() -> i32 { 42 }"), 1);
+        assert_eq!(complexity_of_fn("fn f(a: i32, b: i32) -> i32 { a + b }"), 1);
+    }
+
+    #[test]
+    fn complexity_counts_branches_and_else_if() {
+        assert_eq!(
+            complexity_of_fn("fn f(x: bool) -> i32 { if x { 1 } else { 0 } }"),
+            2
+        );
+        // `else if` is a second `if_expression` in the AST: a second decision.
+        assert_eq!(
+            complexity_of_fn(
+                "fn f(x: i32) -> i32 { if x > 0 { 1 } else if x < 0 { 2 } else { 0 } }"
+            ),
+            3
+        );
+    }
+
+    #[test]
+    fn complexity_counts_loops() {
+        assert_eq!(complexity_of_fn("fn f() { loop { break; } }"), 2);
+        assert_eq!(complexity_of_fn("fn f(x: bool) { while x { break; } }"), 2);
+        assert_eq!(complexity_of_fn("fn f() { for _ in 0..1 {} }"), 2);
+        assert_eq!(
+            complexity_of_fn("fn f() { for _ in 0..1 {} while true { break; } loop { break; } }"),
+            4
+        );
+    }
+
+    #[test]
+    fn complexity_counts_every_match_arm() {
+        // Three arms (including the `_` catch-all): 1 + 3 = 4.
+        assert_eq!(
+            complexity_of_fn("fn f(x: i32) -> i32 { match x { 0 => 1, 1..=5 => 2, _ => 3 } }"),
+            4
+        );
+    }
+
+    #[test]
+    fn complexity_counts_try_and_short_circuit_operators() {
+        assert_eq!(
+            complexity_of_fn("fn f(x: Option<i32>) -> Option<i32> { Some(x?) }"),
+            2
+        );
+        assert_eq!(
+            complexity_of_fn("fn f(a: bool, b: bool) -> bool { a && b }"),
+            2
+        );
+        assert_eq!(
+            complexity_of_fn("fn f(a: bool, b: bool) -> bool { a || b }"),
+            2
+        );
+        assert_eq!(
+            complexity_of_fn("fn f(a: bool, b: bool, c: bool) -> bool { a && b || c }"),
+            3
+        );
+    }
+
+    #[test]
+    fn complexity_counts_closure_bodies_but_not_nested_fns() {
+        // Closure bodies are part of the enclosing function's expression
+        // tree: the `if` inside the closure counts.
+        assert_eq!(
+            complexity_of_fn("fn f() -> i32 { let g = |x: i32| if x > 0 { x } else { -x }; g(1) }"),
+            2
+        );
+        // A nested `fn` gets its own symbol: its `if` must not inflate the
+        // outer score. Outer: 1 + 1 (its own `if`) = 2.
+        let outer = complexity_of_fn(
+            "fn outer() -> i32 { fn inner(x: bool) -> i32 { if x { 1 } else { 0 } } if true { inner(true) } else { 0 } }",
+        );
+        assert_eq!(outer, 2);
+    }
+
+    #[test]
+    fn complexity_is_monotone_in_decision_points() {
+        // Each snippet adds exactly one decision point over the previous:
+        // the scores must be strictly increasing.
+        let snippets = [
+            "fn f() -> i32 { 0 }",
+            "fn f(x: bool) -> i32 { if x { 1 } else { 0 } }",
+            "fn f(x: bool) -> i32 { if x && x { 1 } else { 0 } }",
+            "fn f(x: bool) -> i32 { if x && x || x { 1 } else { 0 } }",
+            "fn f(x: bool) -> i32 { if x && x || x { if x { 1 } else { 0 } } else { 0 } }",
+            "fn f(x: bool) -> i32 { while x { break; } if x && x || x { if x { 1 } else { 0 } } else { 0 } }",
+            "fn f(x: bool) -> i32 { for _ in 0..1 {} while x { break; } if x && x || x { if x { 1 } else { 0 } } else { 0 } }",
+        ];
+        let mut previous = 0u32;
+        for (i, snippet) in snippets.iter().enumerate() {
+            let score = complexity_of_fn(snippet);
+            let expected = u32::try_from(i + 1).expect("snippet index fits in u32");
+            assert_eq!(score, expected, "snippet {i} should score {}", i + 1);
+            assert!(score > previous, "snippet {i} must score strictly higher");
+            previous = score;
+        }
+    }
+
+    // ── Issue #148: macro_rules! symbol extraction ────────────────────────
+
+    fn extract_with_facts(source: &str) -> (Graph, FileFacts) {
+        let file = SourceFile {
+            path: PathBuf::from("src/lib.rs"),
+            repo_relative_path: "src/lib.rs".to_owned(),
+        };
+        let mut graph = Graph::default();
+        let facts = extract_file_source(&file, source, "file-id", "repo-id", &mut graph)
+            .expect("source should parse");
+        (graph, facts)
+    }
+
+    fn macro_symbols(graph: &Graph) -> Vec<&GraphRecord> {
+        graph
+            .records()
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    GraphRecord::Node {
+                        kind: NodeKind::Symbol,
+                        symbol_kind: Some(kind),
+                        ..
+                    } if kind == "macro"
+                )
+            })
+            .collect()
+    }
+
+    fn diagnostic_records(graph: &Graph) -> Vec<&GraphRecord> {
+        graph
+            .records()
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    GraphRecord::Node {
+                        kind: NodeKind::Diagnostic,
+                        ..
+                    }
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn macro_definition_emits_macro_symbol_with_defines_edge() {
+        let (graph, _) = extract_with_facts("macro_rules! greet {\n    () => {};\n}\n");
+        let macros = macro_symbols(&graph);
+        assert_eq!(macros.len(), 1, "one macro symbol expected");
+        let GraphRecord::Node {
+            name,
+            span,
+            repo_relative_path,
+            ..
+        } = macros[0]
+        else {
+            panic!("macro record must be a node");
+        };
+        assert_eq!(name.as_deref(), Some("greet"));
+        assert_eq!(repo_relative_path.as_deref(), Some("src/lib.rs"));
+        assert!(span.is_some(), "macro symbol must carry a span");
+        let defines = graph
+            .records()
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    GraphRecord::Edge {
+                        label: EdgeLabel::Defines,
+                        target,
+                        ..
+                    } if target == macros[0].id()
+                )
+            })
+            .count();
+        assert_eq!(
+            defines, 1,
+            "macro symbol must carry exactly one DEFINES edge"
+        );
+    }
+
+    #[test]
+    fn macro_definition_in_module_is_qualified() {
+        let (graph, _) =
+            extract_with_facts("mod m {\n    macro_rules! greet {\n        () => {};\n    }\n}\n");
+        let macros = macro_symbols(&graph);
+        assert_eq!(macros.len(), 1, "one macro symbol expected");
+        let GraphRecord::Node { name, .. } = macros[0] else {
+            panic!("macro record must be a node");
+        };
+        assert_eq!(name.as_deref(), Some("m::greet"));
+    }
+
+    #[test]
+    fn macro_export_marks_public_visibility() {
+        let (graph, _) =
+            extract_with_facts("#[macro_export]\nmacro_rules! greet {\n    () => {};\n}\n");
+        let macros = macro_symbols(&graph);
+        assert_eq!(macros.len(), 1, "one macro symbol expected");
+        let GraphRecord::Node { visibility, .. } = macros[0] else {
+            panic!("macro record must be a node");
+        };
+        assert_eq!(
+            visibility.as_deref(),
+            Some("public"),
+            "#[macro_export] must surface as public visibility"
+        );
+    }
+
+    #[test]
+    fn macro_without_export_is_private() {
+        let (graph, _) = extract_with_facts("macro_rules! greet {\n    () => {};\n}\n");
+        let macros = macro_symbols(&graph);
+        assert_eq!(macros.len(), 1, "one macro symbol expected");
+        let GraphRecord::Node { visibility, .. } = macros[0] else {
+            panic!("macro record must be a node");
+        };
+        assert_eq!(
+            visibility.as_deref(),
+            Some("private"),
+            "a non-exported macro_rules! must surface as private visibility"
+        );
+    }
+
+    #[test]
+    fn macro_definition_registers_resolution_fact() {
+        let (graph, facts) = extract_with_facts("macro_rules! greet {\n    () => {};\n}\n");
+        assert_eq!(facts.macro_definitions.len(), 1);
+        let def = &facts.macro_definitions[0];
+        assert_eq!(def.simple_name, "greet");
+        assert_eq!(def.qualified_name, "greet");
+        assert_eq!(def.repo_relative_path, "src/lib.rs");
+        let macros = macro_symbols(&graph);
+        assert_eq!(
+            def.id,
+            macros[0].id(),
+            "the resolution fact must point at the emitted symbol"
+        );
+    }
+
+    #[test]
+    fn macro_invocation_records_fact_and_no_diagnostic() {
+        let (graph, facts) = extract_with_facts(
+            "macro_rules! greet {\n    () => {};\n}\nfn f() {\n    greet!();\n}\n",
+        );
+        assert_eq!(
+            facts.macro_invocations.len(),
+            1,
+            "one invocation fact expected"
+        );
+        let invocation = &facts.macro_invocations[0];
+        assert_eq!(invocation.simple_name, "greet");
+        assert_eq!(invocation.invocation_display, "greet!");
+        assert_eq!(invocation.repo_relative_path, "src/lib.rs");
+        assert!(
+            diagnostic_records(&graph).is_empty(),
+            "extraction must defer macro diagnostics to the repo-wide resolution pass"
+        );
+    }
+
+    #[test]
+    fn macro_invocation_inside_function_names_function_caller() {
+        let (graph, facts) = extract_with_facts(
+            "macro_rules! greet {\n    () => {};\n}\nfn f() {\n    greet!();\n}\n",
+        );
+        let invocation = &facts.macro_invocations[0];
+        let fn_symbol = graph
+            .records()
+            .iter()
+            .find(|r| {
+                matches!(
+                    r,
+                    GraphRecord::Node {
+                        kind: NodeKind::Symbol,
+                        name: Some(name),
+                        ..
+                    } if name == "f"
+                )
+            })
+            .expect("function symbol present");
+        assert_eq!(
+            invocation.caller_id,
+            fn_symbol.id(),
+            "the invoking scope of a call inside a function is that function"
+        );
+    }
+
+    #[test]
+    fn macro_invocation_simple_name_strips_path_and_bang() {
+        let (_, facts) = extract_with_facts("fn f() {\n    crate::helpers::greet!();\n}\n");
+        assert_eq!(facts.macro_invocations.len(), 1);
+        assert_eq!(facts.macro_invocations[0].simple_name, "greet");
+        assert_eq!(
+            facts.macro_invocations[0].invocation_display,
+            "crate::helpers::greet!"
         );
     }
 }

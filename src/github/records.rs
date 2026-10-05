@@ -1021,6 +1021,9 @@ fn set_review_extra(
                 end_line: l as usize,
                 start_byte: 0,
                 end_byte: 0,
+                // GitHub provides line anchors only; columns are unknown.
+                start_column: None,
+                end_column: None,
             });
         }
         *diff_hunk_handle = diff_hunk.map(handle_for);

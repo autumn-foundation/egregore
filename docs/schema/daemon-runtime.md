@@ -72,7 +72,7 @@ Reserved nullable fields:
 |---|---|---|---|
 | `api_version` | string | `null` | Wire API value such as `v1` or `v2` |
 | `transports` | array | `null` | `{ "kind": "http"|"unix"|"pipe", "address": string }` |
-| `token_expires_at_unix_ms` | u128 number or string | `null` | Token rotation expiry |
+| `token_expires_at_unix_ms` | u128 number or string | `null` when rotation is disabled; otherwise the unix-ms instant the current token rotates | Token rotation expiry (issue #70) |
 | `daemons_index_url` | string | `null` | Multi-daemon registry pointer |
 
 Adding an optional field is additive within `schema_version: 1`. Renaming,
@@ -176,12 +176,60 @@ On crash, `egregored.json` remains as last written, usually
 running daemon from a crashed one. A future `eg daemon stop --purge` may remove
 the runtime files.
 
-## 8. Reserved Hooks
+## 8. Token Rotation (issue #70)
 
-Token rotation is reserved but not implemented. When
-`token_expires_at_unix_ms` is populated, clients MUST re-read
-`egregored.json` after that instant. The reserved wire error code is
-`token_rotated`.
+Token rotation is implemented and opt-in. Start the daemon with a token
+lifetime to enable it:
+
+```
+eg daemon start --data-dir .egregore --token-ttl-ms 3600000
+```
+
+Operator meaning of `token_expires_at_unix_ms`: the unix-millisecond instant
+at which the daemon rotates the bearer token recorded in `egregored.json`.
+Clients MUST re-read `egregored.json` after that instant; the file then
+carries the fresh token and the next expiry. When rotation is disabled the
+field is `null` and the single startup token lives as long as the daemon.
+
+Rotation semantics:
+
+- At each rotation the daemon commits the new token in memory first, then
+  rewrites `egregored.json` (and the lease copy). If the rewrite fails, the
+  daemon logs `egregored: token rotation metadata write failed` and retries
+  on the next accept-loop pass without advancing the schedule.
+- Cutover window: each superseded token stays valid for `ttl / 2`
+  milliseconds after rotation, so in-flight requests and slightly-late
+  clients keep working.
+- After the cutover window, requests bearing a superseded token are rejected
+  with HTTP 401 and the stable `token_rotated` error code. The rejection
+  never executes the requested read or write, and never carries token
+  material.
+- A bearer the daemon never issued (or issued more than one lifetime past
+  its cutover window) is rejected with `unauthorized`, not `token_rotated`.
+- On daemon restart a fresh token is issued unconditionally; pre-restart
+  tokens fail closed as `unauthorized`. Committed writes are not duplicated
+  by client retries because the idempotency store (`idempotency.json` in the
+  runtime dir) survives restarts and the retry resends the identical
+  idempotency key.
+
+Client retry contract (implemented by `DaemonClient`; the documented `eg`
+workflow is `eg ingest --adapter daemon`):
+
+1. Send the request with the current token.
+2. On a `token_rotated` rejection only, re-read `egregored.json` through the
+   normal discovery flow — staleness (runtime-lock) and liveness checks run
+   first, exactly as on connect — and retry the identical request once with
+   the fresh token. Request identity (`request_id`), idempotency keys, and
+   read/write result semantics are preserved.
+3. If the retry also fails (still `token_rotated`, or anything else), surface
+   the failure. Never retry a third time.
+
+When to restart the daemon instead of retrying: retry handles rotation.
+Restart (or `eg daemon stop` + `eg daemon start`) when the daemon is
+unresponsive, when `token_rotated` persists after the single retry (the
+metadata on disk may belong to a different daemon generation — re-run
+discovery rather than looping), or when the runtime lock shows the metadata
+is stale.
 
 The multi-daemon registry is reserved but not implemented. `daemons_index_url`
 may later point to a per-user daemon index such as
@@ -210,6 +258,15 @@ fn connect(start_dir):
   response = http_get("http://" + address + "/v1/health")
   assert response.status == 200
   return Client(address, token)
+
+# Issue #70 rotation handling: wrap every data-plane call.
+fn call_with_rotation_retry(client, send):
+  (status, body) = send(client)
+  if status == 401 and body.error.code == "token_rotated":
+    # Re-read through the SAME discovery flow: lock + liveness checks first.
+    client = connect(start_dir)   # exactly one re-read
+    (status, body) = send(client) # exactly one retry, identical request
+  return (status, body)           # surface whatever the retry returned
 ```
 
 This example uses only fields documented in this file and the unauthenticated

@@ -50,6 +50,17 @@ pub struct FileAtPointSymbol<'a> {
     /// Valid time (committer date) of the resolved commit, when recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub valid_time: Option<&'a str>,
+    /// Test-vs-production role of the backing record (issue #238), resolved
+    /// as-of the selected point. Omitted for records that predate issue #238
+    /// (role unknown, never fabricated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<crate::ir::SymbolRole>,
+    /// Conditional-compilation gate chain (issue #190), resolved as-of the
+    /// selected point: the normalized predicates lexically gating the backing
+    /// record, outermost gate first. Omitted for records that predate
+    /// issue #190 or are ungated (unknown-or-absent, never fabricated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cfg: Option<Vec<String>>,
 }
 
 /// One stable, machine-readable diagnostic on a *successful* file-at-point
@@ -418,6 +429,10 @@ pub fn file_symbols_at_point<'a>(
             absent_span_reason: span.is_none().then_some("no_span_module_level"),
             commit: resolved_sha,
             valid_time: Some(t.valid_time.as_str()),
+            role: r.role().copied(),
+            // Conditional-compilation gates (issue #190), resolved as-of the
+            // point like every other record field on the row.
+            cfg: r.cfg().cloned(),
         });
     }
     symbols.sort_by(|a, b| {
@@ -478,13 +493,14 @@ pub struct LocationContext<'a> {
     pub primary: Option<&'a GraphRecord>,
     /// Repository owner groups among the path's matched records.
     pub repo_groups: BTreeSet<Option<&'a str>>,
-    /// Maximum recorded span `end_line` across the path's `Symbol`/`Module`
+    /// Maximum recorded `end_line` across the path's `File`/`Module`/`Symbol`
     /// nodes in the selected view, or `None` when the path has no spanned
-    /// structural records. Lets a caller distinguish a line beyond the file's
-    /// last recorded structural element (out of range of the graph's knowledge)
-    /// from a line in a gap between items — `File` nodes carry no span, so the
-    /// file's true last line is not stored and this recorded extent is the best
-    /// deterministic upper bound.
+    /// records. The `File` node's whole-file span (issue #212) makes this the
+    /// file's true last line, so a caller can distinguish a line beyond the
+    /// file (`line_out_of_range`) from a line in a gap between items
+    /// (`no_enclosing_symbol`) without guessing a neighbor. Graphs whose
+    /// `File` nodes predate whole-file spans carry no `File` span and fall
+    /// back to the last recorded structural span, as before.
     pub max_span_end_line: Option<usize>,
 }
 
@@ -623,18 +639,23 @@ pub fn location_context<'a>(
         let GraphRecord::Node { kind, span, .. } = record else {
             continue;
         };
-        if matches!(kind, NodeKind::File) {
+        let is_file = matches!(kind, NodeKind::File);
+        if is_file {
             ctx.file_record = Some(record);
-            continue;
         }
         let Some(span) = span else { continue };
-        // Track the deepest recorded structural line for the path so the caller
-        // can tell a line past the last known span (out of range) from a gap.
+        // Track the deepest recorded line for the path so the caller can tell
+        // a line past the file's last line (out of range) from a gap between
+        // items. The `File` node's whole-file span (issue #212) supplies the
+        // file's true line count; graphs whose `File` nodes predate it carry
+        // no span and fall back to the structural maximum, as before. The
+        // `File` node never joins the containment chain: its span covers every
+        // line by construction.
         ctx.max_span_end_line = Some(
             ctx.max_span_end_line
                 .map_or(span.end_line, |m| m.max(span.end_line)),
         );
-        if span.start_line <= line && line <= span.end_line {
+        if !is_file && span.start_line <= line && line <= span.end_line {
             ctx.chain.push(record);
         }
     }
@@ -692,6 +713,8 @@ mod liveness_tests {
                 end_byte: 100,
                 start_line: 10,
                 end_line: 20,
+                start_column: None,
+                end_column: None,
             }),
             Some("target_fn".to_owned()),
             "fn target_fn".to_owned(),

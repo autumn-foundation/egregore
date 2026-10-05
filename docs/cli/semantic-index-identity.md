@@ -266,16 +266,21 @@ never vectors, never indexed source text, and never the operator's query string.
 
 ## Re-ingesting when the model changes
 
-The remedy is always **re-ingest**, never editing the store — the store is the
-record of what was actually embedded, and mutating it would replace a detectable
-incompatibility with a silent lie. Egregore never chooses, downloads, switches,
-or auto-upgrades an embedding model, and never re-embeds a store on mismatch.
+The remedy is always **re-ingest** (or the explicit `eg re-embed`, below),
+never editing the store — the store is the record of what was actually
+embedded, and mutating it would replace a detectable incompatibility with a
+silent lie. Egregore never chooses, downloads, switches, or auto-upgrades an
+embedding model, and never re-embeds a store on mismatch: the refusal stays
+read-only, and moving the store is a separate operator command.
 
 ```powershell
 # 1. See what the store was embedded with, and why the query was refused.
 eg inspect --data-dir .egregore --format text
 
-# 2. Re-ingest into a FRESH data dir with the current binary's embedder.
+# 2a. Either re-embed in place (no re-scan; see docs/cli/re-embed.md):
+eg re-embed --data-dir .egregore --model <MODEL_DIR_OR_CACHED_HF_ID>
+
+# 2b. Or re-ingest into a FRESH data dir with the current binary's embedder.
 eg scan . --out graph.jsonl
 eg ingest graph.jsonl --adapter embedded --data-dir .egregore-new --embed
 
@@ -286,12 +291,15 @@ eg inspect --data-dir .egregore-new
 eg query semantic "request timeout handling" --data-dir .egregore-new
 ```
 
-A **fresh** data dir matters for a model change, and Egregore enforces it:
-re-embedding in place would leave the prior model's vectors in the index
-alongside the new ones, so `eg ingest --embed` / `eg refresh --embed` / the
-`eg watch --embed` loop **refuse before writing** when the store's index was
-built by a different model, with the stable code
-`embedding_index_identity_conflict`:
+A **fresh** data dir matters for a model change via `ingest`, and Egregore
+enforces it: re-embedding in place would leave the prior model's vectors in
+the index alongside the new ones, so `eg ingest --embed` / `eg refresh
+--embed` / the `eg watch --embed` loop **refuse before writing** when the
+store's index was built by a different model, with the stable code
+`embedding_index_identity_conflict`. `eg re-embed` is the exception that
+proves the rule: it *replaces* every vector and supersedes the identity in
+one transaction (rebuilding the index when the dimension changes), so no
+mixed vector space ever exists — see `docs/cli/re-embed.md`.
 
 ```json
 {"ok":false,"error":{

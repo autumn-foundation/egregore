@@ -1,9 +1,10 @@
 use std::collections::BTreeSet;
 
 use super::{
-    evidence_link_triple_handle, is_bfs_relay_node, is_cross_domain_label, is_forward_only_label,
+    PolicyEntry, evidence_link_triple_handle, is_bfs_relay_node, is_cross_domain_label,
+    is_forward_only_label,
 };
-use crate::ir::{EdgeLabel, GraphRecord, NodeKind};
+use crate::ir::{EdgeLabel, GraphRecord, NodeKind, SourceSpan};
 
 /// An evidence link target that could not be resolved in the current store.
 ///
@@ -21,12 +22,62 @@ pub struct UnresolvedRef {
     pub target_domain: String,
 }
 
+/// One distinct symbol identity sharing a queried name.
+///
+/// Surfaced in [`SymbolContext::candidates`] when a name resolves to more
+/// than one distinct symbol identity (issue #192). The caller picks one by
+/// [`SymbolCandidate::record_id`] or [`SymbolCandidate::file_span_handle`]
+/// and re-queries (via [`record_context`] or the `candidate` selector on the
+/// `symbol_context` MCP tool / `--candidate` on `eg query context`) for
+/// context scoped to exactly that symbol.
+///
+/// The struct is `Serialize` so the MCP and CLI lanes can render the
+/// disambiguation list without a second mapping step.
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize)]
+pub struct SymbolCandidate<'a> {
+    /// Stable record ID of the symbol node (ADR 0004).
+    pub record_id: &'a str,
+    /// The queried symbol name (identical for every candidate).
+    pub symbol_name: &'a str,
+    /// Repo-relative defining path, when the symbol carries one.
+    pub repo_relative_path: Option<&'a str>,
+    /// Source span of the symbol definition, when recorded.
+    pub span: Option<&'a SourceSpan>,
+}
+
+impl SymbolCandidate<'_> {
+    /// Repo-relative `file:span` handle for this candidate:
+    /// `path:start_line-end_line`.
+    ///
+    /// Falls back to the bare repo-relative path when the symbol carries no
+    /// span, and to the record ID when it carries no path either. The
+    /// `path:start_line-end_line` form round-trips through
+    /// [`resolve_symbol_file_span_handle`]; the fallbacks are display-only.
+    #[must_use]
+    pub fn file_span_handle(&self) -> String {
+        match (self.repo_relative_path, self.span) {
+            (Some(path), Some(span)) => {
+                format!("{path}:{}-{}", span.start_line, span.end_line)
+            }
+            (Some(path), None) => path.to_owned(),
+            (None, _) => self.record_id.to_owned(),
+        }
+    }
+}
+
 /// Evidence-backed symbol context returned by [`symbol_context`].
 ///
 /// Sections are kept separate so the caller can present source facts
 /// (deterministic) differently from observations (subjective) without
 /// mixing trust levels. An [`Observation`] node MUST NOT appear in
 /// [`SymbolContext::source_facts`].
+///
+/// When the queried name resolves to more than one distinct symbol identity,
+/// the recall is *ambiguous* (issue #192): every section is empty and
+/// [`SymbolContext::candidates`] enumerates the identities instead. Merging
+/// the sections would attribute one symbol's history to another, so the
+/// sections are NEVER populated on an ambiguous result — check
+/// [`SymbolContext::is_ambiguous`] before inspecting them.
 ///
 /// [`Observation`]: crate::ir::NodeKind::Observation
 #[derive(Debug, Default, Clone)]
@@ -46,10 +97,24 @@ pub struct SymbolContext<'a> {
     ///
     /// Every record carries `agent_id`, `observed_at`, and `confidence`.
     /// These are subjective and MUST NOT be treated as source truth.
+    ///
+    /// Section contract (issue #191): this section holds `Observation` and
+    /// `Failure` records only. `Decision` records never appear here — they
+    /// surface in [`SymbolContext::decisions`].
     pub observations: Vec<&'a GraphRecord>,
+    /// Agent-authored `Decision` nodes linked to the symbol, carrying
+    /// `decision_text` and `rationale_summary` (issue #191).
+    ///
+    /// Trust contract: decisions are agent-authored and evidence-backed, but
+    /// they are deliberate judgments — never deterministic source truth.
+    /// Treat the rationale as a claim to verify before reusing, not as a
+    /// fact to cite. A decision never appears in
+    /// [`SymbolContext::observations`].
+    pub decisions: Vec<&'a GraphRecord>,
     /// `Task` and `AcceptanceCriterion` nodes linked to the symbol.
     pub project_state: Vec<&'a GraphRecord>,
-    /// `Artifact` and `PatchArtifact` nodes linked to the symbol.
+    /// `Artifact`, `PatchArtifact`, `FileEdit`, and the design-doc kinds
+    /// (`Adr`, `Prd`, `PlanDoc`) nodes linked to the symbol.
     pub artifacts: Vec<&'a GraphRecord>,
     /// `Verification`, `TestRun`, `CommandRun`, and `CommandEvidence` nodes
     /// linked to the symbol.
@@ -63,21 +128,65 @@ pub struct SymbolContext<'a> {
     /// Evidence link targets referenced by agent-memory nodes that are absent
     /// from this store slice. Surfaced explicitly per AC5.
     pub unresolved: Vec<UnresolvedRef>,
+    /// Disambiguation candidates, populated ONLY when the queried name
+    /// resolves to more than one distinct symbol identity (issue #192).
+    ///
+    /// One entry per distinct identity, deterministically ordered by
+    /// (repo-relative path, span start line, record ID). Every section is
+    /// empty on an ambiguous result — the sections are never a merge of
+    /// several identities. Empty for no-match and single-match results.
+    pub candidates: Vec<SymbolCandidate<'a>>,
+    /// Active approved user-context policy records whose scope applies to
+    /// the anchor (issue #169).
+    ///
+    /// Folded from the durable policy kinds (`Preference`, `WorkflowRule`,
+    /// `NamingDecision`, `Constraint`) via
+    /// [`policy_for_anchor`][crate::query::policy_for_anchor]: only records
+    /// with a validated audit chain and no `active_to` (superseded/revoked
+    /// excluded), whose [`UserContextScope`][crate::ir::UserContextScope]
+    /// applies to the scope auto-derived from the anchor's own facts
+    /// (owning repository, repo-relative path, language) — no caller-supplied
+    /// policy filter. Pending, rejected, and deferred candidates never
+    /// surface here; they remain visible via `eg query policy`.
+    ///
+    /// Trust: rows carry the approval-decision handle that materialized them
+    /// and classify as [`TrustClass::Other`][crate::query::TrustClass] under
+    /// the #114 closed vocabulary — distinguishable from source-derived code
+    /// facts and unverified observations.
+    ///
+    /// Always present (possibly empty), like every other section: a context
+    /// with no applicable policy carries an explicit empty `policy` section,
+    /// never a missing field. Empty on ambiguous and no-match results.
+    pub policy: Vec<PolicyEntry<'a>>,
 }
 
 impl SymbolContext<'_> {
     /// Returns `true` when no symbol with the queried name exists in the store.
     ///
-    /// Callers MUST check this before inspecting sections — all sections are
-    /// empty for a no-match result.
+    /// Callers MUST check [`SymbolContext::is_ambiguous`] first: an ambiguous
+    /// name has empty sections but is a match, not a no-match.
     #[must_use]
     pub const fn is_no_match(&self) -> bool {
         self.source_facts.is_empty()
             && self.observations.is_empty()
+            && self.decisions.is_empty()
             && self.project_state.is_empty()
             && self.artifacts.is_empty()
             && self.verification_evidence.is_empty()
             && self.unresolved.is_empty()
+            && self.candidates.is_empty()
+    }
+
+    /// Returns `true` when the queried name resolved to more than one
+    /// distinct symbol identity (issue #192).
+    ///
+    /// The sections are empty on an ambiguous result; the identities are
+    /// enumerated in [`SymbolContext::candidates`] instead of being merged.
+    /// Callers MUST check this before inspecting sections — and before
+    /// `is_no_match`, which is `false` for ambiguous results.
+    #[must_use]
+    pub const fn is_ambiguous(&self) -> bool {
+        !self.candidates.is_empty()
     }
 }
 
@@ -91,10 +200,17 @@ pub(super) const fn classify_node(kind: NodeKind) -> Option<ContextSection> {
         NodeKind::Symbol | NodeKind::File | NodeKind::Module | NodeKind::Import => {
             Some(ContextSection::SourceFact)
         }
-        // agent-authored observations and failure records
-        NodeKind::Observation | NodeKind::Decision | NodeKind::Failure => {
-            Some(ContextSection::Observation)
-        }
+        // agent-authored observations and failure records.
+        //
+        // Section contract (issue #191): `Observation` and `Failure` share
+        // the observations section; `Decision` has its own. Failures stay
+        // here deliberately — they are post-hoc notes about what went wrong,
+        // not deliberate judgments — and this comment is the documented
+        // routing the issue requires instead of silent flattening.
+        NodeKind::Observation | NodeKind::Failure => Some(ContextSection::Observation),
+        // agent-authored decisions with rationale (issue #191): a dedicated
+        // section, never mixed into observations.
+        NodeKind::Decision => Some(ContextSection::Decision),
         // project / task domain
         NodeKind::Task
         | NodeKind::AcceptanceCriterion
@@ -111,9 +227,12 @@ pub(super) const fn classify_node(kind: NodeKind) -> Option<ContextSection> {
         // request transition — so it surfaces alongside the Review it concerns.
         | NodeKind::ReviewStateTransition => Some(ContextSection::ProjectState),
         // artifact domain
-        NodeKind::Artifact | NodeKind::PatchArtifact | NodeKind::FileEdit => {
-            Some(ContextSection::Artifact)
-        }
+        NodeKind::Artifact
+        | NodeKind::PatchArtifact
+        | NodeKind::Adr
+        | NodeKind::Prd
+        | NodeKind::PlanDoc
+        | NodeKind::FileEdit => Some(ContextSection::Artifact),
         // verification domain
         NodeKind::Verification
         | NodeKind::CommandEvidence
@@ -132,9 +251,173 @@ pub(super) const fn classify_node(kind: NodeKind) -> Option<ContextSection> {
 pub(super) enum ContextSection {
     SourceFact,
     Observation,
+    /// Agent-authored decisions with rationale (issue #191). Trust-separated
+    /// from observations: a decision is a deliberate, evidence-backed
+    /// judgment — never an ad-hoc note and never source truth.
+    Decision,
     ProjectState,
     Artifact,
     VerificationEvidence,
+}
+
+/// Builds the ambiguous-recall result for issue #192: one
+/// [`SymbolCandidate`] per distinct symbol identity, sections left empty.
+///
+/// `symbol_ids` is the exact set of identities the current-state recall
+/// would otherwise have merged (tombstone and temporal rules already
+/// applied), so ambiguity detection counts precisely those. Candidates cite
+/// the current-state (non-temporal) record's path/span when one exists,
+/// falling back to any version so a historical-only identity still gets a
+/// handle. Ordered by (repo-relative path, span start line, record ID) for
+/// a deterministic, human-scannable disambiguation list.
+fn ambiguous_symbol_context<'a>(
+    records: &'a [GraphRecord],
+    symbol_name: &'a str,
+    symbol_ids: &BTreeSet<&'a str>,
+) -> SymbolContext<'a> {
+    /// Path/span/name of the current-state record for `id`, falling back to
+    /// any version present in the slice.
+    fn current_record_parts<'a>(
+        records: &'a [GraphRecord],
+        id: &str,
+    ) -> Option<(Option<&'a str>, Option<&'a SourceSpan>, Option<&'a str>)> {
+        let mut fallback: Option<(Option<&'a str>, Option<&'a SourceSpan>, Option<&'a str>)> = None;
+        for record in records {
+            let GraphRecord::Node {
+                id: record_id,
+                kind: NodeKind::Symbol,
+                name,
+                repo_relative_path,
+                span,
+                temporal,
+                ..
+            } = record
+            else {
+                continue;
+            };
+            if record_id.as_str() != id {
+                continue;
+            }
+            let parts = (
+                repo_relative_path.as_deref(),
+                span.as_ref(),
+                name.as_deref(),
+            );
+            if temporal.is_none() {
+                return Some(parts);
+            }
+            fallback.get_or_insert(parts);
+        }
+        fallback
+    }
+
+    let mut candidates: Vec<SymbolCandidate<'a>> = symbol_ids
+        .iter()
+        .copied()
+        .filter_map(|id| {
+            let (repo_relative_path, span, name) = current_record_parts(records, id)?;
+            Some(SymbolCandidate {
+                record_id: id,
+                symbol_name: name.unwrap_or(symbol_name),
+                repo_relative_path,
+                span,
+            })
+        })
+        .collect();
+    candidates.sort_by(|a, b| {
+        (
+            a.repo_relative_path,
+            a.span.map(|s| s.start_line),
+            a.record_id,
+        )
+            .cmp(&(
+                b.repo_relative_path,
+                b.span.map(|s| s.start_line),
+                b.record_id,
+            ))
+    });
+
+    SymbolContext {
+        symbol_name: symbol_name.to_owned(),
+        candidates,
+        ..Default::default()
+    }
+}
+
+/// Resolves a `file:span` handle (`path:start_line-end_line`, as produced by
+/// [`SymbolCandidate::file_span_handle`]) back to the symbol record.
+///
+/// This is the re-query half of the issue #192 disambiguation contract: a
+/// caller holding a candidate handle anchors [`record_context`] on the
+/// returned record for context scoped to exactly that symbol.
+///
+/// Returns `None` when the handle is malformed, matches no live symbol, or
+/// matches more than one distinct identity — ambiguity is never resolved
+/// implicitly. Tombstoned current-state records do not resolve (a historical
+/// temporal version survives its current-state tombstone, mirroring the
+/// recall's liveness rules).
+#[must_use]
+pub fn resolve_symbol_file_span_handle<'a>(
+    records: &'a [GraphRecord],
+    handle: &str,
+) -> Option<&'a GraphRecord> {
+    // Split at the LAST colon so paths containing colons keep working.
+    let (path, span_part) = handle.rsplit_once(':')?;
+    let (start_text, end_text) = span_part.split_once('-')?;
+    if path.is_empty() {
+        return None;
+    }
+    let start_line: usize = start_text.parse().ok()?;
+    let end_line: usize = end_text.parse().ok()?;
+
+    let tombstoned_ids: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| {
+            if let GraphRecord::Tombstone { deleted_id, .. } = r {
+                Some(deleted_id.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut found: Option<&'a GraphRecord> = None;
+    let mut found_id: Option<&str> = None;
+    for record in records {
+        let GraphRecord::Node {
+            id,
+            kind: NodeKind::Symbol,
+            repo_relative_path: Some(record_path),
+            span: Some(record_span),
+            temporal,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if record_path.as_str() != path
+            || record_span.start_line != start_line
+            || record_span.end_line != end_line
+        {
+            continue;
+        }
+        // Current-state liveness: a tombstoned record resolves only via a
+        // surviving historical version.
+        if temporal.is_none() && tombstoned_ids.contains(id.as_str()) {
+            continue;
+        }
+        match found_id {
+            // Same identity in two versions (current + temporal): one answer.
+            Some(known) if known == id.as_str() => {}
+            // Two distinct identities, one handle: fail closed.
+            Some(_) => return None,
+            None => {
+                found_id = Some(id.as_str());
+                found = Some(record);
+            }
+        }
+    }
+    found
 }
 
 /// Returns all known context for a named symbol, separated by trust domain.
@@ -142,24 +425,33 @@ pub(super) enum ContextSection {
 /// # Algorithm
 ///
 /// 1. Collect all `Symbol` node IDs for `symbol_name`.
-/// 2. Add those symbol nodes to `source_facts`.
-/// 3. Scan every other record:
+/// 2. Issue #192: when the name resolves to two or more distinct symbol
+///    identities, the recall is ambiguous — return an empty-sectioned
+///    [`SymbolContext`] whose [`SymbolContext::candidates`] enumerates the
+///    identities instead of merging them. Distinct identities are distinct
+///    stable record IDs (ADR 0004); tombstone and temporal rules from step 1
+///    decide which identities count, so the ambiguity set is exactly what
+///    the recall would otherwise have blended.
+/// 3. Add those symbol nodes to `source_facts`.
+/// 4. Scan every other record:
 ///    a. Edges: if source or target is a known symbol ID, follow the other
 ///    end and classify the referenced node.
 ///    b. Nodes with `evidence_links`: for each link whose `target_record_id`
 ///    is a known symbol ID, classify the linking node.
-/// 4. Collect any evidence link targets that are not present in the store
+/// 5. Collect any evidence link targets that are not present in the store
 ///    slice into `unresolved`.
 ///
 /// Output ordering within each section is sorted by record ID for determinism
 /// (AC7).
 ///
 /// An empty [`SymbolContext`] where [`SymbolContext::is_no_match`] returns
-/// `true` is returned when the symbol is not found. The caller MUST use
-/// `is_no_match()` — there is no panic or error path.
+/// `true` is returned when the symbol is not found. Callers MUST check
+/// [`SymbolContext::is_ambiguous`] before `is_no_match` — an ambiguous name
+/// has empty sections but is a match, not a no-match. There is no panic or
+/// error path.
 #[must_use]
 #[allow(clippy::too_many_lines)]
-pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> SymbolContext<'a> {
+pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &'a str) -> SymbolContext<'a> {
     // Step 0: collect tombstoned IDs so deleted symbols yield no-match, not
     // stale context. This mirrors the current-state filter used by the other
     // query paths (query symbol, query file).
@@ -174,11 +466,18 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
         })
         .collect();
 
+    // Issue #472: targets of ACTIVE repository-eviction tombstones are suppressed
+    // from this current-state lane, including their temporal snapshots. Ordinary
+    // `forget` tombstones keep the temporal exemption below — only eviction
+    // tombstones suppress history.
+    let evicted_ids = crate::repo_evict::active_eviction_tombstoned_ids(records);
+
     // Step 1: collect symbol record IDs, excluding tombstoned CURRENT-STATE records.
     //
     // Temporal records (from scan-history, carrying `temporal` metadata) are
     // historical snapshots — they must NOT be suppressed by a tombstone that
-    // reflects deletion only in the current state.
+    // reflects deletion only in the current state (issue #231). However, they
+    // ARE suppressed by an ACTIVE repository-eviction tombstone (issue #472).
     let symbol_ids: BTreeSet<&str> = records
         .iter()
         .filter_map(|r| {
@@ -192,6 +491,10 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
             else {
                 return None;
             };
+            // Issue #472: evicted snapshots are suppressed even though temporal.
+            if temporal.is_some() && evicted_ids.contains(id.as_str()) {
+                return None;
+            }
             let is_historical = temporal.is_some();
             if name.as_deref() == Some(symbol_name)
                 && (is_historical || !tombstoned_ids.contains(id.as_str()))
@@ -208,6 +511,15 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
             symbol_name: symbol_name.to_owned(),
             ..Default::default()
         };
+    }
+
+    // Issue #192: distinct symbol identities sharing one name are never
+    // merged. When the name resolves to two or more distinct identities — the
+    // exact set the current-state recall below would otherwise have blended
+    // into one answer — report the ambiguity and enumerate the candidates
+    // instead of populating the sections.
+    if symbol_ids.len() >= 2 {
+        return ambiguous_symbol_context(records, symbol_name, &symbol_ids);
     }
 
     // Build a lookup map: record_id → record for fast classification checks.
@@ -395,6 +707,8 @@ fn context_from_seeds<'a>(
             _ => None,
         })
         .collect();
+    // Liveness view for BFS relay-node checks.
+    let liveness = crate::query::liveness::Liveness::new(records);
     let mut source_facts = source_facts;
 
     // Snapshot seed IDs (symbol IDs + co-located file IDs) before the main
@@ -445,6 +759,7 @@ fn context_from_seeds<'a>(
 
     // Step 3a + 3b: classify linked records.
     let mut observations: BTreeSet<&str> = BTreeSet::new();
+    let mut decisions: BTreeSet<&str> = BTreeSet::new();
     let mut project_state: BTreeSet<&str> = BTreeSet::new();
     let mut artifacts: BTreeSet<&str> = BTreeSet::new();
     let mut verification_evidence: BTreeSet<&str> = BTreeSet::new();
@@ -466,6 +781,7 @@ fn context_from_seeds<'a>(
     let classify_and_insert = |record_id: &'a str,
                                source_facts: &mut BTreeSet<&'a str>,
                                observations: &mut BTreeSet<&'a str>,
+                               decisions: &mut BTreeSet<&'a str>,
                                project_state: &mut BTreeSet<&'a str>,
                                artifacts: &mut BTreeSet<&'a str>,
                                verification_evidence: &mut BTreeSet<&'a str>|
@@ -489,6 +805,10 @@ fn context_from_seeds<'a>(
             }
             Some(ContextSection::Observation) => {
                 observations.insert(record_id);
+                true
+            }
+            Some(ContextSection::Decision) => {
+                decisions.insert(record_id);
                 true
             }
             Some(ContextSection::ProjectState) => {
@@ -563,6 +883,7 @@ fn context_from_seeds<'a>(
                             id,
                             &mut source_facts,
                             &mut observations,
+                            &mut decisions,
                             &mut project_state,
                             &mut artifacts,
                             &mut verification_evidence,
@@ -571,14 +892,7 @@ fn context_from_seeds<'a>(
                         // kinds (e.g. ToolCall) which bridge classifiable sections but
                         // have no output section of their own. Tombstoned and missing
                         // (by_id miss) nodes still must not enter the frontier.
-                        if was_classified
-                            || is_bfs_relay_node(
-                                id,
-                                &by_id,
-                                &tombstoned_ids,
-                                &has_any_temporal_version,
-                            )
-                        {
+                        if was_classified || is_bfs_relay_node(id, &by_id, &liveness) {
                             next_frontier.push(id);
                         }
                     }
@@ -625,18 +939,13 @@ fn context_from_seeds<'a>(
                             node_id.as_str(),
                             &mut source_facts,
                             &mut observations,
+                            &mut decisions,
                             &mut project_state,
                             &mut artifacts,
                             &mut verification_evidence,
                         );
                         visited.insert(node_id.as_str());
-                        if was_classified
-                            || is_bfs_relay_node(
-                                node_id.as_str(),
-                                &by_id,
-                                &tombstoned_ids,
-                                &has_any_temporal_version,
-                            )
+                        if was_classified || is_bfs_relay_node(node_id.as_str(), &by_id, &liveness)
                         {
                             next_frontier.push(node_id.as_str());
                         }
@@ -654,6 +963,7 @@ fn context_from_seeds<'a>(
                                         target_id.as_str(),
                                         &mut source_facts,
                                         &mut observations,
+                                        &mut decisions,
                                         &mut project_state,
                                         &mut artifacts,
                                         &mut verification_evidence,
@@ -790,6 +1100,7 @@ fn context_from_seeds<'a>(
                             target_id.as_str(),
                             &mut source_facts,
                             &mut observations,
+                            &mut decisions,
                             &mut project_state,
                             &mut artifacts,
                             &mut verification_evidence,
@@ -822,6 +1133,7 @@ fn context_from_seeds<'a>(
     let mut extra_frontier: BTreeSet<&str> = source_facts
         .iter()
         .chain(observations.iter())
+        .chain(decisions.iter())
         .chain(project_state.iter())
         .chain(artifacts.iter())
         .chain(verification_evidence.iter())
@@ -864,13 +1176,12 @@ fn context_from_seeds<'a>(
                         id,
                         &mut source_facts,
                         &mut observations,
+                        &mut decisions,
                         &mut project_state,
                         &mut artifacts,
                         &mut verification_evidence,
                     );
-                    if was_classified
-                        || is_bfs_relay_node(id, &by_id, &tombstoned_ids, &has_any_temporal_version)
-                    {
+                    if was_classified || is_bfs_relay_node(id, &by_id, &liveness) {
                         next_extra.push(id);
                     }
                 }
@@ -883,6 +1194,7 @@ fn context_from_seeds<'a>(
     // (a Symbol node classified via edge could end up in the wrong section).
     for sid in symbol_ids {
         observations.remove(sid);
+        decisions.remove(sid);
         project_state.remove(sid);
         artifacts.remove(sid);
         verification_evidence.remove(sid);
@@ -1035,8 +1347,21 @@ fn context_from_seeds<'a>(
         out
     };
 
+    // Issue #169: fold active approved policy whose scope applies to the
+    // anchor's own facts (owning repository, repo-relative path, language).
+    // Both lanes reach this constructor with exactly one anchor ID, so the
+    // policy section is always attributable to a single identity; ambiguous
+    // and no-match results return earlier with an empty (default) section.
+    let policy = symbol_ids
+        .iter()
+        .next()
+        .and_then(|anchor_id| records.iter().find(|r| r.id() == *anchor_id))
+        .map(|anchor| super::policy_for_anchor(records, anchor))
+        .unwrap_or_default();
+
     SymbolContext {
         symbol_name: symbol_name.to_owned(),
+        policy,
         source_facts: resolve(&source_facts),
         topology_edges: {
             let mut out: Vec<&'a GraphRecord> = records
@@ -1057,6 +1382,7 @@ fn context_from_seeds<'a>(
             out
         },
         observations: resolve(&observations),
+        decisions: resolve(&decisions),
         project_state: resolve(&project_state),
         artifacts: resolve(&artifacts),
         verification_evidence: resolve(&verification_evidence),
@@ -1078,6 +1404,8 @@ fn context_from_seeds<'a>(
             });
             u
         },
+        // Single-match recall: no disambiguation needed (issue #192).
+        candidates: Vec::new(),
     }
 }
 
@@ -1205,6 +1533,17 @@ pub fn record_context<'a>(records: &'a [GraphRecord], anchor_id: &str) -> Symbol
                         target_kind,
                         Some(NodeKind::Symbol | NodeKind::Module | NodeKind::Import)
                     ) {
+                        continue;
+                    }
+                    // An `IMPORTS` edge is followed only in its containment
+                    // shape (`File —IMPORTS→ Import`): the issue-#444
+                    // module-target edge (`File —IMPORTS→ Module|File`) is a
+                    // dependency edge into ANOTHER file's tree, and following
+                    // it would leak the imported module's symbols into this
+                    // file's context.
+                    if matches!(label, EdgeLabel::Imports)
+                        && !matches!(target_kind, Some(NodeKind::Import))
+                    {
                         continue;
                     }
                     if let Some(t) = id_ref(target.as_str())
@@ -1726,5 +2065,396 @@ mod drift_history_tests {
             vec!["semantic:v1:gated-drift"],
             "symbol_context must still populate drift_history over the same records"
         );
+    }
+}
+#[cfg(test)]
+mod relay_liveness_tests {
+    //! Divergence repros for the shared `is_bfs_relay_node` tombstone gate
+    //! (issue #469): a ToolCall re-ingested AFTER its own tombstone must relay
+    //! the context BFS again (latest-write-wins, matching the coalesced
+    //! `--data-dir` read), while a tombstone with no re-ingest still deletes
+    //! the relay.
+
+    use super::*;
+
+    fn file_node() -> GraphRecord {
+        GraphRecord::node(
+            "codegraph:v5:file:src/lib.rs".to_owned(),
+            NodeKind::File,
+            Some("src/lib.rs".to_owned()),
+            None,
+            Some("src/lib.rs".to_owned()),
+            "file src/lib.rs".to_owned(),
+        )
+    }
+
+    fn symbol_node() -> GraphRecord {
+        GraphRecord::node(
+            "codegraph:v5:sym:foo".to_owned(),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            None,
+            Some("foo".to_owned()),
+            "symbol foo".to_owned(),
+        )
+    }
+
+    fn memory_node(id: &str, kind: NodeKind) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            kind,
+            None,
+            None,
+            Some(id.to_owned()),
+            format!("{} {id}", kind.as_str()),
+        )
+    }
+
+    fn tombstone(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("codegraph:v5:tomb:{deleted_id}"),
+            schema_version: 5,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    /// Fixture: a Symbol + co-located File seed, a ToolCall relay with a
+    /// `TOUCHED_FILE` edge to the file and a `PRODUCED_EVIDENCE` edge to a
+    /// CommandRun. `revive` controls whether the ToolCall is re-ingested after
+    /// its tombstone.
+    fn fixture(revive: bool) -> Vec<GraphRecord> {
+        let tool_id = "codegraph:v5:tool:relay";
+        let run_id = "codegraph:v5:run:relay";
+        let mut records = vec![
+            symbol_node(),
+            file_node(),
+            memory_node(tool_id, NodeKind::ToolCall),
+            GraphRecord::edge(
+                EdgeLabel::TouchedFile,
+                tool_id.to_owned(),
+                "codegraph:v5:file:src/lib.rs".to_owned(),
+                None,
+                "tool touched file".to_owned(),
+            ),
+            tombstone(tool_id),
+        ];
+        if revive {
+            records.push(memory_node(tool_id, NodeKind::ToolCall));
+        }
+        records.push(memory_node(run_id, NodeKind::CommandRun));
+        records.push(GraphRecord::edge(
+            EdgeLabel::ProducedEvidence,
+            tool_id.to_owned(),
+            run_id.to_owned(),
+            None,
+            "tool call produced run".to_owned(),
+        ));
+        records
+    }
+
+    #[test]
+    fn revived_toolcall_relays_context_bfs_to_command_run() {
+        // Divergence repro (issue #469): over `--graph` the revived ToolCall is
+        // tombstone-gated out of the BFS relay, so the CommandRun it produced
+        // is never reached — while `--data-dir` (embedded latest-write-wins)
+        // treats the relay as live and surfaces the run.
+        let records = fixture(true);
+        let ctx = symbol_context(&records, "foo");
+        assert!(
+            ctx.verification_evidence
+                .iter()
+                .any(|r| r.id() == "codegraph:v5:run:relay"),
+            "a ToolCall revived after its tombstone must relay the context BFS to its CommandRun"
+        );
+    }
+
+    #[test]
+    fn tombstoned_toolcall_without_reingest_does_not_relay() {
+        // Negative control: a tombstone with no later re-ingest still deletes
+        // the relay — the conversion must not turn every tombstoned relay live.
+        let records = fixture(false);
+        let ctx = symbol_context(&records, "foo");
+        assert!(
+            !ctx.verification_evidence
+                .iter()
+                .any(|r| r.id() == "codegraph:v5:run:relay"),
+            "a tombstoned ToolCall with no re-ingest must not relay the context BFS"
+        );
+    }
+}
+
+#[cfg(test)]
+mod decision_section_tests {
+    //! Issue #191: `Decision` records must surface in a dedicated `decisions`
+    //! section — never flattened into `observations`.
+    //!
+    //! The section exists: `SymbolContext::decisions` carries `Decision`
+    //! records, `SymbolContext::observations` never does.
+    use super::*;
+    use crate::ir::{AGENT_MEMORY_SCHEMA_VERSION, EvidenceLink};
+    use crate::query::{TrustIndex, context_decision};
+
+    const DEC_ID: &str = "agent_memory:v1:dec-191";
+    const OBS_ID: &str = "agent_memory:v1:obs-191";
+    const FAIL_ID: &str = "agent_memory:v1:fail-191";
+
+    fn sym(name: &str) -> GraphRecord {
+        GraphRecord::node(
+            format!("codegraph:v5:sym-{name}"),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            None,
+            Some(name.to_owned()),
+            format!("symbol {name}"),
+        )
+    }
+
+    fn evidence_link(target: &str, relation: &str) -> EvidenceLink {
+        EvidenceLink {
+            target_record_id: Some(target.to_owned()),
+            target_domain: "codegraph".to_owned(),
+            relation: relation.to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }
+    }
+
+    fn agent_node(id: &str, kind: NodeKind, symbol_id: &str, relation: &str) -> GraphRecord {
+        let mut node = GraphRecord::node(
+            id.to_owned(),
+            kind,
+            None,
+            None,
+            None,
+            format!("{kind:?} summary"),
+        )
+        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION);
+        if let GraphRecord::Node {
+            agent_id,
+            session_id,
+            observed_at,
+            evidence_links,
+            ..
+        } = &mut node
+        {
+            *agent_id = Some("agent-1".to_owned());
+            *session_id = Some("sess-1".to_owned());
+            *observed_at = Some("2026-01-01T00:00:00Z".to_owned());
+            *evidence_links = Some(vec![evidence_link(symbol_id, relation)]);
+        }
+        node
+    }
+
+    fn fixture() -> Vec<GraphRecord> {
+        let target = sym("foo");
+        let target_id = target.id().to_owned();
+        vec![
+            target,
+            agent_node(DEC_ID, NodeKind::Decision, &target_id, "OBSERVES"),
+            agent_node(OBS_ID, NodeKind::Observation, &target_id, "OBSERVES"),
+            agent_node(FAIL_ID, NodeKind::Failure, &target_id, "FAILED_ON"),
+        ]
+    }
+
+    #[test]
+    fn classify_node_separates_decision_from_observation() {
+        // RED: today Decision flattens into the Observation section.
+        assert_ne!(
+            classify_node(NodeKind::Decision),
+            classify_node(NodeKind::Observation),
+            "Decision must not share the Observation section (issue #191)"
+        );
+    }
+
+    #[test]
+    fn classify_node_keeps_failure_in_observations() {
+        // Section contract (issue #191): Failure stays in observations —
+        // documented, not silently flattened. Guards the fix against moving
+        // failures along with decisions.
+        assert_eq!(
+            classify_node(NodeKind::Failure),
+            Some(ContextSection::Observation)
+        );
+        assert_eq!(
+            classify_node(NodeKind::Observation),
+            Some(ContextSection::Observation)
+        );
+    }
+
+    #[test]
+    fn decision_record_never_surfaces_inside_observations() {
+        let records = fixture();
+        let ctx = symbol_context(&records, "foo");
+        let obs_ids: Vec<&str> = ctx.observations.iter().map(|r| r.id()).collect();
+        assert!(
+            !obs_ids.contains(&DEC_ID),
+            "Decision {DEC_ID} must not appear in observations: {obs_ids:?}"
+        );
+    }
+
+    #[test]
+    fn decision_record_surfaces_in_dedicated_decisions_section() {
+        // The dedicated-section half of the contract: the Decision record is
+        // not merely kept out of `observations` — it must appear in
+        // `decisions` (issue #191 AC1/AC3).
+        let records = fixture();
+        let ctx = symbol_context(&records, "foo");
+        let dec_ids: Vec<&str> = ctx.decisions.iter().map(|r| r.id()).collect();
+        assert!(
+            dec_ids.contains(&DEC_ID),
+            "Decision {DEC_ID} must surface in the decisions section: {dec_ids:?}"
+        );
+        assert!(
+            !ctx.is_no_match(),
+            "a symbol with linked decisions is not a no-match"
+        );
+    }
+
+    #[test]
+    fn failure_records_stay_in_observations_per_section_contract() {
+        // Companion to the classifier contract: the fix must not move
+        // failures out of observations.
+        let records = fixture();
+        let ctx = symbol_context(&records, "foo");
+        let obs_ids: Vec<&str> = ctx.observations.iter().map(|r| r.id()).collect();
+        assert!(
+            obs_ids.contains(&FAIL_ID),
+            "Failure records stay in observations per the section contract: {obs_ids:?}"
+        );
+        assert!(
+            obs_ids.contains(&OBS_ID),
+            "Observation records stay in observations: {obs_ids:?}"
+        );
+        assert!(!ctx.is_no_match());
+    }
+
+    #[test]
+    fn decision_row_retains_text_rationale_and_resolved_evidence() {
+        // Issue #191 AC2/AC6: the dedicated section must carry the decision
+        // text, the non-empty rationale, provenance, confidence, and the
+        // resolved `EXPLAINS_CHANGE` evidence handle.
+        let mut decision = GraphRecord::node(
+            DEC_ID.to_owned(),
+            NodeKind::Decision,
+            None,
+            None,
+            None,
+            "Decision summary".to_owned(),
+        )
+        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION)
+        .with_decision_text("decide to refactor foo")
+        .with_rationale_summary("the symbol is duplicated in three places");
+        if let GraphRecord::Node {
+            agent_id,
+            session_id,
+            confidence,
+            evidence_links,
+            ..
+        } = &mut decision
+        {
+            *agent_id = Some("agent-1".to_owned());
+            *session_id = Some("sess-1".to_owned());
+            *confidence = Some("0.9".to_owned());
+            *evidence_links = Some(vec![EvidenceLink {
+                target_record_id: Some("codegraph:v5:sym-foo".to_owned()),
+                target_domain: "codegraph".to_owned(),
+                relation: "EXPLAINS_CHANGE".to_owned(),
+                confidence: "0.9".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            }]);
+        }
+        let records = vec![sym("foo"), decision];
+        let trust = TrustIndex::build(&records);
+        let record = records.iter().find(|r| r.id() == DEC_ID).unwrap();
+        let row = context_decision(record, &records, &trust)
+            .expect("Decision record must build a decision row");
+
+        assert_eq!(row.decision_text, Some("decide to refactor foo"));
+        assert!(
+            row.rationale_summary.is_some_and(|r| !r.is_empty()),
+            "rationale_summary must be non-empty (issue #191 success metric)"
+        );
+        assert_eq!(row.provenance_handle.as_deref(), Some("agent-1:sess-1"));
+        assert_eq!(row.confidence, Some("0.9"));
+        assert_eq!(row.record_id, DEC_ID);
+        assert_eq!(row.evidence_handles.len(), 1);
+        assert_eq!(row.evidence_handles[0].relation, "EXPLAINS_CHANGE");
+        assert_eq!(
+            row.evidence_handles[0].target_record_id,
+            "codegraph:v5:sym-foo"
+        );
+        assert_eq!(row.evidence_handles[0].target_kind, "Symbol");
+    }
+
+    #[test]
+    fn decision_row_provenance_falls_back_to_agent_id() {
+        // Provenance handle is `agent_id:session_id`, falling back to
+        // `agent_id` when no session is recorded.
+        let mut decision = GraphRecord::node(
+            DEC_ID.to_owned(),
+            NodeKind::Decision,
+            None,
+            None,
+            None,
+            "Decision summary".to_owned(),
+        )
+        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION)
+        .with_rationale_summary("some reason");
+        if let GraphRecord::Node { agent_id, .. } = &mut decision {
+            *agent_id = Some("agent-9".to_owned());
+        }
+        let records = vec![decision];
+        let trust = TrustIndex::build(&records);
+        let row = context_decision(&records[0], &records, &trust).unwrap();
+        assert_eq!(row.provenance_handle.as_deref(), Some("agent-9"));
+    }
+
+    #[test]
+    fn decision_row_serializes_with_expected_fields() {
+        // The row shape the CLI/MCP/daemon lanes share: every field the
+        // issue requires must be present on the wire.
+        let mut decision = GraphRecord::node(
+            DEC_ID.to_owned(),
+            NodeKind::Decision,
+            None,
+            None,
+            None,
+            "Decision summary".to_owned(),
+        )
+        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION)
+        .with_decision_text("decide X")
+        .with_rationale_summary("because Y");
+        if let GraphRecord::Node { agent_id, .. } = &mut decision {
+            *agent_id = Some("agent-1".to_owned());
+        }
+        let records = vec![decision];
+        let trust = TrustIndex::build(&records);
+        let row = context_decision(&records[0], &records, &trust).unwrap();
+        let value = serde_json::to_value(&row).unwrap();
+        // Always-serialized keys (the MCP contract requires them).
+        for field in [
+            "record_id",
+            "kind",
+            "trust",
+            "summary",
+            "decision_text",
+            "rationale_summary",
+        ] {
+            assert!(
+                value.get(field).is_some(),
+                "decision row must serialize `{field}`"
+            );
+        }
+        // Present here because the fixture sets them; skipped when absent.
+        assert_eq!(value["provenance_handle"], "agent-1");
+        assert_eq!(value["rationale_summary"], "because Y");
     }
 }
