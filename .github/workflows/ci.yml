@@ -76,14 +76,18 @@ jobs:
         with:
           key: query-latency
       - name: build
-        run: cargo build
+        # The budget is a product-latency promise, so it is measured on the
+        # optimised binary: an unoptimised build runs the embedded engine's
+        # index load and WAL replay several times slower and would gate
+        # compiler settings rather than the code.
+        run: cargo build --release
       - name: cold query-latency gate
         # Full two-source gate (issue #255): 11 cold samples each of
         # `eg query symbol` against --graph <JSONL> and --data-dir <embedded
         # store> on the pinned reference corpus
         # (corpus/query_latency_corpus.json, ~10k records). Fails when any
         # source p50 exceeds the 2s budget.
-        run: ./target/debug/egregore audit query-latency
+        run: ./target/release/egregore audit query-latency
 
   query-budget:
     name: structural query latency budget + scaling gate
