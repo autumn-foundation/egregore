@@ -503,7 +503,17 @@ pub fn collapse_memory_recall(
                 .iter()
                 .filter_map(|member| member.observed_at.as_deref())
                 .collect();
-            observed.sort_unstable();
+            // Order by INSTANT (text order is wrong across differing RFC 3339
+            // offsets); the original strings are kept for serialization.
+            observed.sort_by(|a, b| {
+                match (
+                    chrono::DateTime::parse_from_rfc3339(a),
+                    chrono::DateTime::parse_from_rfc3339(b),
+                ) {
+                    (Ok(left), Ok(right)) => left.cmp(&right),
+                    _ => a.cmp(b),
+                }
+            });
             let mut trust_spread: BTreeMap<String, usize> = BTreeMap::new();
             for member in &members {
                 *trust_spread
@@ -712,6 +722,31 @@ mod tests {
             representative_order(&earlier, &later),
             std::cmp::Ordering::Less,
             "the earlier instant must rank first"
+        );
+    }
+
+    #[test]
+    fn cluster_time_bounds_follow_instants_across_offsets() {
+        let mut earlier = candidate("agent_memory:v1:b");
+        earlier.observed_at = Some("2026-01-01T00:30:00+01:00".to_owned());
+        let mut later = candidate("agent_memory:v1:a");
+        later.observed_at = Some("2026-01-01T00:00:00Z".to_owned());
+        let outcome = collapse_memory_recall(
+            &[earlier, later],
+            &CollapseConfig {
+                mode: CollapseMode::NormalizedText,
+                similarity_threshold: 0.85,
+            },
+        );
+        assert_eq!(outcome.clusters.len(), 1, "same body and target collapse");
+        let cluster = &outcome.clusters[0];
+        assert_eq!(
+            cluster.observed_at_min.as_deref(),
+            Some("2026-01-01T00:30:00+01:00")
+        );
+        assert_eq!(
+            cluster.observed_at_max.as_deref(),
+            Some("2026-01-01T00:00:00Z")
         );
     }
 }

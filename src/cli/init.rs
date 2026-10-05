@@ -45,6 +45,7 @@ pub(crate) const INIT_ALREADY_CURRENT_EXIT_CODE: i32 = 3;
 pub(crate) const INIT_REFUSED_EXIT_CODE: i32 = 2;
 
 /// Resolved inputs for [`init_cmd`].
+#[derive(Clone)]
 pub(crate) struct InitArgs {
     /// Repository path to bootstrap.
     pub repo_path: PathBuf,
@@ -547,6 +548,14 @@ pub(crate) fn init_cmd(args: &InitArgs) -> Result<()> {
 
     let data_dir = resolve_data_dir(args.data_dir.as_deref());
     let scan_args = resolve_scan_args(args.repo_id_override.clone(), args.raw_literals);
+    // The identity override may come from `egregore.toml` alone. Use the
+    // RESOLVED value everywhere below (identity, idempotency probes, report) so
+    // they agree with the identity the tree and history scans actually write.
+    let resolved_args = InitArgs {
+        repo_id_override: scan_args.repo_id_override.clone(),
+        ..args.clone()
+    };
+    let args = &resolved_args;
     let identity =
         identity::compute_repository_identity(&args.repo_path, args.repo_id_override.as_deref());
 
