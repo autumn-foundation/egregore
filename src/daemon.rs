@@ -1785,13 +1785,14 @@ fn build_server_state(
 /// Commits the new token to the in-memory rotation state FIRST (the old token
 /// stays valid through the cutover window), then publishes the new metadata.
 /// If the metadata write fails, the schedule does not advance: the next
-/// accept-loop pass retries the same publish.
+/// accept-loop pass retries publishing the SAME token.
 fn maybe_rotate_token(
     config: &DaemonConfig,
     tokens: &TokenRotationState,
     metadata: &mut DaemonMetadata,
     lease: &mut StoreLease,
     next_rotation_at_unix_ms: &mut Option<u128>,
+    unpublished_rotation: &mut bool,
 ) {
     let Some(rotation_at) = *next_rotation_at_unix_ms else {
         return;
@@ -1800,12 +1801,20 @@ fn maybe_rotate_token(
     if now < rotation_at {
         return;
     }
-    let new_token = random_token();
-    tokens.commit_rotation_at(new_token.clone(), now);
-    metadata.token = new_token;
-    metadata.token_expires_at_unix_ms = tokens.current_expiry_unix_ms();
+    // A token already committed to the rotation state but not yet published
+    // (an earlier metadata write failed) is retried as-is: minting another
+    // would rotate on every pass, invalidate the last token clients could
+    // read, and grow the retained token history.
+    if !*unpublished_rotation {
+        let new_token = random_token();
+        tokens.commit_rotation_at(new_token.clone(), now);
+        metadata.token = new_token;
+        metadata.token_expires_at_unix_ms = tokens.current_expiry_unix_ms();
+        *unpublished_rotation = true;
+    }
     match write_metadata(&config.data_dir, metadata).and_then(|()| lease.write_metadata(metadata)) {
         Ok(()) => {
+            *unpublished_rotation = false;
             *next_rotation_at_unix_ms = config.token_ttl_ms.map(|ttl_ms| now + u128::from(ttl_ms));
         }
         Err(error) => {
@@ -1917,6 +1926,7 @@ pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
     let mut next_rotation_at_unix_ms = config
         .token_ttl_ms
         .map(|ttl_ms| started_at_unix_ms + u128::from(ttl_ms));
+    let mut unpublished_rotation = false;
 
     while !shutdown.load(Ordering::SeqCst) {
         maybe_rotate_token(
@@ -1925,6 +1935,7 @@ pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
             &mut metadata,
             &mut lease,
             &mut next_rotation_at_unix_ms,
+            &mut unpublished_rotation,
         );
         match listener.accept() {
             Ok((stream, _)) => {
@@ -18090,6 +18101,75 @@ mod tests {
             rendered.contains("stale"),
             "expected a stale-metadata refusal, got: {rendered}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_rotation_publish_retries_the_same_token() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let data_dir = temp.path().join("store");
+        fs::create_dir_all(&data_dir)?;
+        let mut config = DaemonConfig::new(data_dir.clone());
+        config.token_ttl_ms = Some(60_000);
+        let tokens = TokenRotationState::new("initial-token".to_owned(), config.token_ttl_ms);
+        let mut lease = StoreLease::acquire(&data_dir)?;
+        let mut metadata = DaemonMetadata {
+            schema_version: DAEMON_RUNTIME_SCHEMA_VERSION,
+            pid: std::process::id(),
+            address: "127.0.0.1:0".to_owned(),
+            token: "initial-token".to_owned(),
+            data_dir: store_identity_dir(&data_dir),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            started_at_unix_ms: 0,
+            state: DaemonState::Running,
+            api_version: None,
+            transports: None,
+            token_expires_at_unix_ms: tokens.current_expiry_unix_ms(),
+            daemons_index_url: None,
+            storage_mode: "plaintext".to_owned(),
+            key_source: None,
+        };
+        // A non-empty directory squatting on the metadata path makes every
+        // publish fail until it is removed.
+        let blocker = metadata_path(&data_dir);
+        fs::create_dir_all(blocker.join("squatter"))?;
+
+        let mut next_rotation_at = Some(0_u128);
+        let mut unpublished = false;
+        for _ in 0..3 {
+            maybe_rotate_token(
+                &config,
+                &tokens,
+                &mut metadata,
+                &mut lease,
+                &mut next_rotation_at,
+                &mut unpublished,
+            );
+        }
+        assert_eq!(
+            tokens.rotation_count(),
+            1,
+            "a failing publish must keep ONE pending token, not rotate every pass"
+        );
+        assert!(unpublished, "the rotation is still unpublished");
+        assert_eq!(next_rotation_at, Some(0), "the schedule must not advance");
+        let pending = metadata.token.clone();
+        assert_ne!(pending, "initial-token");
+
+        fs::remove_dir_all(&blocker)?;
+        maybe_rotate_token(
+            &config,
+            &tokens,
+            &mut metadata,
+            &mut lease,
+            &mut next_rotation_at,
+            &mut unpublished,
+        );
+        assert_eq!(metadata.token, pending, "the SAME token is published");
+        assert_eq!(tokens.rotation_count(), 1);
+        assert!(!unpublished);
+        assert!(next_rotation_at.is_some_and(|at| at > 0));
+        assert_eq!(read_metadata(&data_dir)?.token, pending);
         Ok(())
     }
 

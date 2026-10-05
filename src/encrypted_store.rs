@@ -663,6 +663,16 @@ pub fn key_source_from_flags(
             ),
         });
     }
+    // Persist an ABSOLUTE path: the marker and engine state outlive this
+    // process, and every later open resolves the descriptor against its own
+    // working directory, so a relative path would strand the store.
+    let absolute_key_file =
+        std::path::absolute(key_file).map_err(|error| EncryptedStoreError::InvalidOptions {
+            message: format!(
+                "--key-file {} cannot be resolved to an absolute path: {error}",
+                key_file.display()
+            ),
+        })?;
     let descriptor = if let Some(var) = passphrase_env {
         if std::env::var(var).map_or(true, |v| v.is_empty()) {
             return Err(EncryptedStoreError::InvalidOptions {
@@ -672,7 +682,7 @@ pub fn key_source_from_flags(
             });
         }
         KeySourceDescriptor::PassphraseFile {
-            path: key_file.to_path_buf(),
+            path: absolute_key_file,
             passphrase_env: var.to_owned(),
         }
     } else {
@@ -687,10 +697,41 @@ pub fn key_source_from_flags(
             }
         })?;
         KeySourceDescriptor::File {
-            path: key_file.to_path_buf(),
+            path: absolute_key_file,
         }
     };
     Ok(descriptor.to_provider_config())
+}
+
+/// Removes the leftovers of an interrupted fresh encrypted-store
+/// initialisation: a directory holding only `encryption.state` (and at most
+/// the marker's temp file), with no marker. Any other content means a real
+/// store, which is left untouched.
+fn discard_partial_encrypted_init(data_dir: &Path) -> Result<(), EncryptedStoreError> {
+    let marker_tmp = Path::new(STORE_MARKER_FILE).with_extension("json.tmp");
+    let Ok(entries) = fs::read_dir(data_dir) else {
+        return Ok(());
+    };
+    let names: Vec<std::ffi::OsString> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect();
+    let only_partial_init = names.iter().any(|n| n == "encryption.state")
+        && names
+            .iter()
+            .all(|n| n == "encryption.state" || n.as_os_str() == marker_tmp.as_os_str());
+    if !only_partial_init {
+        return Ok(());
+    }
+    for name in names {
+        fs::remove_file(data_dir.join(&name)).map_err(|error| {
+            EncryptedStoreError::KeyUnavailable {
+                key_source: "encryption.state".to_owned(),
+                message: format!("failed to clear an interrupted initialisation: {error}"),
+            }
+        })?;
+    }
+    Ok(())
 }
 
 /// Decide what `eg ingest --encrypted` should do for `data_dir`.
@@ -714,6 +755,11 @@ pub fn prepare_encrypted_ingest(
     passphrase_env: Option<&str>,
 ) -> Result<Option<KeyProviderConfig>, EncryptedStoreError> {
     let key_source = key_source_from_flags(key_file, passphrase_env)?;
+    // A crash or write failure between the authority file and the marker
+    // leaves `encryption.state` alone in the directory. That is a half-
+    // initialised FRESH store, not a plaintext one: discard the stray files
+    // and initialise again so the failure is recoverable through the CLI.
+    discard_partial_encrypted_init(data_dir)?;
     if is_fresh_store(data_dir) {
         // Issue #54: write the authority file and marker before the first
         // open so the engine enables encryption from the start. The marker
@@ -872,5 +918,68 @@ mod tests {
         fs::write(temp.path().join("x"), "y").expect("write");
         assert!(!is_fresh_store(temp.path()));
         assert!(is_fresh_store(&temp.path().join("missing")));
+    }
+
+    fn write_raw_key(path: &Path) {
+        fs::write(path, [0x42_u8; 32]).expect("write key");
+    }
+
+    #[test]
+    fn relative_key_file_is_persisted_as_an_absolute_path() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let temp = tempfile::tempdir_in(&cwd).expect("temp under cwd");
+        let absolute = temp.path().join("store.key");
+        write_raw_key(&absolute);
+        let relative = absolute
+            .strip_prefix(&cwd)
+            .expect("under cwd")
+            .to_path_buf();
+        assert!(relative.is_relative());
+
+        let config = key_source_from_flags(Some(&relative), None).expect("valid key file");
+        let descriptor = KeySourceDescriptor::from_provider_config(&config).expect("descriptor");
+        let KeySourceDescriptor::File { path } = descriptor else {
+            panic!("expected a raw key-file descriptor");
+        };
+        assert!(
+            path.is_absolute(),
+            "persisted path must be absolute: {path:?}"
+        );
+        assert!(path.ends_with(&relative));
+    }
+
+    #[test]
+    fn interrupted_fresh_init_is_recoverable() {
+        let temp = tempfile::tempdir().expect("temp");
+        let key = temp.path().join("store.key");
+        write_raw_key(&key);
+        let data_dir = temp.path().join("store");
+        fs::create_dir_all(&data_dir).expect("data dir");
+        // The authority file landed but the marker write never did.
+        fs::write(data_dir.join("encryption.state"), "version=3\n").expect("stray state");
+
+        let prepared =
+            prepare_encrypted_ingest(&data_dir, Some(&key), None).expect("retry must recover");
+        assert!(prepared.is_some(), "recovered store is initialised fresh");
+        assert!(read_marker(&data_dir).expect("marker").is_some());
+    }
+
+    #[test]
+    fn plaintext_store_is_still_refused_when_state_file_is_not_alone() {
+        let temp = tempfile::tempdir().expect("temp");
+        let key = temp.path().join("store.key");
+        write_raw_key(&key);
+        let data_dir = temp.path().join("store");
+        fs::create_dir_all(&data_dir).expect("data dir");
+        fs::write(data_dir.join("encryption.state"), "x").expect("state");
+        fs::write(data_dir.join("wal.log"), "x").expect("real store content");
+
+        let error = prepare_encrypted_ingest(&data_dir, Some(&key), None)
+            .expect_err("a populated store must not be re-initialised");
+        assert!(matches!(
+            error,
+            EncryptedStoreError::StorageModeMismatch { .. }
+        ));
+        assert!(data_dir.join("wal.log").exists(), "nothing was deleted");
     }
 }
