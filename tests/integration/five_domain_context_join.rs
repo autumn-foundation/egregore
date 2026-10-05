@@ -239,7 +239,16 @@ fn canonical_answer(envelope: &Value) -> String {
     parts.join("\n")
 }
 
+/// Serializes the nested nightly fixture builds. `RUSTUP_TOOLCHAIN=nightly` can
+/// make rustup download the toolchain on first use, and two tests doing that
+/// concurrently race on the shared download cache ("could not rename
+/// 'downloaded' file"), failing whichever loses.
+static NIGHTLY_FIXTURE_BUILD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn run_cargo_test(fixture: &Path, target_dir: &Path, run_json: &Path) {
+    let _serialized = NIGHTLY_FIXTURE_BUILD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // The libtest JSON event stream (`--format json`) is nightly-only; the
     // linked libtest is baked in at compile time, so the fixture itself must
     // be built by nightly. This matches the documented `eg capture-tests`

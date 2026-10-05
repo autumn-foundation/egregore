@@ -54,7 +54,13 @@ fn scan_repo(root: &Path, out: &Path) {
 /// first File's repo-relative path.
 fn symbol_names_and_file(graph: &Path) -> (String, String, String) {
     let content = fs::read_to_string(graph).expect("graph readable");
-    let mut symbols: Vec<String> = Vec::new();
+    // Names seen per Symbol node: a name carried by several symbols is
+    // ambiguous and never resolves to a MENTIONS_SYMBOL edge, so only
+    // UNIQUE, qualified names are usable. Record order in the graph depends on hashed IDs
+    // (which depend on the temp-dir repo identity), so pick deterministically
+    // (sorted) instead of by file order.
+    let mut name_counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
     let mut file: Option<String> = None;
     for line in content.lines() {
         if line.trim().is_empty() {
@@ -64,10 +70,8 @@ fn symbol_names_and_file(graph: &Path) -> (String, String, String) {
         if v["type"] == "node" || v.get("kind").is_some() {
             match v["kind"].as_str() {
                 Some("Symbol") => {
-                    if let Some(name) = v["name"].as_str().map(str::to_owned)
-                        && !symbols.contains(&name)
-                    {
-                        symbols.push(name);
+                    if let Some(name) = v["name"].as_str().map(str::to_owned) {
+                        *name_counts.entry(name).or_default() += 1;
                     }
                 }
                 Some("File") if file.is_none() => {
@@ -77,7 +81,15 @@ fn symbol_names_and_file(graph: &Path) -> (String, String, String) {
             }
         }
     }
-    assert!(symbols.len() >= 2, "graph needs two symbols");
+    let mut symbols: Vec<String> = name_counts
+        .into_iter()
+        .filter_map(|(name, count)| {
+            // Only a qualified (`::`) name without spaces is a symbol literal
+            // the importer recognizes (`classify_literal`).
+            (count == 1 && name.contains("::") && !name.contains(' ')).then_some(name)
+        })
+        .collect();
+    assert!(symbols.len() >= 2, "graph needs two unique symbols");
     let second = symbols[1].clone();
     let first = symbols.remove(0);
     (first, second, file.expect("graph has a file"))
