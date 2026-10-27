@@ -321,8 +321,15 @@ fn read_exact_at(file: &fs::File, buf: &mut [u8], offset: u64) -> std::io::Resul
     std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
 }
 
+/// Reads exactly `buf.len()` bytes at `offset` on a target with no
+/// positional read. The index is then unusable, so callers cold-scan.
+#[cfg(not(any(unix, windows)))]
+fn read_exact_at(_file: &fs::File, _buf: &mut [u8], _offset: u64) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
 /// Reads exactly `buf.len()` bytes at `offset` without a shared cursor.
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn read_exact_at(file: &fs::File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
     while !buf.is_empty() {
         let read = std::os::windows::fs::FileExt::seek_read(file, buf, offset)?;

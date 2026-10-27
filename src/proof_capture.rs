@@ -478,6 +478,10 @@ pub fn run_verifier(bin: &Path, args: &[String], timeout: Duration) -> std::io::
                         let _ = child.kill();
                     }
                 }
+                // Windows: `taskkill /T` follows parent-PID links. A grandchild
+                // whose parent already exited survives and keeps the pipes
+                // open. A Job Object would close that gap, but it needs
+                // `unsafe`, which this crate forbids.
                 #[cfg(not(unix))]
                 {
                     let (program, args) = tree_kill_command(child.id());

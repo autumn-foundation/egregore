@@ -295,7 +295,17 @@ fn copy_staged_file(src: &Path, dst: &Path) -> std::io::Result<()> {
     if dst.exists() && files_match(src, dst)? {
         return Ok(());
     }
-    std::fs::copy(src, dst).map(|_| ())
+    // Copy to a temporary name, then swap it in: a crash never leaves a
+    // truncated model file, and removing the old file first also clears a
+    // read-only attribute copied from an earlier source.
+    let mut tmp = dst.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::copy(src, &tmp)?;
+    if dst.exists() {
+        std::fs::remove_file(dst)?;
+    }
+    std::fs::rename(&tmp, dst)
 }
 
 /// True when both files have the same length and BLAKE3 digest.
