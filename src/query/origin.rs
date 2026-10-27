@@ -445,6 +445,55 @@ mod tests {
     }
 
     #[test]
+    fn at_pin_ignores_same_named_symbol_introduced_later() {
+        let mut records = history();
+        records.push(commit("commit:4", "c4", &["c3"], "2026-01-04T00:00:00Z"));
+        records.push(symbol(
+            "symbol:answer-later",
+            "answer",
+            "c4",
+            &["c3"],
+            "2026-01-04T00:00:00Z",
+        ));
+        let report =
+            symbol_origin(&records, "answer", None, OriginPin::AtCommit("c3")).unwrap();
+        assert_eq!(report.symbol_record_id, "symbol:answer");
+    }
+
+    #[test]
+    fn as_of_pin_ignores_same_named_symbol_introduced_later() {
+        let mut records = history();
+        records.push(commit("commit:4", "c4", &["c3"], "2026-01-04T00:00:00Z"));
+        records.push(symbol(
+            "symbol:answer-later",
+            "answer",
+            "c4",
+            &["c3"],
+            "2026-01-04T00:00:00Z",
+        ));
+        let report =
+            symbol_origin(&records, "answer", None, OriginPin::AsOf("2026-01-03T00:00:00Z"))
+                .unwrap();
+        assert_eq!(report.symbol_record_id, "symbol:answer");
+    }
+
+    #[test]
+    fn at_pin_uses_introduction_inside_the_pinned_ancestry() {
+        // Two branches from c1. Branch `c3` is outside the pin but sorts first;
+        // the pinned branch `c9` must still report its own introduction.
+        let records = vec![
+            commit("commit:1", "c1", &[], "2026-01-01T00:00:00Z"),
+            commit("commit:3", "c3", &["c1"], "2026-01-02T00:00:00Z"),
+            commit("commit:9", "c9", &["c1"], "2026-01-03T00:00:00Z"),
+            symbol("symbol:answer", "answer", "c3", &["c1"], "2026-01-02T00:00:00Z"),
+            symbol("symbol:answer", "answer", "c9", &["c1"], "2026-01-03T00:00:00Z"),
+        ];
+        let report =
+            symbol_origin(&records, "answer", None, OriginPin::AtCommit("c9")).unwrap();
+        assert_eq!(report.introducing_commit, "c9");
+    }
+
+    #[test]
     fn origin_is_first_introduction_not_first_seen_snapshot() {
         let records = history();
         let report = symbol_origin(&records, "answer", None, OriginPin::None).unwrap();

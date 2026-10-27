@@ -356,3 +356,97 @@ const fn add_opt_u64(acc: Option<u64>, v: Option<u64>) -> Option<u64> {
         (None, None) => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cost_node(id: &str, tokens: u64) -> GraphRecord {
+        let mut node = GraphRecord::node(
+            id.to_owned(),
+            NodeKind::CostUsage,
+            None,
+            None,
+            None,
+            "cost".to_owned(),
+        );
+        if let GraphRecord::Node { text, session_id, .. } = &mut node {
+            *text = Some(
+                serde_json::json!({
+                    "derivation": COST_USAGE_DERIVATION_TRANSCRIPT,
+                    "prompt_tokens": tokens,
+                })
+                .to_string(),
+            );
+            *session_id = Some("sess".to_owned());
+        }
+        node
+    }
+
+    fn tombstone(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("tomb:{deleted_id}"),
+            schema_version: 1,
+            deleted_id: deleted_id.to_owned(),
+            summary: "gone".to_owned(),
+            producer: None,
+        }
+    }
+
+    fn authored_by(cost: &str, run: &str) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::AuthoredBy,
+            cost.to_owned(),
+            run.to_owned(),
+            None,
+            "authored".to_owned(),
+        )
+    }
+
+    fn rollup(records: &[GraphRecord]) -> CostRollup {
+        cost_rollup(records, &CostFilters::default(), COST_DEFAULT_LIMIT)
+    }
+
+    #[test]
+    fn same_id_rewrite_counts_once_with_latest_values() {
+        let records = vec![cost_node("c1", 10), cost_node("c1", 25)];
+        let out = rollup(&records);
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.totals.matching_rows, 1);
+        assert_eq!(out.totals.prompt_tokens, Some(25));
+    }
+
+    #[test]
+    fn tombstoned_record_is_excluded_from_rows_totals_and_diagnostics() {
+        let records = vec![cost_node("c1", 10), cost_node("c2", 5), tombstone("c1")];
+        let out = rollup(&records);
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0].record_id, "c2");
+        assert_eq!(out.totals.prompt_tokens, Some(5));
+        assert!(out.diagnostics.iter().all(|d| d.record_id != "c1"));
+    }
+
+    #[test]
+    fn record_revived_after_tombstone_is_live() {
+        let records = vec![cost_node("c1", 10), tombstone("c1"), cost_node("c1", 12)];
+        let out = rollup(&records);
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.totals.prompt_tokens, Some(12));
+    }
+
+    #[test]
+    fn run_id_comes_from_the_live_authored_by_edge() {
+        let records = vec![cost_node("c1", 1), authored_by("c1", "run-a")];
+        assert_eq!(rollup(&records).rows[0].run_id.as_deref(), Some("run-a"));
+    }
+
+    #[test]
+    fn tombstoned_authored_by_edge_leaves_run_unknown() {
+        let edge = authored_by("c1", "run-a");
+        let edge_id = edge.id().to_owned();
+        let records = vec![cost_node("c1", 1), edge, tombstone(&edge_id)];
+        let out = rollup(&records);
+        assert_eq!(out.rows[0].run_id, None);
+        assert_eq!(out.diagnostics.len(), 1);
+    }
+}

@@ -848,6 +848,56 @@ mod tests {
         assert!(brief.unindexed.is_empty());
     }
 
+    fn tombstone(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("tomb:{deleted_id}"),
+            schema_version: 1,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    #[test]
+    fn tombstoned_symbol_is_not_a_changed_anchor() {
+        let mut records = sample_records();
+        records.push(tombstone("sym-1"));
+        let index = RepositoryIndex::build(&records);
+        let brief = brief_working_set(&records, &sample_diff(), &index, None);
+        assert!(brief.changed_symbols.is_empty());
+    }
+
+    #[test]
+    fn tombstoned_file_is_reported_unindexed() {
+        let mut records = sample_records();
+        records.push(tombstone("file-1"));
+        let index = RepositoryIndex::build(&records);
+        let brief = brief_working_set(&records, &sample_diff(), &index, None);
+        assert!(brief.changed_files.is_empty());
+        assert_eq!(brief.unindexed.len(), 1);
+        assert!(brief.observations.is_empty(), "no anchor, no evidence");
+    }
+
+    #[test]
+    fn reingested_symbol_uses_its_latest_span() {
+        // Old version overlaps the hunk; the latest version moved away.
+        let mut records = sample_records();
+        records.push(symbol_node("sym-1", "touched_fn", "src/a.rs", 50, 60));
+        let index = RepositoryIndex::build(&records);
+        let brief = brief_working_set(&records, &sample_diff(), &index, None);
+        assert!(brief.changed_symbols.is_empty());
+    }
+
+    #[test]
+    fn symbol_revived_after_tombstone_is_live() {
+        let mut records = sample_records();
+        records.push(tombstone("sym-1"));
+        records.push(symbol_node("sym-1", "touched_fn", "src/a.rs", 9, 15));
+        let index = RepositoryIndex::build(&records);
+        let brief = brief_working_set(&records, &sample_diff(), &index, None);
+        assert_eq!(brief.changed_symbols.len(), 1);
+    }
+
     #[test]
     fn unindexed_paths_are_reported_not_dropped() {
         let records = sample_records();

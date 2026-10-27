@@ -223,3 +223,49 @@ pub fn symbol_complexity_ranking(
         corpus_disclaimer,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn symbol(id: &str, name: &str, complexity: u32) -> GraphRecord {
+        let mut node = GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            None,
+            Some(name.to_owned()),
+            format!("fn {name}"),
+        );
+        if let GraphRecord::Node {
+            symbol_kind,
+            complexity: score,
+            ..
+        } = &mut node
+        {
+            *symbol_kind = Some("function".to_owned());
+            *score = Some(complexity);
+        }
+        node
+    }
+
+    fn report(records: &[GraphRecord]) -> SymbolComplexityReport {
+        symbol_complexity(records, None, 10).expect("symbols present")
+    }
+
+    #[test]
+    fn same_id_rewrite_ranks_once_with_latest_score() {
+        let records = vec![symbol("s1", "f", 3), symbol("s1", "f", 9)];
+        let out = report(&records);
+        assert_eq!(out.total_symbol_count, 1);
+        assert_eq!(out.symbols[0].complexity, 9);
+    }
+
+    #[test]
+    fn rewrite_does_not_change_truncation() {
+        let records = vec![symbol("s1", "f", 3), symbol("s1", "f", 9), symbol("s2", "g", 1)];
+        let out = symbol_complexity_ranking(&records, None, 2).expect("symbols present");
+        assert_eq!(out.total_symbol_count, 2);
+        assert!(!out.truncated);
+    }
+}

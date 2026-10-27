@@ -510,3 +510,63 @@ fn priority_labels_assignees_do_not_affect_eligibility() {
         "both open, no deps: both ready regardless of priority"
     );
 }
+
+// ── Issue #509: stale unresolved-dependency diagnostics ─────────────────────
+
+fn unresolved_diag_ids(records: &[GraphRecord]) -> Vec<String> {
+    records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Node {
+                id,
+                kind: NodeKind::Diagnostic,
+                summary,
+                ..
+            } if summary.starts_with("[unresolved_dependency]") => Some(id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn has_unresolved(report: &aletheia_egregore::query::TaskReadyReport) -> bool {
+    report
+        .diagnostics
+        .iter()
+        .any(|d| d.code == TaskReadyDiagnosticCode::UnresolvedDependency)
+        || report
+            .blocked
+            .iter()
+            .flat_map(|row| &row.unmet_dependencies)
+            .any(|u| u.resolution == UnmetResolution::Unresolved)
+}
+
+#[test]
+fn fixed_depends_on_after_reimport_is_not_unresolved() {
+    let mut records = import_lines(&[header(), task("a", "open", &["ghost"])]);
+    assert!(has_unresolved(&ready_report(&records)), "precondition");
+    // Fix the reference: `ghost` now exists. Append-only `--graph` keeps the
+    // old diagnostic from the first import.
+    records.extend(import_lines(&[
+        header(),
+        task("a", "open", &["ghost"]),
+        task("ghost", "closed_completed", &[]),
+    ]));
+    let report = ready_report(&records);
+    assert!(!has_unresolved(&report), "stale diagnostic must not block");
+    assert_eq!(report.ready.len(), 1, "task a is ready once ghost is closed");
+}
+
+#[test]
+fn tombstoned_unresolved_diagnostic_is_ignored() {
+    let mut records = import_lines(&[header(), task("a", "open", &["ghost"])]);
+    for id in unresolved_diag_ids(&records.clone()) {
+        records.push(GraphRecord::Tombstone {
+            id: format!("tomb:{id}"),
+            schema_version: 1,
+            deleted_id: id,
+            summary: "retracted".to_owned(),
+            producer: None,
+        });
+    }
+    assert!(!has_unresolved(&ready_report(&records)));
+}

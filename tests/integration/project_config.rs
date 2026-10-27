@@ -1010,3 +1010,61 @@ fn query_similar_without_any_store_names_the_remedy() {
         .failure()
         .stderr(predicate::str::contains("--data-dir"));
 }
+
+/// Issue #509: every store-backed semantic lane honors the pinned `data_dir`.
+/// Without it, clap would reject the omitted `--data-dir` as "required".
+#[cfg(feature = "embeddings")]
+#[test]
+fn semantic_lanes_resolve_the_config_pinned_data_dir() {
+    for lane in ["semantic", "semantic-context", "semantic-memory"] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_config(temp.path(), "data_dir = \"pinned-store\"\n");
+        eg_in(temp.path())
+            .args(["query", lane, "request timeout"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("required").not());
+    }
+}
+
+/// Issue #509: without a flag or a pin, the failure names both remedies.
+#[cfg(feature = "embeddings")]
+#[test]
+fn semantic_lanes_without_any_store_name_the_remedy() {
+    for lane in ["semantic", "semantic-context", "semantic-memory"] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        eg_in(temp.path())
+            .args(["query", lane, "request timeout"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("--data-dir"))
+            .stderr(predicate::str::contains("egregore.toml"));
+    }
+}
+
+/// Issue #509: `eg query cost` reads the pinned store like the other lanes.
+#[test]
+#[cfg(feature = "embedded-aletheiadb")]
+fn query_cost_reads_config_data_dir() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_config(temp.path(), "data_dir = \"pinned-store\"\n");
+    let graph_path = temp.path().join("graph.jsonl");
+    eg_in(temp.path())
+        .arg("scan")
+        .arg(fixture_repo())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+    eg_in(temp.path())
+        .args(["ingest"])
+        .arg(&graph_path)
+        .args(["--adapter", "embedded"])
+        .assert()
+        .success();
+    eg_in(temp.path())
+        .args(["query", "cost", "--format", "text"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cost: 0 row(s)"));
+}
