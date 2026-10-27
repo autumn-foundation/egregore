@@ -250,7 +250,7 @@ mod tests {
     }
 
     fn report(records: &[GraphRecord]) -> SymbolComplexityReport {
-        symbol_complexity(records, None, 10).expect("symbols present")
+        symbol_complexity_ranking(records, None, 10).expect("symbols present")
     }
 
     #[test]
