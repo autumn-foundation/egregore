@@ -270,20 +270,20 @@ pub fn symbol_origin<'a>(
     // Pin BEFORE resolving: a same-named symbol that exists only after the
     // pin must not make the name ambiguous, and the introduction must come
     // from the pinned ancestry, not from another branch.
-    let pinned_records: Vec<GraphRecord>;
-    let lifeline_records: &[GraphRecord] = match &pin_set {
-        None => records,
-        Some(set) => {
-            pinned_records = records
-                .iter()
-                .filter(|record| record_in_commit_set(record, set))
-                .cloned()
-                .collect();
-            &pinned_records
-        }
-    };
+    let lifeline_records: std::borrow::Cow<'_, [GraphRecord]> =
+        pin_set
+            .as_ref()
+            .map_or(std::borrow::Cow::Borrowed(records), |set| {
+                std::borrow::Cow::Owned(
+                    records
+                        .iter()
+                        .filter(|record| record_in_commit_set(record, set))
+                        .cloned()
+                        .collect(),
+                )
+            });
     let events =
-        symbol_lifeline(lifeline_records, query, repo_id).map_err(|error| match error {
+        symbol_lifeline(&lifeline_records, query, repo_id).map_err(|error| match error {
             LifelineError::UnknownSymbol { query } => OriginError::UnknownSymbol { query },
             LifelineError::AmbiguousSymbol { query, candidates } => {
                 OriginError::AmbiguousSymbol { query, candidates }

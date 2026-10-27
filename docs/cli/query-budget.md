@@ -46,7 +46,12 @@ a pinned transaction time (`2026-01-01T00:00:00Z`).
 - The benchmark scans the corpus **N times** (N = `scale_factor`, 10) with
   disjoint repository identities (`<override>-sNN`) and concatenates the
   copies into the scaled store — so the 1x store is exactly the first slice
-  of the 10x store, and record IDs never collide.
+  of the 10x store, and record IDs never collide. Copies after the first also
+  get disjoint symbol names (`__sNN` suffix) and paths (`sNN/` prefix). Then a
+  by-name or by-path query has the same answer size at every store size, and
+  the ratio measures lookup cost alone.
+- Setup also builds the sidecar index (`eg index`) for each store, untimed.
+  Without an index a lookup is a linear scan of the whole store.
 - A plain deterministic scan produces no `SemanticDrift` nodes (drift is an
   embeddings-over-history product), so the benchmark appends deterministic
   synthetic drift nodes per copy (25 per repo; strictly descending scores, so
@@ -103,17 +108,14 @@ The gate is enforced two ways:
    `cargo test --all-targets` matrix. It asserts the gate mechanics: an
    unmeetable `--max-ratio` genuinely fails the gate (exit 1, not a rubber
    stamp), an unmeetable `--budget-p95-ms` still passes (advisory, not
-   gating), the report schema is complete, and bad arguments fail fast with
-   the JSON error envelope. The end-state test
-   (`scaling_gate_passes_on_reference_corpus`) is `#[ignore]`d as the
-   tracked RED — see the Measured section; remove the attribute when the
-   optimization slice turns the gate green.
+   gating), the report schema is complete, bad arguments fail fast with
+   the JSON error envelope, and the end-state test
+   (`scaling_gate_passes_on_reference_corpus`) holds the 2x ceiling.
 2. The dedicated `query-budget` CI job (`.github/workflows/ci.yml`), which
    installs ripgrep, builds once, and runs the complete manifest-default
    gate — `./target/debug/egregore audit query-budget` — on the reference
    machine class (`ubuntu-latest`). This is the authoritative scaling
-   enforcement on every push/PR, and it is **expected-red** until the
-   optimization slice lands (the RED is the signal, not a breakage).
+   enforcement on every push/PR.
 
 ## When the gate fails
 
@@ -132,37 +134,35 @@ The gate is enforced two ways:
 
 ## Measured (reference run)
 
-Store size, machine class, and measured numbers for the committed benchmark,
-so future regressions are detectable. Reference machine class: **GitHub
-Actions `ubuntu-latest` runner** (the CI gate).
-
-*Measured 2026-09-30 on a Fly Sprite (8 vCPU, 8 GiB RAM, Ubuntu) — full
-manifest-default profile (`--samples 5 --warm-samples 5`, scale factor 10).
-`eg` built from this branch at the commit recorded below; ripgrep 14.1.1.*
+Reference machine class: **GitHub Actions `ubuntu-latest` runner** (the CI
+gate). Numbers below come from a 4-vCPU Linux sandbox with the debug binary
+(the CI build), full manifest-default profile (`--samples 5 --warm-samples 5`,
+scale factor 10).
 
 | Query | Temp | 1x p50 | 1x p95 | 10x p50 | 10x p95 |
 |---|---|---|---|---|---|
-| symbol | cold | 285ms | 287ms | 2879ms | 2913ms |
-| symbol | warm | 289ms | 305ms | 2789ms | 2913ms |
-| file | cold | 322ms | 1457ms | 2685ms | 2727ms |
-| file | warm | 266ms | 269ms | 2750ms | 2782ms |
-| drift | cold | 289ms | 324ms | 2695ms | 2697ms |
-| drift | warm | 284ms | 291ms | 2713ms | 2768ms |
-| ripgrep baseline (`rg … RepositoryIndex` on the corpus source) | — | 4ms (p50) | 4ms (p95) | — | — |
+| symbol | cold | 49ms | 59ms | 47ms | 50ms |
+| symbol | warm | 58ms | 62ms | 40ms | 41ms |
+| file | cold | 26ms | 29ms | 25ms | 29ms |
+| file | warm | 27ms | 37ms | 26ms | 30ms |
+| drift | cold | 68ms | 80ms | 128ms | 131ms |
+| drift | warm | 67ms | 69ms | 134ms | 180ms |
+| ripgrep baseline | — | 5ms | 5ms | — | — |
 
 - 1x store: **10,466 records**; 10x store: **104,660 records**.
-- **Scaling assertion (cold symbol): ratio 10.11x vs 2.0x ceiling — FAIL.**
-  The query path loads the whole store per invocation (see issue #255's
-  notes), so time-to-first-answer scales linearly with record count
-  (~27µs/record in both sizes — no pathology, just O(n) load). This is the
-  genuine RED this slice was built to capture: the measurement, budget, and
-  guard are committed; the optimization slice (indexing / lazy load /
-  caching — explicitly out of scope for #120) is required to turn the gate
-  green. Do **not** "fix" it by raising `--max-ratio`.
-- Advisory budgets (p50 < 2s, p95 < 2s): all six 1x cells within budget;
-  all six 10x cells exceed the p95 budget (flagged, not gating). The
-  file/cold 1x p95 (1457ms) is a single-sample outlier against a 322ms p50 —
-  system noise during the run, not a trend.
-- Success-metric status: p95 time-to-first-symbol-answer on the 1x
-  representative store is **287ms < 2s** ✓; sub-linear scaling is **not met**
-  on current trunk (10.11x) — pending the optimization slice.
+- **Scaling assertion (cold symbol): ratio 0.95x vs 2.0x ceiling — PASS.**
+- All twelve cells are within the advisory budgets.
+
+### Before the fix (history)
+
+Measured 2026-09-30 and re-measured on this sandbox before the fix: the query
+path read the whole store per invocation, so latency grew linearly with record
+count (symbol cold: 661ms at 1x, 6225ms at 10x; ratio 9.4x). Two causes: a
+cold scan of every line, and a sidecar index (issue #447) that was not built
+for the benchmark stores and still cost `O(n)` (whole-graph read, whole-graph
+BLAKE3, JSON parse of the tables). The fix: index format 2 (binary tables read
+in place, cheap validity check), the drift lane on the index, and the index
+built in benchmark setup.
+
+Do **not** "fix" a future regression by raising `--max-ratio` or shrinking the
+corpus without a product decision.

@@ -1423,6 +1423,12 @@ instead of deserializing the whole file. The index is content-addressed on the
 graph's BLAKE3 + byte length: a stale, corrupt, missing, or version-mismatched
 index is silently ignored and the lane transparently cold-scans, so results are
 BYTE-IDENTICAL with or without the index (a pure access-path optimization).
+Format v2 (issue #120) is a set of binary tables a query reads in place by
+binary search, with a cheap validity check (length, modification time, sampled
+blocks; the full BLAKE3 only when the time differs), so a lookup's index cost
+does not grow with the graph. `eg query drift` (unscoped) also uses it, and
+`eg audit query-budget` builds the index for its stores in setup and now gates
+at 10x records ≤ 2x latency (measured 0.95x).
 `eg index` is the only writer (atomic `.idx.tmp` + rename, deterministic bytes),
 refuses (exit 2) any graph a cold load would reject, and never writes from a
 query path. Migrated lanes (`deps`, `context`/`symbol`, `at`/`locate`, `file`,

@@ -79,14 +79,14 @@ pub(crate) fn load_records_from_jsonl_selected(
     graph: &Path,
     selector: &crate::graph_index::Selector,
 ) -> Result<Vec<GraphRecord>> {
-    use crate::graph_index::{GraphIndex, Selector};
+    use crate::graph_index::{LazyGraphIndex, Selector};
 
     if matches!(selector, Selector::Whole) {
         return load_records_from_jsonl(graph);
     }
     // Try the index; ANY failure (absent, stale, corrupt, version mismatch, or a
     // hydration I/O error) transparently degrades to the cold scan.
-    let Ok(index) = GraphIndex::load_for(graph) else {
+    let Ok(index) = LazyGraphIndex::open(graph) else {
         return load_records_from_jsonl(graph);
     };
     // Compose with #457: over a history / corpus store the default HEAD-anchor
@@ -98,13 +98,46 @@ pub(crate) fn load_records_from_jsonl_selected(
     // cold answer. So a history store falls back to the cold whole-file scan; a
     // plain current-tree `scan` graph (no temporal records) keeps the #447 fast
     // path, where head-anchoring drops nothing and the closure is byte-identical.
-    if index.body.has_temporal_history {
+    if index.has_temporal_history() {
         return load_records_from_jsonl(graph);
     }
-    match index.hydrate(graph, selector) {
+    match index.hydrate(selector) {
         Ok(Some(records)) => Ok(records),
         Ok(None) | Err(_) => load_records_from_jsonl(graph),
     }
+}
+
+/// Loads the records `eg query drift --graph` needs (issue #120).
+///
+/// Through a valid sidecar index it reads every `SemanticDrift` node, ranks
+/// them like the lane does, then adds only the closure of the top `limit`
+/// rows (the drift node and the target it resolves), so the read does not
+/// grow with the rest of the graph. Without a usable index, or over a history
+/// store, it cold-scans the whole file.
+pub(crate) fn load_drift_records(graph: &Path, limit: usize) -> Result<Vec<GraphRecord>> {
+    use crate::graph_index::{LazyGraphIndex, Selector};
+
+    let kind = Selector::ByKind("SemanticDrift".to_owned());
+    let indexed = || -> Option<Vec<GraphRecord>> {
+        let index = LazyGraphIndex::open(graph).ok()?;
+        if index.has_temporal_history() {
+            return None;
+        }
+        let drifts = index.hydrate(&kind).ok()??;
+        let mut selectors = vec![kind.clone()];
+        for record in query::largest_semantic_drifts(&drifts, limit) {
+            selectors.push(Selector::Anchored(record.id().to_owned()));
+            if let GraphRecord::Node {
+                semantic_drift: Some(drift),
+                ..
+            } = record
+            {
+                selectors.push(Selector::Lineage(drift.target_record_id.clone()));
+            }
+        }
+        index.hydrate_many(&selectors).ok()?
+    };
+    indexed().map_or_else(|| load_records_from_jsonl(graph), Ok)
 }
 
 #[cfg(feature = "embedded-aletheiadb")]
