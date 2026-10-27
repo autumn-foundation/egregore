@@ -26,6 +26,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::BTreeMap;
+
+use super::liveness::Liveness;
 use crate::ir::{
     COST_USAGE_DERIVATION_TRANSCRIPT, CostUsagePayload, EdgeLabel, GraphRecord, NodeKind,
 };
@@ -189,8 +192,10 @@ pub fn bounded_cost_text(value: &str) -> String {
 pub fn cost_rollup(records: &[GraphRecord], filters: &CostFilters, limit: usize) -> CostRollup {
     let mut rows: Vec<CostRow> = Vec::new();
     let mut diagnostics: Vec<CostDiagnostic> = Vec::new();
+    let liveness = Liveness::new(records);
+    let runs = authored_by_runs(records, &liveness);
 
-    for record in records {
+    for (index, record) in records.iter().enumerate() {
         let GraphRecord::Node {
             id,
             kind,
@@ -203,6 +208,11 @@ pub fn cost_rollup(records: &[GraphRecord], filters: &CostFilters, limit: usize)
             continue;
         };
         if *kind != NodeKind::CostUsage {
+            continue;
+        }
+        // Latest write wins, as in the embedded read: skip forgotten
+        // records and superseded versions.
+        if liveness.deleted(id) || !liveness.is_latest_node_version(id, index) {
             continue;
         }
         let payload: CostUsagePayload = match text
@@ -248,7 +258,7 @@ pub fn cost_rollup(records: &[GraphRecord], filters: &CostFilters, limit: usize)
             }
         }
 
-        let run_id = authored_by_run(records, id);
+        let run_id = runs.get(id.as_str()).map(|run| (*run).to_owned());
         if run_id.is_none() {
             diagnostics.push(CostDiagnostic {
                 code: "cost_usage_without_run_edge".to_owned(),
@@ -301,21 +311,31 @@ pub fn cost_rollup(records: &[GraphRecord], filters: &CostFilters, limit: usize)
     }
 }
 
-/// Resolve the `AgentRun` a `CostUsage` node belongs to via its `AuthoredBy`
-/// edge (edge-derived membership, never a matching ID string).
-fn authored_by_run(records: &[GraphRecord], cost_id: &str) -> Option<String> {
-    records.iter().find_map(|r| {
+/// Map each source ID to the `AgentRun` its first live `AuthoredBy` edge names
+/// (edge-derived membership, never a matching ID string). One pass keeps the
+/// rollup linear in the record count.
+fn authored_by_runs<'a>(
+    records: &'a [GraphRecord],
+    liveness: &Liveness<'_>,
+) -> BTreeMap<&'a str, &'a str> {
+    let mut runs = BTreeMap::new();
+    for (index, record) in records.iter().enumerate() {
         let GraphRecord::Edge {
-            label,
+            id,
+            label: EdgeLabel::AuthoredBy,
             source,
             target,
             ..
-        } = r
+        } = record
         else {
-            return None;
+            continue;
         };
-        (*label == EdgeLabel::AuthoredBy && source == cost_id).then(|| target.clone())
-    })
+        if liveness.deleted(id) || !liveness.is_latest_edge_version(id, index) {
+            continue;
+        }
+        runs.entry(source.as_str()).or_insert(target.as_str());
+    }
+    runs
 }
 
 /// Sum the present values of every matching row. A measurement no row carries
@@ -370,7 +390,10 @@ mod tests {
             None,
             "cost".to_owned(),
         );
-        if let GraphRecord::Node { text, session_id, .. } = &mut node {
+        if let GraphRecord::Node {
+            text, session_id, ..
+        } = &mut node
+        {
             *text = Some(
                 serde_json::json!({
                     "derivation": COST_USAGE_DERIVATION_TRANSCRIPT,

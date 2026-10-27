@@ -292,10 +292,24 @@ pub fn stage_local_model_dir(dir: &Path, model_id: &str) -> Result<PathBuf, Reem
 /// only when its content matches.
 #[cfg_attr(unix, allow(dead_code))]
 fn copy_staged_file(src: &Path, dst: &Path) -> std::io::Result<()> {
-    if dst.exists() {
+    if dst.exists() && files_match(src, dst)? {
         return Ok(());
     }
     std::fs::copy(src, dst).map(|_| ())
+}
+
+/// True when both files have the same length and BLAKE3 digest.
+#[cfg_attr(unix, allow(dead_code))]
+fn files_match(a: &Path, b: &Path) -> std::io::Result<bool> {
+    if std::fs::metadata(a)?.len() != std::fs::metadata(b)?.len() {
+        return Ok(false);
+    }
+    let digest = |path: &Path| -> std::io::Result<blake3::Hash> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update_reader(std::fs::File::open(path)?)?;
+        Ok(hasher.finalize())
+    };
+    Ok(digest(a)? == digest(b)?)
 }
 
 /// Reads the model's DECLARED embedding dimension (`hidden_size` in
@@ -575,9 +589,15 @@ mod tests {
         let dst = dir.path().join("copy.bin");
         std::fs::write(&src, b"same").expect("write");
         std::fs::write(&dst, b"same").expect("write");
-        let before = std::fs::metadata(&dst).expect("meta").modified().expect("mtime");
+        let before = std::fs::metadata(&dst)
+            .expect("meta")
+            .modified()
+            .expect("mtime");
         copy_staged_file(&src, &dst).expect("no-op");
-        let after = std::fs::metadata(&dst).expect("meta").modified().expect("mtime");
+        let after = std::fs::metadata(&dst)
+            .expect("meta")
+            .modified()
+            .expect("mtime");
         assert_eq!(before, after);
     }
 

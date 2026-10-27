@@ -219,6 +219,20 @@ fn as_of_commit_set<'a>(
     in_scope
 }
 
+/// True when a record belongs to the pinned commit set. Records with no
+/// temporal anchor (tombstones, non-temporal edges) stay in every view.
+fn record_in_commit_set(record: &GraphRecord, set: &BTreeSet<&str>) -> bool {
+    match record {
+        GraphRecord::Node {
+            temporal: Some(t), ..
+        }
+        | GraphRecord::Edge {
+            temporal: Some(t), ..
+        } => set.contains(t.git_commit.as_str()),
+        _ => true,
+    }
+}
+
 /// Trace a symbol to its introducing commit and link the project records.
 ///
 /// The `records` slice is the answer's corpus: callers suppress
@@ -253,12 +267,28 @@ pub fn symbol_origin<'a>(
         }
     };
 
-    let events = symbol_lifeline(records, query, repo_id).map_err(|error| match error {
-        LifelineError::UnknownSymbol { query } => OriginError::UnknownSymbol { query },
-        LifelineError::AmbiguousSymbol { query, candidates } => {
-            OriginError::AmbiguousSymbol { query, candidates }
+    // Pin BEFORE resolving: a same-named symbol that exists only after the
+    // pin must not make the name ambiguous, and the introduction must come
+    // from the pinned ancestry, not from another branch.
+    let pinned_records: Vec<GraphRecord>;
+    let lifeline_records: &[GraphRecord] = match &pin_set {
+        None => records,
+        Some(set) => {
+            pinned_records = records
+                .iter()
+                .filter(|record| record_in_commit_set(record, set))
+                .cloned()
+                .collect();
+            &pinned_records
         }
-    })?;
+    };
+    let events =
+        symbol_lifeline(lifeline_records, query, repo_id).map_err(|error| match error {
+            LifelineError::UnknownSymbol { query } => OriginError::UnknownSymbol { query },
+            LifelineError::AmbiguousSymbol { query, candidates } => {
+                OriginError::AmbiguousSymbol { query, candidates }
+            }
+        })?;
     // By lifeline construction the first event is always `Introduced`; an
     // empty event list means the symbol resolved but has no commit-linked
     // history (the `no_history` lane contract, mirroring `query lifeline`).
@@ -455,8 +485,7 @@ mod tests {
             &["c3"],
             "2026-01-04T00:00:00Z",
         ));
-        let report =
-            symbol_origin(&records, "answer", None, OriginPin::AtCommit("c3")).unwrap();
+        let report = symbol_origin(&records, "answer", None, OriginPin::AtCommit("c3")).unwrap();
         assert_eq!(report.symbol_record_id, "symbol:answer");
     }
 
@@ -471,9 +500,13 @@ mod tests {
             &["c3"],
             "2026-01-04T00:00:00Z",
         ));
-        let report =
-            symbol_origin(&records, "answer", None, OriginPin::AsOf("2026-01-03T00:00:00Z"))
-                .unwrap();
+        let report = symbol_origin(
+            &records,
+            "answer",
+            None,
+            OriginPin::AsOf("2026-01-03T00:00:00Z"),
+        )
+        .unwrap();
         assert_eq!(report.symbol_record_id, "symbol:answer");
     }
 
@@ -485,11 +518,22 @@ mod tests {
             commit("commit:1", "c1", &[], "2026-01-01T00:00:00Z"),
             commit("commit:3", "c3", &["c1"], "2026-01-02T00:00:00Z"),
             commit("commit:9", "c9", &["c1"], "2026-01-03T00:00:00Z"),
-            symbol("symbol:answer", "answer", "c3", &["c1"], "2026-01-02T00:00:00Z"),
-            symbol("symbol:answer", "answer", "c9", &["c1"], "2026-01-03T00:00:00Z"),
+            symbol(
+                "symbol:answer",
+                "answer",
+                "c3",
+                &["c1"],
+                "2026-01-02T00:00:00Z",
+            ),
+            symbol(
+                "symbol:answer",
+                "answer",
+                "c9",
+                &["c1"],
+                "2026-01-03T00:00:00Z",
+            ),
         ];
-        let report =
-            symbol_origin(&records, "answer", None, OriginPin::AtCommit("c9")).unwrap();
+        let report = symbol_origin(&records, "answer", None, OriginPin::AtCommit("c9")).unwrap();
         assert_eq!(report.introducing_commit, "c9");
     }
 

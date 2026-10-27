@@ -553,7 +553,11 @@ fn fixed_depends_on_after_reimport_is_not_unresolved() {
     ]));
     let report = ready_report(&records);
     assert!(!has_unresolved(&report), "stale diagnostic must not block");
-    assert_eq!(report.ready.len(), 1, "task a is ready once ghost is closed");
+    assert_eq!(
+        report.ready.len(),
+        1,
+        "task a is ready once ghost is closed"
+    );
 }
 
 #[test]

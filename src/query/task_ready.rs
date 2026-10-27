@@ -345,8 +345,9 @@ pub fn task_ready_report(records: &[GraphRecord]) -> TaskReadyOutcome {
     }
     let mut unresolved: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     let mut unresolved_diags: Vec<TaskReadyDiagnostic> = Vec::new();
-    for record in records {
+    for (index, record) in records.iter().enumerate() {
         let GraphRecord::Node {
+            id: diag_id,
             kind: NodeKind::Diagnostic,
             summary,
             ..
@@ -354,6 +355,10 @@ pub fn task_ready_report(records: &[GraphRecord]) -> TaskReadyOutcome {
         else {
             continue;
         };
+        // A retracted or rewritten diagnostic no longer holds.
+        if liveness.deleted(diag_id) || !liveness.is_latest_node_version(diag_id, index) {
+            continue;
+        }
         let Some(payload_json) = summary.strip_prefix(UNRESOLVED_DEPENDENCY_PREFIX) else {
             continue;
         };
@@ -365,6 +370,15 @@ pub fn task_ready_report(records: &[GraphRecord]) -> TaskReadyOutcome {
         else {
             continue;
         };
+        // Superseded: the reference now resolves to a live task in the same
+        // file and the task depends on it. The importer never rewrites the
+        // old diagnostic, so an append-only graph still carries it.
+        let resolved_now = task_by_source
+            .get(&(payload.file.as_str(), payload.unknown_dep.as_str()))
+            .is_some_and(|dep| dep_adj.get(task_id).is_some_and(|deps| deps.contains(dep)));
+        if resolved_now {
+            continue;
+        }
         unresolved
             .entry(*task_id)
             .or_default()

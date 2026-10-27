@@ -2265,9 +2265,10 @@ pub(crate) enum QuerySubcommand {
     Semantic {
         /// Query text (symbol name, description, or code snippet).
         query: String,
-        /// Embedded `AletheiaDB` data directory.
+        /// Embedded `AletheiaDB` data directory. Falls back to the `data_dir`
+        /// pinned in `egregore.toml`.
         #[arg(long)]
-        data_dir: PathBuf,
+        data_dir: Option<PathBuf>,
         /// Route the query through the running daemon instead of opening the store directly.
         #[arg(long)]
         daemon: bool,
@@ -2358,7 +2359,7 @@ pub(crate) enum QuerySubcommand {
         query: String,
         /// Embedded `AletheiaDB` data directory (must be ingested with `--embed`).
         #[arg(long)]
-        data_dir: PathBuf,
+        data_dir: Option<PathBuf>,
         /// Restrict results to one repository (see `eg query symbol --help`).
         #[arg(long)]
         repo: Option<String>,
@@ -2393,7 +2394,7 @@ pub(crate) enum QuerySubcommand {
         query: String,
         /// Embedded `AletheiaDB` data directory.
         #[arg(long)]
-        data_dir: PathBuf,
+        data_dir: Option<PathBuf>,
         /// Restrict results to one repository (see `eg query symbol --help`).
         #[arg(long)]
         repo: Option<String>,
@@ -9269,6 +9270,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             format,
             embed_model,
         } => {
+            let data_dir = require_query_data_dir("semantic", data_dir)?;
             if daemon {
                 // `--under` conflicts with `--daemon` at the CLI layer (scoped
                 // retrieval is a local-CLI surface for this slice, issue #198),
@@ -9293,11 +9295,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             limit,
             format,
         } => {
-            let Some(data_dir) = resolve_query_data_dir(None, data_dir) else {
-                anyhow::bail!(
-                    "`eg query similar` needs a store: pass --data-dir or pin `data_dir` in egregore.toml"
-                );
-            };
+            let data_dir = require_query_data_dir("similar", data_dir)?;
             similar::query_similar_cmd(&handle, &data_dir, limit, format)
         }
         #[cfg(feature = "embeddings")]
@@ -9308,14 +9306,17 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             limit,
             min_score,
             supersession,
-        } => query_semantic_context(
-            &query,
-            &data_dir,
-            limit,
-            min_score,
-            repo.as_deref(),
-            supersession,
-        ),
+        } => {
+            let data_dir = require_query_data_dir("semantic-context", data_dir)?;
+            query_semantic_context(
+                &query,
+                &data_dir,
+                limit,
+                min_score,
+                repo.as_deref(),
+                supersession,
+            )
+        }
         #[cfg(feature = "embeddings")]
         QuerySubcommand::SemanticMemory {
             query,
@@ -9331,21 +9332,24 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             similarity_threshold,
             collapse_mode,
             include_retired,
-        } => query_semantic_memory(
-            &query,
-            &data_dir,
-            limit,
-            repo.as_deref(),
-            verified_only,
-            agent.as_deref(),
-            not_agent.as_deref(),
-            format,
-            supersession,
-            collapse,
-            similarity_threshold,
-            collapse_mode,
-            include_retired,
-        ),
+        } => {
+            let data_dir = require_query_data_dir("semantic-memory", data_dir)?;
+            query_semantic_memory(
+                &query,
+                &data_dir,
+                limit,
+                repo.as_deref(),
+                verified_only,
+                agent.as_deref(),
+                not_agent.as_deref(),
+                format,
+                supersession,
+                collapse,
+                similarity_threshold,
+                collapse_mode,
+                include_retired,
+            )
+        }
         QuerySubcommand::Context {
             name,
             graph,

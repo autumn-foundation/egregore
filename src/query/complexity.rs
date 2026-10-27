@@ -141,7 +141,7 @@ pub fn symbol_complexity_ranking(
         .collect();
 
     let mut rows: Vec<SymbolComplexityRow> = Vec::new();
-    for record in records {
+    for (position, record) in records.iter().enumerate() {
         let GraphRecord::Node {
             id,
             kind,
@@ -151,6 +151,7 @@ pub fn symbol_complexity_ranking(
             span,
             schema_version,
             complexity,
+            temporal,
             ..
         } = record
         else {
@@ -160,6 +161,12 @@ pub fn symbol_complexity_ranking(
             continue;
         }
         if tombstoned.contains(id.as_str()) || !is_owned(id) {
+            continue;
+        }
+        // A non-temporal rewrite supersedes earlier versions of the same id
+        // (the embedded store keeps only the latest). Temporal snapshots are
+        // distinct history and stay.
+        if temporal.is_none() && !liveness.is_latest_node_version(id, position) {
             continue;
         }
         let (Some(qualified_name), Some(kind_str), Some(path), Some(score)) = (
@@ -263,7 +270,11 @@ mod tests {
 
     #[test]
     fn rewrite_does_not_change_truncation() {
-        let records = vec![symbol("s1", "f", 3), symbol("s1", "f", 9), symbol("s2", "g", 1)];
+        let records = vec![
+            symbol("s1", "f", 3),
+            symbol("s1", "f", 9),
+            symbol("s2", "g", 1),
+        ];
         let out = symbol_complexity_ranking(&records, None, 2).expect("symbols present");
         assert_eq!(out.total_symbol_count, 2);
         assert!(!out.truncated);

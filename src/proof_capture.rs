@@ -1265,7 +1265,15 @@ pub fn capture_proof(config: &CaptureConfig) -> Result<ProofOutcome, ProofCaptur
 /// pipes open and block the drain threads. `taskkill /T` ends the tree.
 #[cfg_attr(unix, allow(dead_code))]
 fn tree_kill_command(pid: u32) -> (&'static str, Vec<String>) {
-    ("taskkill", Vec::new())
+    (
+        "taskkill",
+        vec![
+            "/PID".to_owned(),
+            pid.to_string(),
+            "/T".to_owned(),
+            "/F".to_owned(),
+        ],
+    )
 }
 
 #[cfg(test)]
