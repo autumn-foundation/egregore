@@ -72,6 +72,7 @@ mod line_ending_determinism;
 mod line_ending_stability;
 mod link_evidence;
 mod link_logs;
+mod lint_suppression_embedded;
 mod local_project;
 mod local_project_jsonl_doc;
 mod log_deltas;

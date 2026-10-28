@@ -5295,6 +5295,10 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "PanicRiskSite" => Ok(NodeKind::PanicRiskSite),
         "DebtMarker" => Ok(NodeKind::DebtMarker),
         "UnsafeSite" => Ok(NodeKind::UnsafeSite),
+        // Lint-suppression facts (issue #227): written by `node_label` from
+        // the start but missing here, so every embedded read-back of a
+        // LintSuppression node failed with "unknown embedded node kind".
+        "LintSuppression" => Ok(NodeKind::LintSuppression),
         "Commit" => Ok(NodeKind::Commit),
         "Change" => Ok(NodeKind::Change),
         "SemanticDrift" => Ok(NodeKind::SemanticDrift),
@@ -9146,6 +9150,25 @@ mod tests {
                 kind.as_str(),
                 "node_label({kind:?}) must equal its kind string, or the #486 \
                  label inventory no longer describes what the adapter writes"
+            );
+        }
+    }
+
+    /// The read side must mirror the write side for EVERY kind: a kind the
+    /// adapter can write but `parse_node_kind` cannot read back makes every
+    /// ingest of a graph containing one fail read-back verification
+    /// ("unknown embedded node kind …"). `LintSuppression` (issue #227)
+    /// shipped exactly that gap — written (label + `lint_suppression_json`)
+    /// but missing from `parse_node_kind`. This pins the full round-trip so
+    /// the next added kind cannot desync the two matches silently.
+    #[test]
+    fn parse_node_kind_round_trips_every_kind() {
+        for kind in NodeKind::ALL {
+            assert_eq!(
+                parse_node_kind("round-trip-test", kind.as_str()).ok(),
+                Some(kind),
+                "parse_node_kind must read back the kind string node_label \
+                 writes for {kind:?}"
             );
         }
     }
