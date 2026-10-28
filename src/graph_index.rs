@@ -46,7 +46,7 @@ pub const INDEX_FORMAT_VERSION: u32 = 2;
 const INDEX_MAGIC: &[u8; 4] = b"EGIX";
 
 /// Fixed header width, 89 bytes: magic (4), version `u32` (4), `graph_len`
-/// `u64` (8), `graph_blake3` (32), `graph_mtime_ns` `u64` (8), sample
+/// `u64` (8), `graph_blake3` (32), `graph_stat_stamp` `u64` (8), sample
 /// fingerprint (32), history flag (1).
 const HEADER_LEN: usize = 4 + 4 + 8 + 32 + 8 + 32 + 1;
 
@@ -201,9 +201,9 @@ pub struct GraphIndex {
     pub graph_len: u64,
     /// BLAKE3 of the graph file bytes the index was built over.
     pub graph_blake3: [u8; 32],
-    /// Modification time of the graph file when the index was built
-    /// (nanoseconds since the Unix epoch; `0` when unknown).
-    pub graph_mtime_ns: u64,
+    /// Stamp of the graph file's times and identity when the index was built
+    /// (`0` when unknown). See `stat_stamp`.
+    pub graph_stat_stamp: u64,
     /// BLAKE3 over the length and a fixed sample of graph blocks.
     pub sample_fingerprint: [u8; 32],
     /// The offset maps.
@@ -306,13 +306,41 @@ fn sample_fingerprint_file(file: &fs::File, len: u64) -> std::io::Result<[u8; 32
     Ok(*hasher.finalize().as_bytes())
 }
 
-/// Modification time of a file as nanoseconds since the Unix epoch (`0` when
-/// the platform cannot report it).
-fn mtime_ns(meta: &fs::Metadata) -> u64 {
-    meta.modified()
+/// A stamp of a file's identity and change times (`0` when the platform
+/// reports none). On Unix it mixes the modification time, the change time,
+/// the inode, and the device, so a copy that keeps the modification time
+/// (`cp -p`, `rsync -t`) still gets a different stamp.
+fn stat_stamp(meta: &fs::Metadata) -> u64 {
+    let mtime = meta
+        .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(0))
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(0));
+    if mtime == 0 {
+        return 0;
+    }
+    #[cfg(unix)]
+    let extra = {
+        use std::os::unix::fs::MetadataExt;
+        [
+            meta.ctime().cast_unsigned(),
+            meta.ctime_nsec().cast_unsigned(),
+            meta.ino(),
+            meta.dev(),
+        ]
+    };
+    #[cfg(not(unix))]
+    let extra = [0u64; 4];
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&mtime.to_le_bytes());
+    for part in extra {
+        hasher.update(&part.to_le_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&digest.as_bytes()[..8]);
+    // `0` means "no stamp"; keep a real stamp non-zero.
+    u64::from_le_bytes(raw).max(1)
 }
 
 /// Reads exactly `buf.len()` bytes at `offset` without moving a cursor.
@@ -566,10 +594,13 @@ impl IndexView for FileView {
     }
 
     fn record_at(&self, offset: u64) -> Option<GraphRecord> {
-        read_record_in_file(&self.graph, offset).unwrap_or_else(|_| {
+        let record = read_record_in_file(&self.graph, offset).unwrap_or(None);
+        if record.is_none() {
+            // A validated index only points at lines that parsed at build
+            // time, so a miss means damage or a changed graph.
             self.failed.set(true);
-            None
-        })
+        }
+        record
     }
 }
 
@@ -592,10 +623,10 @@ impl GraphIndex {
         };
         // Take the modification time BEFORE reading: a write that lands during
         // the build then leaves a stale time, never a fresh-looking one.
-        let mtime = mtime_ns(&fs::metadata(graph).map_err(read_error)?);
+        let mtime = stat_stamp(&fs::metadata(graph).map_err(read_error)?);
         let bytes = fs::read(graph).map_err(read_error)?;
         let mut index = Self::build_from_bytes(&bytes)?;
-        index.graph_mtime_ns = mtime;
+        index.graph_stat_stamp = mtime;
         Ok(index)
     }
 
@@ -673,7 +704,7 @@ impl GraphIndex {
         Ok(Self {
             graph_len,
             graph_blake3,
-            graph_mtime_ns: 0,
+            graph_stat_stamp: 0,
             sample_fingerprint,
             body,
         })
@@ -695,7 +726,7 @@ impl GraphIndex {
         out.extend_from_slice(&INDEX_FORMAT_VERSION.to_le_bytes());
         out.extend_from_slice(&self.graph_len.to_le_bytes());
         out.extend_from_slice(&self.graph_blake3);
-        out.extend_from_slice(&self.graph_mtime_ns.to_le_bytes());
+        out.extend_from_slice(&self.graph_stat_stamp.to_le_bytes());
         out.extend_from_slice(&self.sample_fingerprint);
         out.push(u8::from(self.body.has_temporal_history));
         out.push(b'\n');
@@ -757,7 +788,7 @@ impl GraphIndex {
         Ok(Self {
             graph_len: header.graph_len,
             graph_blake3: header.graph_blake3,
-            graph_mtime_ns: header.graph_mtime_ns,
+            graph_stat_stamp: header.graph_stat_stamp,
             sample_fingerprint: header.sample_fingerprint,
             body,
         })
@@ -782,7 +813,7 @@ impl GraphIndex {
 struct Header {
     graph_len: u64,
     graph_blake3: [u8; 32],
-    graph_mtime_ns: u64,
+    graph_stat_stamp: u64,
     sample_fingerprint: [u8; 32],
     has_temporal_history: bool,
     tables: [(u64, u64); TABLE_COUNT],
@@ -823,7 +854,7 @@ fn parse_header(bytes: &[u8]) -> Result<Header, LoadError> {
     Ok(Header {
         graph_len: u64_at(bytes, 8),
         graph_blake3,
-        graph_mtime_ns: u64_at(bytes, 48),
+        graph_stat_stamp: u64_at(bytes, 48),
         sample_fingerprint,
         has_temporal_history: bytes[88] != 0,
         tables,
@@ -849,13 +880,16 @@ fn decode_table(raw: &[u8]) -> std::io::Result<BTreeMap<String, Vec<u64>>> {
         entry_raw.copy_from_slice(&raw[at..at + ENTRY_LEN]);
         let entry = decode_entry(&entry_raw);
         let key_start = usize::try_from(entry.key_off).map_err(|_| corrupt("key offset"))?;
-        let key = raw
-            .get(key_start..key_start + entry.key_len as usize)
+        let key = key_start
+            .checked_add(entry.key_len as usize)
+            .and_then(|end| raw.get(key_start..end))
             .ok_or_else(|| corrupt("key outside the table"))?;
         let key = String::from_utf8(key.to_vec()).map_err(|_| corrupt("key is not UTF-8"))?;
         let post_start = usize::try_from(entry.post_off).map_err(|_| corrupt("post offset"))?;
-        let posts = raw
-            .get(post_start..post_start + entry.post_cnt as usize * 8)
+        let posts = (entry.post_cnt as usize)
+            .checked_mul(8)
+            .and_then(|n| post_start.checked_add(n))
+            .and_then(|end| raw.get(post_start..end))
             .ok_or_else(|| corrupt("postings outside the table"))?;
         map.insert(key, posts.chunks_exact(8).map(|c| u64_at(c, 0)).collect());
     }
@@ -909,8 +943,8 @@ impl LazyGraphIndex {
         if meta.len() != header.graph_len {
             return Err(LoadError::Stale);
         }
-        let quick = header.graph_mtime_ns != 0
-            && mtime_ns(&meta) == header.graph_mtime_ns
+        let quick = header.graph_stat_stamp != 0
+            && stat_stamp(&meta) == header.graph_stat_stamp
             && sample_fingerprint_file(&graph_file, meta.len()).map_err(LoadError::Read)?
                 == header.sample_fingerprint;
         if !quick {
@@ -1059,6 +1093,13 @@ impl<V: IndexView> Closure<'_, V> {
         ids.into_iter().collect()
     }
 
+    /// Adds an edge record's offset and every tombstone that retracts it.
+    fn add_edge(&mut self, offset: u64, edge_id: &str) {
+        self.offsets.insert(offset);
+        self.offsets
+            .extend(self.view.postings(Table::DeletedId, edge_id));
+    }
+
     /// Adds a single id's every physical version plus every tombstone that
     /// retracts it.
     fn add_id_versions(&mut self, id: &str) {
@@ -1078,8 +1119,14 @@ impl<V: IndexView> Closure<'_, V> {
         // Incident edges + one hop of neighbours (with their incident edges).
         for edge_offset in self.view.postings(Table::Adjacency, id) {
             self.offsets.insert(edge_offset);
-            if let Some(GraphRecord::Edge { source, target, .. }) = self.view.record_at(edge_offset)
+            if let Some(GraphRecord::Edge {
+                id: edge_id,
+                source,
+                target,
+                ..
+            }) = self.view.record_at(edge_offset)
             {
+                self.add_edge(edge_offset, &edge_id);
                 let other = if source == id { &target } else { &source };
                 self.add_id_versions(other);
                 self.offsets
@@ -1096,8 +1143,14 @@ impl<V: IndexView> Closure<'_, V> {
         self.add_id_versions(id);
         for edge_offset in self.view.postings(Table::Adjacency, id) {
             self.offsets.insert(edge_offset);
-            if let Some(GraphRecord::Edge { source, target, .. }) = self.view.record_at(edge_offset)
+            if let Some(GraphRecord::Edge {
+                id: edge_id,
+                source,
+                target,
+                ..
+            }) = self.view.record_at(edge_offset)
             {
+                self.add_edge(edge_offset, &edge_id);
                 let other = if source == id { target } else { source };
                 self.add_id_versions(&other);
                 self.climb_ancestry(&other);
@@ -1146,6 +1199,7 @@ impl<V: IndexView> Closure<'_, V> {
             }
             for edge_offset in self.view.postings(Table::Adjacency, &node) {
                 let Some(GraphRecord::Edge {
+                    id: edge_id,
                     label,
                     source,
                     target,
@@ -1166,7 +1220,7 @@ impl<V: IndexView> Closure<'_, V> {
                         _ => false,
                     };
                 if is_parent_edge {
-                    self.offsets.insert(edge_offset);
+                    self.add_edge(edge_offset, &edge_id);
                     self.add_id_versions(&source);
                     self.offsets
                         .extend(self.view.postings(Table::Adjacency, &source));
@@ -1893,5 +1947,90 @@ mod tests {
             sample_fingerprint_file(&file, bytes.len() as u64).expect("fp"),
             sample_fingerprint_bytes(&bytes)
         );
+    }
+
+    #[test]
+    fn climbed_containment_edge_pulls_its_tombstone() {
+        let mut graph = sample_graph();
+        let caller = sym_id("src/a.rs", "caller");
+        let defines_id = GraphRecord::edge(
+            EdgeLabel::Defines,
+            file_id("src/a.rs"),
+            caller.clone(),
+            None,
+            "defines".to_owned(),
+        )
+        .id()
+        .to_owned();
+        graph.push(GraphRecord::Tombstone {
+            id: format!("tomb:{defines_id}"),
+            schema_version: 1,
+            deleted_id: defines_id.clone(),
+            summary: "edge retracted".to_owned(),
+            producer: None,
+        });
+        let text = jsonl(&graph);
+        let index = GraphIndex::build_from_bytes(text.as_bytes()).expect("build");
+        let tombstone_offsets = index
+            .body
+            .by_deleted_id
+            .get(&defines_id)
+            .cloned()
+            .expect("tombstone indexed");
+        for selector in [Selector::Lineage(caller.clone()), Selector::ById(caller)] {
+            let closure = index
+                .closure_offsets(&selector, text.as_bytes())
+                .expect("offsets");
+            assert!(
+                tombstone_offsets.iter().all(|o| closure.contains(o)),
+                "{selector:?} must carry the edge tombstone"
+            );
+        }
+    }
+
+    /// A graph over 400 KB, so some bytes lie outside every sampled block.
+    fn large_graph() -> Graph {
+        let mut graph = Graph::new();
+        for n in 0..3000 {
+            let name = format!("symbol_number_{n:05}");
+            graph.push(GraphRecord::syntax_node(
+                sym_id("src/big.rs", &name),
+                NodeKind::Symbol,
+                "src/big.rs".to_owned(),
+                span(n + 1, n + 2),
+                name.clone(),
+                "rust",
+                format!("fn {name}"),
+            ));
+        }
+        graph
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_length_edit_with_restored_mtime_is_stale() {
+        let (_dir, path) = write_indexed(&large_graph());
+        let meta = fs::metadata(&path).expect("meta");
+        let mtime = meta.modified().expect("mtime");
+        let mut bytes = fs::read(&path).expect("read");
+        let ranges = sample_ranges(bytes.len() as u64);
+        let at = (bytes.len() / 3..bytes.len())
+            .find(|p| {
+                let pos = *p as u64;
+                ranges
+                    .iter()
+                    .all(|(o, n)| pos < *o || pos >= *o + *n as u64)
+                    && bytes[*p].is_ascii_digit()
+            })
+            .expect("an unsampled digit");
+        bytes[at] = if bytes[at] == b'7' { b'8' } else { b'7' };
+        fs::write(&path, &bytes).expect("edit in place");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_modified(mtime)
+            .expect("restore mtime");
+        assert!(matches!(LazyGraphIndex::open(&path), Err(LoadError::Stale)));
     }
 }

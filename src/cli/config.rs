@@ -80,6 +80,7 @@ fn resolve_query_data_dir_with(
     }
 }
 
+#[cfg(feature = "embeddings")]
 /// Resolve the store for a lane that needs one (no `--graph` form): the flag,
 /// else the pinned `data_dir`, else an error that names both.
 pub(crate) fn require_query_data_dir(lane: &str, data_dir: Option<PathBuf>) -> Result<PathBuf> {

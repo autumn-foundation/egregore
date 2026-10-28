@@ -124,7 +124,9 @@ pub(crate) fn load_drift_records(graph: &Path, limit: usize) -> Result<Vec<Graph
             return None;
         }
         let drifts = index.hydrate(&kind).ok()??;
-        let mut selectors = vec![kind.clone()];
+        // Every `Repository` node, so owner and display attribution see the
+        // same repositories (and schema versions) as a cold read.
+        let mut selectors = vec![kind.clone(), Selector::ByKind("Repository".to_owned())];
         for record in query::largest_semantic_drifts(&drifts, limit) {
             selectors.push(Selector::Anchored(record.id().to_owned()));
             if let GraphRecord::Node {
@@ -133,6 +135,7 @@ pub(crate) fn load_drift_records(graph: &Path, limit: usize) -> Result<Vec<Graph
             } = record
             {
                 selectors.push(Selector::Lineage(drift.target_record_id.clone()));
+                selectors.push(Selector::Lineage(drift.prior_record_id.clone()));
             }
         }
         index.hydrate_many(&selectors).ok()?

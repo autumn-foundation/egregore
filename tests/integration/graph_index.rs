@@ -361,6 +361,18 @@ fn drift_graph() -> Graph {
     );
     let first_drift = drifts[0].id().to_owned();
     let edge_target = sym_id("src/b.rs", "beta");
+    // One drift whose recorded target has no owner, but whose prior record
+    // does: attribution falls through to `prior_record_id`.
+    let orphan = symbol(&mut graph, "src/orphan.rs", "orphan", (1, 2));
+    let mut drifts = drifts;
+    if let GraphRecord::Node {
+        semantic_drift: Some(drift),
+        ..
+    } = &mut drifts[1]
+    {
+        drift.target_record_id = orphan;
+        drift.prior_record_id = sym_id("src/a.rs", "alpha");
+    }
     for drift in drifts {
         graph.push(drift);
     }

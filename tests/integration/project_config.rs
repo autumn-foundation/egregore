@@ -1043,28 +1043,50 @@ fn semantic_lanes_without_any_store_name_the_remedy() {
 }
 
 /// Issue #509: `eg query cost` reads the pinned store like the other lanes.
+/// A cost row in the pinned store proves that store was the one read.
 #[test]
 #[cfg(feature = "embedded-aletheiadb")]
 fn query_cost_reads_config_data_dir() {
+    use aletheia_egregore::ir::{COST_USAGE_DERIVATION_TRANSCRIPT, GraphRecord, NodeKind};
+
     let temp = tempfile::tempdir().expect("temp dir");
     write_config(temp.path(), "data_dir = \"pinned-store\"\n");
-    let graph_path = temp.path().join("graph.jsonl");
+    let mut cost = GraphRecord::node(
+        "agent_memory:v1:pinned-cost".to_owned(),
+        NodeKind::CostUsage,
+        None,
+        None,
+        None,
+        "cost".to_owned(),
+    )
+    .with_domain("agent_memory", 1);
+    if let GraphRecord::Node { text, .. } = &mut cost {
+        *text = Some(
+            serde_json::json!({
+                "derivation": COST_USAGE_DERIVATION_TRANSCRIPT,
+                "prompt_tokens": 4242,
+            })
+            .to_string(),
+        );
+    }
+    let graph_path = temp.path().join("cost.jsonl");
+    std::fs::write(
+        &graph_path,
+        format!("{}\n", serde_json::to_string(&cost).expect("serialize")),
+    )
+    .expect("write graph");
     eg_in(temp.path())
-        .arg("scan")
-        .arg(fixture_repo())
-        .arg("--out")
-        .arg(&graph_path)
-        .assert()
-        .success();
-    eg_in(temp.path())
-        .args(["ingest"])
+        .arg("ingest")
         .arg(&graph_path)
         .args(["--adapter", "embedded"])
         .assert()
         .success();
+    assert!(temp.path().join("pinned-store").exists());
+    assert!(!temp.path().join(".egregore").exists());
     eg_in(temp.path())
         .args(["query", "cost", "--format", "text"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("cost: 0 row(s)"));
+        .stdout(predicate::str::contains("agent_memory:v1:pinned-cost"))
+        .stdout(predicate::str::contains("prompt=4242"));
 }

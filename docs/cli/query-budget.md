@@ -47,9 +47,9 @@ a pinned transaction time (`2026-01-01T00:00:00Z`).
   disjoint repository identities (`<override>-sNN`) and concatenates the
   copies into the scaled store — so the 1x store is exactly the first slice
   of the 10x store, and record IDs never collide. Copies after the first also
-  get disjoint symbol names (`__sNN` suffix) and paths (`sNN/` prefix). Then a
-  by-name or by-path query has the same answer size at every store size, and
-  the ratio measures lookup cost alone.
+  get disjoint symbol names (`__sNN` suffix) and paths (`sNN/` prefix). A
+  by-name or by-path query then has the same answer size at every store size.
+  The ratio shows how lookup cost grows with store size, not answer size.
 - Setup also builds the sidecar index (`eg index`) for each store, untimed.
   Without an index a lookup is a linear scan of the whole store.
 - A plain deterministic scan produces no `SemanticDrift` nodes (drift is an
@@ -153,16 +153,22 @@ scale factor 10).
 - **Scaling assertion (cold symbol): ratio 0.95x vs 2.0x ceiling — PASS.**
 - All twelve cells are within the advisory budgets.
 
-### Before the fix (history)
+### Before the fix
 
-Measured 2026-09-30 and re-measured on this sandbox before the fix: the query
-path read the whole store per invocation, so latency grew linearly with record
-count (symbol cold: 661ms at 1x, 6225ms at 10x; ratio 9.4x). Two causes: a
-cold scan of every line, and a sidecar index (issue #447) that was not built
-for the benchmark stores and still cost `O(n)` (whole-graph read, whole-graph
-BLAKE3, JSON parse of the tables). The fix: index format 2 (binary tables read
-in place, cheap validity check), the drift lane on the index, and the index
-built in benchmark setup.
+The query path read the whole store for each query, so latency grew with record
+count. Symbol cold took 661ms at 1x and 6225ms at 10x (ratio 9.4x). The sidecar
+index (issue #447) also cost `O(n)` per query. The fix has three parts: index
+format 2 (binary tables read in place), the drift lane on the index, and the
+index built in benchmark setup.
 
-Do **not** "fix" a future regression by raising `--max-ratio` or shrinking the
-corpus without a product decision.
+### What this gate does not show
+
+- `eg scan` and `eg ingest` build no index. Run `eg index` to get the fast
+  path. Without it, a lookup is a linear scan.
+- A history or corpus store (`scan-history`) always cold-scans. The benchmark
+  corpus is a plain scan, so the gate does not cover that case.
+- The benchmark names are unique. A common name (`new`, `fmt`) matches many
+  symbols, and its answer grows with the store.
+- The index setup is not timed.
+
+Do not raise `--max-ratio` or shrink the corpus without a product decision.

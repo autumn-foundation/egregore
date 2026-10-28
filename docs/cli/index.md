@@ -44,16 +44,19 @@ The index is written to `<graph>.idx` next to the graph (`foo.jsonl` →
 `foo.jsonl.idx`). It is a binary file (format version 2):
 
 - **Header:** magic `EGIX`, `format_version` (`u32`), graph byte length (`u64`),
-  graph BLAKE3, graph modification time (`u64`, ns), a sample fingerprint
-  (BLAKE3 of the length and 66 sampled 4 KiB blocks), and the
-  `has_temporal_history` flag (see below).
+  graph BLAKE3, a stamp of the graph file's times and identity (`u64`), a
+  sample fingerprint (BLAKE3 of the length and 66 sampled 4 KiB blocks), and
+  the `has_temporal_history` flag (see below).
 - **Tables:** six sorted tables (record ids, tombstone `deleted_id`s, node
   names, repo-relative paths, node kinds, edge adjacency). Each maps a key to
   line-start byte offsets.
 
 A query reads the tables in place with binary search. It does not read the
-whole graph and does not parse the index. Its index cost is `O(log n)` reads,
-so it does not grow with the graph (issue #120).
+whole graph and does not parse the index. A lookup needs about log n small
+reads, so its cost stays almost flat as the graph grows (issue #120).
+
+Two builds over the same file give the same bytes. The header holds a stamp of
+the file, so a copy of the file gives different bytes.
 
 The `has_temporal_history` flag is `true` when the indexed graph is a
 **history / corpus store**: any record carries temporal provenance, or a
@@ -65,18 +68,29 @@ index. Repeated builds of an unchanged graph produce a byte-identical `.idx`.
 
 ## Content-addressed validity + transparent fallback
 
-An index is used for a query only when it is present, the magic matches, the
-`format_version` equals the version this build understands, and it matches the
-graph. A query checks the match cheaply first: same length, same modification
-time, and same sample fingerprint. When only the modification time differs (a
-copy or a touch), the full BLAKE3 decides. Any mismatch — absent, corrupt,
-truncated, an unknown version, or a changed graph — makes the query lane
-transparently cold-scan and return the current answer. The query path never
-fails because of the index and never writes it.
+A query uses an index only when the index is present, its magic and
+`format_version` match, and it matches the graph. The query checks the match in
+two steps:
 
-Honest limit: the cheap check trusts an unchanged length, time, and sample. An
-in-place edit that keeps the length, restores the time, and misses every sampled
-block would not be seen. Run `eg index` again after any edit to the graph.
+1. Cheap check: same length, same file stamp, and same sample fingerprint.
+2. Full check, when only the stamp differs (a copy or a touch): the full
+   BLAKE3 of the graph.
+
+On Unix the stamp includes the inode and the change time, so a copy that keeps
+the modification time (`cp -p`) is still seen.
+
+Any mismatch makes the query lane cold-scan and return the current answer. A
+mismatch is an absent, corrupt, truncated, or unknown-version index, or a
+changed graph. The query path never fails because of the index and never writes
+it.
+
+Limits:
+
+- The cheap check can miss a change that keeps the length, the stamp, and every
+  sampled block. Run `eg index` again after you edit a graph.
+- The tables have no checksum. A failed read makes the query cold-scan. A
+  damaged key can still give a missing match. Run `eg index` again if you
+  suspect damage.
 
 `eg index` refuses (exit 2, machine-readable `index_build_error`) any graph a
 cold load would also reject (a parse error or an unknown schema version) and

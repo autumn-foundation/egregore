@@ -279,4 +279,42 @@ mod tests {
         assert_eq!(out.total_symbol_count, 2);
         assert!(!out.truncated);
     }
+
+    fn temporal(commit: &str) -> crate::ir::TemporalMetadata {
+        crate::ir::TemporalMetadata {
+            git_commit: commit.to_owned(),
+            git_parent_commits: Vec::new(),
+            valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            author_time: None,
+            observed_at: "2026-01-01T00:00:00Z".to_owned(),
+            valid_time_source: None,
+        }
+    }
+
+    #[test]
+    fn temporal_snapshots_of_one_id_are_all_kept() {
+        let records = vec![
+            symbol("s1", "f", 3).with_temporal(temporal("c1")),
+            symbol("s1", "f", 9).with_temporal(temporal("c2")),
+        ];
+        assert_eq!(report(&records).total_symbol_count, 2);
+    }
+
+    #[test]
+    fn tombstoned_symbol_is_not_ranked() {
+        let records = vec![
+            symbol("s1", "f", 3),
+            symbol("s2", "g", 5),
+            GraphRecord::Tombstone {
+                id: "tomb:s1".to_owned(),
+                schema_version: 1,
+                deleted_id: "s1".to_owned(),
+                summary: "gone".to_owned(),
+                producer: None,
+            },
+        ];
+        let out = report(&records);
+        assert_eq!(out.total_symbol_count, 1);
+        assert_eq!(out.symbols[0].symbol_record_id, "s2");
+    }
 }

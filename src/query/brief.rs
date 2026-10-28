@@ -912,6 +912,16 @@ mod tests {
     }
 
     #[test]
+    fn changed_symbols_are_ordered_by_record_id() {
+        let mut records = sample_records();
+        records.push(symbol_node("sym-0", "early_fn", "src/a.rs", 10, 11));
+        let index = RepositoryIndex::build(&records);
+        let brief = brief_working_set(&records, &sample_diff(), &index, None);
+        let ids: Vec<&str> = brief.changed_symbols.iter().map(|s| s.record_id).collect();
+        assert_eq!(ids, ["sym-0", "sym-1"]);
+    }
+
+    #[test]
     fn unindexed_paths_are_reported_not_dropped() {
         let records = sample_records();
         let index = RepositoryIndex::build(&records);
