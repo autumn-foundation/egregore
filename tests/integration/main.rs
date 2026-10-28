@@ -11,6 +11,7 @@ mod agent_sessions;
 mod antigravity;
 mod asof_file_symbols;
 mod author_attribution_doc;
+mod autoindex;
 mod brief;
 mod bundle;
 mod capture_bench;

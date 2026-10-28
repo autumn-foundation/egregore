@@ -3,6 +3,8 @@
 
 # Generated egregore stores and graph snapshots
 *.jsonl
+# Sidecar indexes built next to graph snapshots (eg scan / ingest / index)
+*.jsonl.idx
 !tests/fixtures/**/*.jsonl
 # Checked-in evaluation corpora (seeds for reproducible recall metrics)
 !corpus/*.jsonl

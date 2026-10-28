@@ -139,7 +139,11 @@ pub(crate) fn embedded_write_open_error(data_dir: &Path, error: AdapterError) ->
     anyhow::anyhow!("{error}")
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::fn_params_excessive_bools
+)]
 pub(crate) fn ingest(
     graph: &Path,
     adapter: IngestAdapter,
@@ -156,6 +160,8 @@ pub(crate) fn ingest(
     #[cfg(feature = "embedded-aletheiadb")] passphrase_env: Option<&str>,
     // Dangling cross-domain evidence citation policy (issue #241).
     dangling_citation_policy: DanglingCitationPolicy,
+    // Skip the producer-side sidecar build for the input graph (`--no-index`).
+    no_index: bool,
 ) -> Result<()> {
     // Resolve the data directory: explicit `--data-dir` > `egregore.toml` >
     // `.egregore` (issue #261). Discovery fails fast on a malformed config
@@ -317,6 +323,9 @@ pub(crate) fn ingest(
             println!("failed: {}", response.failed);
             println!("idempotent: {}", response.idempotent);
             if response.failed == 0 {
+                // Producer-side sidecar build (issue #447) for the input
+                // graph, as on the fall-through path below.
+                auto_build_sidecar_index_unless(graph, no_index);
                 return Ok(());
             }
             for failure in &response.failures {
@@ -338,6 +347,19 @@ pub(crate) fn ingest(
     println!("failed: {}", report.failed);
 
     if report.is_success() {
+        // Producer-side sidecar build (issue #447): the ingested graph is
+        // the artifact targeted `--graph` queries read, and ingest is the
+        // step that validated and consumed it — so (re)build its
+        // `<graph>.idx` here, covering graphs produced elsewhere or whose
+        // sidecar went stale, instead of leaving queries to cold-scan
+        // until someone runs `eg index` by hand. This applies to every
+        // adapter, dry-run included: dry-run writes no store, but the
+        // graph remains the queryable artifact and validating it is
+        // exactly what dry-run is for. The embedded store's own indexes
+        // (`sink.persist_indexes()` above) are a separate mechanism.
+        // Best-effort: a build failure warns, never fails an ingest whose
+        // store writes already succeeded. `--no-index` opts out.
+        auto_build_sidecar_index_unless(graph, no_index);
         Ok(())
     } else {
         for failure in &report.failures {

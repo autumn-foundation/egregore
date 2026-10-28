@@ -14,6 +14,17 @@ eg ingest graph.jsonl --adapter daemon --data-dir .egregore --idempotency-key <k
 through a running daemon). Concurrency rules for the embedded/daemon writers are
 in [`embedded-concurrency.md`](embedded-concurrency.md).
 
+## Sidecar index auto-build (issue #447)
+
+After a successful ingest — every adapter, `dry-run` included — `eg ingest`
+(re)builds the sidecar index `<graph>.idx` for its **input graph**, so
+targeted `eg query … --graph` lanes seek instead of cold-scanning the whole
+JSONL (see [`index.md`](index.md)). This covers graphs produced elsewhere
+or whose sidecar went stale. It is distinct from the embedded store's own
+indexes, which ingest persists via `persist_indexes`. The build is
+best-effort: a failure prints a one-line warning on stderr and never fails
+an ingest whose writes already succeeded. Pass `--no-index` to skip it.
+
 ## `--embed` and the vector-index model identity (issue #104)
 
 `--embed` (embedded adapter only) generates dense embeddings and enables the

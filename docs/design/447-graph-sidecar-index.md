@@ -88,6 +88,16 @@ index, and hash-validated hydration never meets an unknown-version line). The
 write is atomic: `<graph>.idx.tmp` then `fs::rename`. Auto-build on query is OFF
 for v1.
 
+> **Amendment (producer-side auto-build):** the "only writer" rule above
+> described v1 as shipped. The default `scan → ingest` / `scan → query`
+> flows never ran `eg index`, so in practice no sidecar existed and every
+> targeted query cold-scanned. The writers are now the producer commands:
+> `eg scan`, `eg scan-history`, and `eg ingest` build the sidecar
+> automatically through the same build+write path (best-effort, warning
+> on failure, `--no-index` opt-out), and `eg index` remains the explicit
+> rebuild. Auto-build on *query* is still OFF — query lanes never write.
+> See `docs/cli/index.md` for the current contract.
+
 ### Selector + hydration closure
 
 `Selector { Whole, ById(String), ByName(String), ByPath(String), ByKind(String) }`.

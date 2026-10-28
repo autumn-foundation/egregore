@@ -11,10 +11,12 @@
 //! byte-identical with the cold scan, so every migrated lane's stdout and exit
 //! code are unchanged (proven by differential tests). Validity is
 //! content-addressed on the graph file's BLAKE3 + length; any mismatch makes the
-//! caller transparently fall back to the cold scan. `eg index` is the only
-//! writer. This is a SEPARATE mechanism from the scan-time incremental cache
-//! (`crate::incremental`); it shares that module's versioned self-invalidation
-//! discipline but none of its code.
+//! caller transparently fall back to the cold scan. Writers are the producer
+//! commands — `eg scan`, `eg scan-history`, and `eg ingest` build the sidecar
+//! automatically (unless `--no-index`), and `eg index` rebuilds it explicitly;
+//! query lanes never write it. This is a SEPARATE mechanism from the scan-time
+//! incremental cache (`crate::incremental`); it shares that module's
+//! versioned self-invalidation discipline but none of its code.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -105,9 +107,10 @@ pub struct GraphIndexBody {
     /// for a history store (see `load_records_from_jsonl_selected`). A plain
     /// current-tree `scan` graph carries no temporal records, so this stays
     /// `false` and the #447 fast path applies. `#[serde(default)]` keeps the
-    /// body format tolerant (the field is additive within v1); `eg index` — the
-    /// only writer — always emits it, and every index freshly built by this
-    /// binary carries the correct value.
+    /// body format tolerant (the field is additive within v1); every writer
+    /// (`eg scan` / `eg scan-history` / `eg ingest` / `eg index`) always
+    /// emits it, and every index freshly built by this binary carries the
+    /// correct value.
     #[serde(default)]
     pub has_temporal_history: bool,
 }
@@ -294,7 +297,8 @@ impl GraphIndex {
     }
 
     /// Writes the index to `index_path` atomically (`.tmp` + rename), so a reader
-    /// never observes a torn index. `eg index` is the only caller.
+    /// never observes a torn index. Called by the shared CLI build path
+    /// (`eg index` and the producer commands' automatic builds).
     ///
     /// # Errors
     ///

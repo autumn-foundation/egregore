@@ -110,6 +110,12 @@ pub(crate) struct ResolvedScanArgs {
     pub from_rev: Option<String>,
     /// Effective `scan-history --to` (issue #256).
     pub to_rev: Option<String>,
+    /// Effective `--no-index`: when `false` (the default), `scan` /
+    /// `scan-history` build the `<out>.idx` sidecar after writing the graph
+    /// (issue #447 producer-side auto-build). Internal callers whose graph
+    /// is a throwaway intermediate (`eg init`'s temp-dir graphs) set this
+    /// to `true`.
+    pub no_index: bool,
 }
 
 /// Resolve `eg scan` / `eg scan-history` flags against the discovered config.
@@ -134,6 +140,7 @@ pub(crate) fn resolve_scan_args(
         since: None,
         from_rev: None,
         to_rev: None,
+        no_index: false,
     }
 }
 

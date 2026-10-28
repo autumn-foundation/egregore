@@ -368,6 +368,12 @@ pub(crate) enum Commands {
         /// Keep source-embedded secrets in raw form instead of redacting them.
         #[arg(long)]
         raw_literals: bool,
+        /// Do not build the `<out>.idx` sidecar index after writing the
+        /// graph. By default the sidecar is built so targeted
+        /// `eg query … --graph` lanes seek instead of cold-scanning the
+        /// whole JSONL (issue #447).
+        #[arg(long)]
+        no_index: bool,
     },
     /// Replay Git history and write temporal graph JSONL.
     ScanHistory {
@@ -414,6 +420,13 @@ pub(crate) enum Commands {
         /// resume frontier.
         #[arg(long)]
         resume_from: Option<PathBuf>,
+        /// Do not build the `<out>.idx` sidecar index after writing the
+        /// graph. By default the sidecar is built so targeted
+        /// `eg query … --graph` lanes seek instead of cold-scanning the
+        /// whole JSONL (issue #447). A zero-new-commit `--resume-from`
+        /// run writes no graph and builds no sidecar either way.
+        #[arg(long)]
+        no_index: bool,
     },
     /// Extract runtime log signatures from a captured log file (issues #319 / #320).
     ///
@@ -1089,9 +1102,10 @@ pub(crate) enum Commands {
     /// lanes seek to the records they need instead of deserializing the whole
     /// file. The index is content-addressed on the graph's BLAKE3 + length: a
     /// query lane transparently cold-scans when the index is absent, stale, or
-    /// corrupt, so results are byte-identical with or without it. This command
-    /// is the only writer of the index and refuses (exit 2) any graph a cold
-    /// load would also reject. See `docs/cli/index.md`.
+    /// corrupt, so results are byte-identical with or without it. `eg scan`,
+    /// `eg scan-history`, and `eg ingest` build the index automatically;
+    /// this command rebuilds it explicitly and refuses (exit 2) any graph a
+    /// cold load would also reject. See `docs/cli/index.md`.
     Index {
         /// Graph JSONL path to index.
         graph: PathBuf,
@@ -1220,6 +1234,13 @@ pub(crate) enum Commands {
         /// the policy is forwarded to the daemon in the ingest request.
         #[arg(long, value_enum, default_value_t = DanglingCitationPolicy::Quarantine)]
         dangling_citation_policy: DanglingCitationPolicy,
+        /// Do not (re)build the `<graph>.idx` sidecar index for the input
+        /// graph. By default a successful ingest builds it (every adapter,
+        /// dry-run included) so targeted `eg query … --graph` lanes seek
+        /// instead of cold-scanning the whole JSONL (issue #447). This is
+        /// the graph sidecar, not the embedded store's own indexes.
+        #[arg(long)]
+        no_index: bool,
     },
     /// Export every persisted record from an embedded store as canonical JSONL.
     ///
@@ -6714,8 +6735,10 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             out,
             repo_id_override,
             raw_literals,
+            no_index,
         } => {
-            let args = resolve_scan_args(repo_id_override, raw_literals);
+            let mut args = resolve_scan_args(repo_id_override, raw_literals);
+            args.no_index = no_index;
             scan(&repo_path, &out, &args)
         }
         Commands::ScanHistory {
@@ -6728,12 +6751,14 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             from,
             to,
             resume_from,
+            no_index,
         } => {
             let mut args = resolve_scan_args(repo_id_override, raw_literals);
             args.max_commits = max_commits;
             args.since = since;
             args.from_rev = from;
             args.to_rev = to;
+            args.no_index = no_index;
             scan_history(&repo_path, &out, &args, resume_from.as_deref())
         }
         Commands::Config { action } => match action {
@@ -7030,6 +7055,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             #[cfg(feature = "embedded-aletheiadb")]
             passphrase_env,
             dangling_citation_policy,
+            no_index,
         } => ingest(
             &graph,
             adapter,
@@ -7050,6 +7076,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             #[cfg(feature = "embedded-aletheiadb")]
             passphrase_env.as_deref(),
             dangling_citation_policy,
+            no_index,
         ),
         Commands::Export {
             format,
