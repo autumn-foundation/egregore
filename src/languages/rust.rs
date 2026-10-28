@@ -71,8 +71,11 @@ pub fn extract_file(
 ///
 /// # Errors
 ///
-/// Returns an error when the Rust grammar cannot be loaded, or Tree-sitter
-/// cannot produce a syntax tree.
+/// Returns an error when the Rust grammar cannot be loaded, Tree-sitter
+/// cannot produce a syntax tree, or the parse root is not `source_file`
+/// (a wholly unparseable file, e.g. a starter template with
+/// `{{placeholder}}` tokens — reported as [`CodegraphError::Parse`] so the
+/// scan funnel can skip the file with a diagnostic instead of aborting).
 pub fn extract_file_source(
     file: &SourceFile,
     source: &str,
@@ -97,6 +100,21 @@ pub fn extract_file_source(
         .ok_or_else(|| CodegraphError::Parse {
             path: file.path.clone(),
         })?;
+    // A wholly unparseable file (e.g. a starter template carrying
+    // `{{crate_name}}` placeholders) makes Tree-sitter return an `ERROR`
+    // root instead of `source_file`. That is a defined Parse failure, not
+    // a panic: in debug builds this input used to trip the
+    // `debug_assert_eq!` in `file_level_cfg_gates` and abort the whole
+    // scan, and in release builds it walked the ERROR root and emitted
+    // undefined partial output. A valid `source_file` root that merely
+    // CONTAINS error nodes (partially broken syntax) is unaffected: it
+    // still extracts exactly as before.
+    let root = tree.root_node();
+    if root.kind() != "source_file" {
+        return Err(CodegraphError::Parse {
+            path: file.path.clone(),
+        });
+    }
 
     let mut extractor = RustExtractor::new(
         file,
@@ -104,9 +122,9 @@ pub fn extract_file_source(
         repository_id,
         graph,
         source,
-        file_level_cfg_gates(tree.root_node(), source),
+        file_level_cfg_gates(root, source),
     );
-    extractor.walk(tree.root_node());
+    extractor.walk(root);
     extractor.resolve_pending_impl_edges();
     extractor.finalize_use_imports();
     extractor.emit_reference_edges();
@@ -4226,7 +4244,16 @@ fn module_inner_cfg_gates(node: Node<'_>, source: &str) -> Vec<String> {
 /// body) apply to the block expression, a different semantic, and stay out
 /// of scope.
 fn file_level_cfg_gates(root: Node<'_>, source: &str) -> Vec<String> {
-    debug_assert_eq!(root.kind(), "source_file");
+    // Total over root kinds: a non-`source_file` root (an `ERROR` root from
+    // a wholly unparseable file) has no file-level inner attributes by
+    // definition, so it yields no gates. `extract_file_source` rejects such
+    // roots with a Parse error before this is reached on the scan path;
+    // keeping this function total means no present or future caller can
+    // panic on the same input (this was a `debug_assert_eq!` that aborted
+    // whole-repo scans in debug builds).
+    if root.kind() != "source_file" {
+        return Vec::new();
+    }
     let mut gates = Vec::new();
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
@@ -6785,6 +6812,48 @@ mod tests {
             .iter()
             .find(|r| matches!(r, GraphRecord::Node { kind, .. } if *kind == want))
             .expect("node of requested kind present")
+    }
+
+    /// A wholly unparseable file — Tree-sitter returns an `ERROR` root
+    /// instead of `source_file` (here a starter-template
+    /// `use {{crate_name}}::…` inside a function body) — is a defined
+    /// `CodegraphError::Parse` failure, never a panic: in debug builds this
+    /// input used to trip the `debug_assert_eq!` in `file_level_cfg_gates`
+    /// and abort the whole scan; in release builds it walked the ERROR root
+    /// and emitted undefined partial output.
+    #[test]
+    fn error_root_source_returns_parse_error() {
+        let file = SourceFile {
+            path: PathBuf::from("src/bad.rs"),
+            repo_relative_path: "src/bad.rs".to_owned(),
+        };
+        let mut graph = Graph::default();
+        let result = extract_file_source(
+            &file,
+            "async fn f() {\n    use {{crate_name}}::schema::comments;\n",
+            "file-id",
+            "repo-id",
+            &mut graph,
+        );
+        assert!(
+            matches!(result, Err(CodegraphError::Parse { .. })),
+            "an ERROR-root source must return a Parse error, got: {result:?}"
+        );
+    }
+
+    /// A valid `source_file` root that merely CONTAINS error nodes
+    /// (partially broken syntax) is not the ERROR-root case: extraction
+    /// proceeds and the intact items are still extracted.
+    #[test]
+    fn source_file_root_with_error_nodes_still_extracts() {
+        let graph = extract_records("pub fn ok() -> u32 { 1 }\npub fn broken( {\n");
+        assert!(
+            graph.records().iter().any(|r| matches!(
+                r,
+                GraphRecord::Node { kind: NodeKind::Symbol, name: Some(name), .. } if name.ends_with("ok")
+            )),
+            "the intact symbol of a partially broken file must be extracted"
+        );
     }
 
     #[test]

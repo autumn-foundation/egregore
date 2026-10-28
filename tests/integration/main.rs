@@ -205,6 +205,7 @@ mod transitive_callees;
 mod transitive_callers;
 mod trust_class;
 mod typescript_scan;
+mod unparseable_scan;
 mod validate;
 mod verify_scan;
 mod watch;
