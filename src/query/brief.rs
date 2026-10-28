@@ -13,6 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::liveness::Liveness;
 use super::{
     ContextLinkedItem, ContextObservation, FailureHistoryContext, FailureTargetKind,
     RepositoryIndex, ResolvedFailureTarget, TrustClass, TrustIndex, failure_history_context,
@@ -379,6 +380,7 @@ pub fn brief_working_set<'a>(
     repo_scope: Option<&str>,
 ) -> WorkingSetBrief<'a> {
     let trust = TrustIndex::build(records);
+    let liveness = Liveness::new(records);
     let by_id: BTreeMap<&str, &'a GraphRecord> =
         records.iter().map(|record| (record.id(), record)).collect();
 
@@ -387,22 +389,37 @@ pub fn brief_working_set<'a>(
         ..Default::default()
     };
 
-    // Live, in-scope `File` records by repo-relative path.
+    // Live, in-scope `File` and `Symbol` records. Latest write wins, as in the
+    // embedded read: a tombstoned record is gone and a rewritten one is
+    // represented by its newest version only.
     let mut files_by_path: BTreeMap<&str, &str> = BTreeMap::new();
-    for record in records {
+    let mut symbols_by_path: BTreeMap<&str, Vec<&'a GraphRecord>> = BTreeMap::new();
+    for (index, record) in records.iter().enumerate() {
         let GraphRecord::Node {
             id,
-            kind: NodeKind::File,
+            kind,
             repo_relative_path: Some(path),
+            temporal,
             ..
         } = record
         else {
             continue;
         };
-        if !in_scope(repo_index, repo_scope, id) {
+        if !matches!(kind, NodeKind::File | NodeKind::Symbol)
+            || liveness.deleted(id)
+            || (temporal.is_none() && !liveness.is_latest_node_version(id, index))
+            || !in_scope(repo_index, repo_scope, id)
+        {
             continue;
         }
-        files_by_path.entry(path.as_str()).or_insert(id.as_str());
+        if *kind == NodeKind::File {
+            files_by_path.entry(path.as_str()).or_insert(id.as_str());
+        } else {
+            symbols_by_path
+                .entry(path.as_str())
+                .or_default()
+                .push(record);
+        }
     }
 
     // The failure/linkage anchors: resolved file IDs plus intersected symbol IDs.
@@ -439,10 +456,14 @@ pub fn brief_working_set<'a>(
 
         // Only symbols whose recorded `HEAD` spans intersect the old-side
         // changed ranges are in the working set.
-        for record in records {
+        let candidates = symbols_by_path
+            .get(changed.path.as_str())
+            .into_iter()
+            .chain(renamed_from.and_then(|from| symbols_by_path.get(from)))
+            .flatten();
+        for record in candidates {
             let GraphRecord::Node {
                 id: symbol_id,
-                kind: NodeKind::Symbol,
                 name,
                 repo_relative_path: Some(symbol_path),
                 span,
@@ -451,14 +472,6 @@ pub fn brief_working_set<'a>(
             else {
                 continue;
             };
-            if !in_scope(repo_index, repo_scope, symbol_id) {
-                continue;
-            }
-            let path_matches =
-                symbol_path == &changed.path || renamed_from == Some(symbol_path.as_str());
-            if !path_matches {
-                continue;
-            }
             if !span_intersects_ranges(span.as_ref(), &changed.old_ranges) {
                 continue;
             }
@@ -846,6 +859,66 @@ mod tests {
         assert_eq!(brief.changed_symbols.len(), 1);
         assert_eq!(brief.changed_symbols[0].record_id, "sym-1");
         assert!(brief.unindexed.is_empty());
+    }
+
+    fn tombstone(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("tomb:{deleted_id}"),
+            schema_version: 1,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    #[test]
+    fn tombstoned_symbol_is_not_a_changed_anchor() {
+        let mut records = sample_records();
+        records.push(tombstone("sym-1"));
+        let index = RepositoryIndex::build(&records);
+        let brief = brief_working_set(&records, &sample_diff(), &index, None);
+        assert!(brief.changed_symbols.is_empty());
+    }
+
+    #[test]
+    fn tombstoned_file_is_reported_unindexed() {
+        let mut records = sample_records();
+        records.push(tombstone("file-1"));
+        let index = RepositoryIndex::build(&records);
+        let brief = brief_working_set(&records, &sample_diff(), &index, None);
+        assert!(brief.changed_files.is_empty());
+        assert_eq!(brief.unindexed.len(), 1);
+        assert!(brief.observations.is_empty(), "no anchor, no evidence");
+    }
+
+    #[test]
+    fn reingested_symbol_uses_its_latest_span() {
+        // Old version overlaps the hunk; the latest version moved away.
+        let mut records = sample_records();
+        records.push(symbol_node("sym-1", "touched_fn", "src/a.rs", 50, 60));
+        let index = RepositoryIndex::build(&records);
+        let brief = brief_working_set(&records, &sample_diff(), &index, None);
+        assert!(brief.changed_symbols.is_empty());
+    }
+
+    #[test]
+    fn symbol_revived_after_tombstone_is_live() {
+        let mut records = sample_records();
+        records.push(tombstone("sym-1"));
+        records.push(symbol_node("sym-1", "touched_fn", "src/a.rs", 9, 15));
+        let index = RepositoryIndex::build(&records);
+        let brief = brief_working_set(&records, &sample_diff(), &index, None);
+        assert_eq!(brief.changed_symbols.len(), 1);
+    }
+
+    #[test]
+    fn changed_symbols_are_ordered_by_record_id() {
+        let mut records = sample_records();
+        records.push(symbol_node("sym-0", "early_fn", "src/a.rs", 10, 11));
+        let index = RepositoryIndex::build(&records);
+        let brief = brief_working_set(&records, &sample_diff(), &index, None);
+        let ids: Vec<&str> = brief.changed_symbols.iter().map(|s| s.record_id).collect();
+        assert_eq!(ids, ["sym-0", "sym-1"]);
     }
 
     #[test]

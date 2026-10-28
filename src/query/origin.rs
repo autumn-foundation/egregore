@@ -166,6 +166,15 @@ fn resolve_commit_prefix<'a>(
 /// parent links (rather than requiring `Commit` nodes) keeps shallow or
 /// partial stores honest.
 fn ancestor_closure<'a>(records: &'a [GraphRecord], anchor: &'a str) -> BTreeSet<&'a str> {
+    ancestors_of(records, std::iter::once(anchor))
+}
+
+/// The anchors plus every commit reachable from them through
+/// `git_parent_commits` links.
+fn ancestors_of<'a>(
+    records: &'a [GraphRecord],
+    anchors: impl IntoIterator<Item = &'a str>,
+) -> BTreeSet<&'a str> {
     let mut parents: BTreeMap<&'a str, Vec<&'a str>> = BTreeMap::new();
     for record in records {
         let temporal = match record {
@@ -183,7 +192,7 @@ fn ancestor_closure<'a>(records: &'a [GraphRecord], anchor: &'a str) -> BTreeSet
             .extend(temporal.git_parent_commits.iter().map(String::as_str));
     }
     let mut seen: BTreeSet<&'a str> = BTreeSet::new();
-    let mut stack = vec![anchor];
+    let mut stack: Vec<&'a str> = anchors.into_iter().collect();
     while let Some(sha) = stack.pop() {
         if seen.insert(sha) {
             if let Some(ps) = parents.get(sha) {
@@ -217,6 +226,20 @@ fn as_of_commit_set<'a>(
         }
     }
     in_scope
+}
+
+/// True when a record belongs to the pinned commit set. Records with no
+/// temporal anchor (tombstones, non-temporal edges) stay in every view.
+fn record_in_commit_set(record: &GraphRecord, set: &BTreeSet<&str>) -> bool {
+    match record {
+        GraphRecord::Node {
+            temporal: Some(t), ..
+        }
+        | GraphRecord::Edge {
+            temporal: Some(t), ..
+        } => set.contains(t.git_commit.as_str()),
+        _ => true,
+    }
 }
 
 /// Trace a symbol to its introducing commit and link the project records.
@@ -253,12 +276,31 @@ pub fn symbol_origin<'a>(
         }
     };
 
-    let events = symbol_lifeline(records, query, repo_id).map_err(|error| match error {
-        LifelineError::UnknownSymbol { query } => OriginError::UnknownSymbol { query },
-        LifelineError::AmbiguousSymbol { query, candidates } => {
-            OriginError::AmbiguousSymbol { query, candidates }
-        }
-    })?;
+    // Pin BEFORE resolving: a same-named symbol that exists only after the
+    // pin must not make the name ambiguous, and the introduction must come
+    // from the pinned ancestry, not from another branch.
+    // An `--as-of` set is not ancestry-closed (committer dates can skew), so
+    // close it before filtering: a parent outside the instant stays visible.
+    let lifeline_records: std::borrow::Cow<'_, [GraphRecord]> =
+        pin_set
+            .as_ref()
+            .map_or(std::borrow::Cow::Borrowed(records), |set| {
+                let visible = ancestors_of(records, set.iter().copied());
+                std::borrow::Cow::Owned(
+                    records
+                        .iter()
+                        .filter(|record| record_in_commit_set(record, &visible))
+                        .cloned()
+                        .collect(),
+                )
+            });
+    let events =
+        symbol_lifeline(&lifeline_records, query, repo_id).map_err(|error| match error {
+            LifelineError::UnknownSymbol { query } => OriginError::UnknownSymbol { query },
+            LifelineError::AmbiguousSymbol { query, candidates } => {
+                OriginError::AmbiguousSymbol { query, candidates }
+            }
+        })?;
     // By lifeline construction the first event is always `Introduced`; an
     // empty event list means the symbol resolved but has no commit-linked
     // history (the `no_history` lane contract, mirroring `query lifeline`).
@@ -442,6 +484,95 @@ mod tests {
                 "2026-01-03T00:00:00Z",
             ),
         ]
+    }
+
+    #[test]
+    fn at_pin_ignores_same_named_symbol_introduced_later() {
+        let mut records = history();
+        records.push(commit("commit:4", "c4", &["c3"], "2026-01-04T00:00:00Z"));
+        records.push(symbol(
+            "symbol:answer-later",
+            "answer",
+            "c4",
+            &["c3"],
+            "2026-01-04T00:00:00Z",
+        ));
+        let report = symbol_origin(&records, "answer", None, OriginPin::AtCommit("c3")).unwrap();
+        assert_eq!(report.symbol_record_id, "symbol:answer");
+    }
+
+    #[test]
+    fn as_of_pin_ignores_same_named_symbol_introduced_later() {
+        let mut records = history();
+        records.push(commit("commit:4", "c4", &["c3"], "2026-01-04T00:00:00Z"));
+        records.push(symbol(
+            "symbol:answer-later",
+            "answer",
+            "c4",
+            &["c3"],
+            "2026-01-04T00:00:00Z",
+        ));
+        let report = symbol_origin(
+            &records,
+            "answer",
+            None,
+            OriginPin::AsOf("2026-01-03T00:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!(report.symbol_record_id, "symbol:answer");
+    }
+
+    #[test]
+    fn at_pin_uses_introduction_inside_the_pinned_ancestry() {
+        // Two branches from c1. Branch `c3` is outside the pin but sorts first;
+        // the pinned branch `c9` must still report its own introduction.
+        let records = vec![
+            commit("commit:1", "c1", &[], "2026-01-01T00:00:00Z"),
+            commit("commit:3", "c3", &["c1"], "2026-01-02T00:00:00Z"),
+            commit("commit:9", "c9", &["c1"], "2026-01-03T00:00:00Z"),
+            symbol(
+                "symbol:answer",
+                "answer",
+                "c3",
+                &["c1"],
+                "2026-01-02T00:00:00Z",
+            ),
+            symbol(
+                "symbol:answer",
+                "answer",
+                "c9",
+                &["c1"],
+                "2026-01-03T00:00:00Z",
+            ),
+        ];
+        let report = symbol_origin(&records, "answer", None, OriginPin::AtCommit("c9")).unwrap();
+        assert_eq!(report.introducing_commit, "c9");
+    }
+
+    #[test]
+    fn as_of_keeps_parent_commits_dated_after_the_instant() {
+        // Child c2 is inside the instant, its parent c1 is dated after it
+        // (committer-date skew). The symbol began in c1, outside the instant,
+        // so it must not look introduced at c2.
+        let records = vec![
+            commit("commit:1", "c1", &[], "2026-01-05T00:00:00Z"),
+            commit("commit:2", "c2", &["c1"], "2026-01-02T00:00:00Z"),
+            symbol("symbol:answer", "answer", "c1", &[], "2026-01-05T00:00:00Z"),
+            symbol(
+                "symbol:answer",
+                "answer",
+                "c2",
+                &["c1"],
+                "2026-01-02T00:00:00Z",
+            ),
+        ];
+        let result = symbol_origin(
+            &records,
+            "answer",
+            None,
+            OriginPin::AsOf("2026-01-03T00:00:00Z"),
+        );
+        assert!(matches!(result, Err(OriginError::UnknownSymbol { .. })));
     }
 
     #[test]

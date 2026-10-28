@@ -141,7 +141,7 @@ pub fn symbol_complexity_ranking(
         .collect();
 
     let mut rows: Vec<SymbolComplexityRow> = Vec::new();
-    for record in records {
+    for (position, record) in records.iter().enumerate() {
         let GraphRecord::Node {
             id,
             kind,
@@ -151,6 +151,7 @@ pub fn symbol_complexity_ranking(
             span,
             schema_version,
             complexity,
+            temporal,
             ..
         } = record
         else {
@@ -160,6 +161,12 @@ pub fn symbol_complexity_ranking(
             continue;
         }
         if tombstoned.contains(id.as_str()) || !is_owned(id) {
+            continue;
+        }
+        // A non-temporal rewrite supersedes earlier versions of the same id
+        // (the embedded store keeps only the latest). Temporal snapshots are
+        // distinct history and stay.
+        if temporal.is_none() && !liveness.is_latest_node_version(id, position) {
             continue;
         }
         let (Some(qualified_name), Some(kind_str), Some(path), Some(score)) = (
@@ -222,4 +229,92 @@ pub fn symbol_complexity_ranking(
         corpus_mode_source: corpus_mode_source.as_str(),
         corpus_disclaimer,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn symbol(id: &str, name: &str, complexity: u32) -> GraphRecord {
+        let mut node = GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            None,
+            Some(name.to_owned()),
+            format!("fn {name}"),
+        );
+        if let GraphRecord::Node {
+            symbol_kind,
+            complexity: score,
+            ..
+        } = &mut node
+        {
+            *symbol_kind = Some("function".to_owned());
+            *score = Some(complexity);
+        }
+        node
+    }
+
+    fn report(records: &[GraphRecord]) -> SymbolComplexityReport {
+        symbol_complexity_ranking(records, None, 10).expect("symbols present")
+    }
+
+    #[test]
+    fn same_id_rewrite_ranks_once_with_latest_score() {
+        let records = vec![symbol("s1", "f", 3), symbol("s1", "f", 9)];
+        let out = report(&records);
+        assert_eq!(out.total_symbol_count, 1);
+        assert_eq!(out.symbols[0].complexity, 9);
+    }
+
+    #[test]
+    fn rewrite_does_not_change_truncation() {
+        let records = vec![
+            symbol("s1", "f", 3),
+            symbol("s1", "f", 9),
+            symbol("s2", "g", 1),
+        ];
+        let out = symbol_complexity_ranking(&records, None, 2).expect("symbols present");
+        assert_eq!(out.total_symbol_count, 2);
+        assert!(!out.truncated);
+    }
+
+    fn temporal(commit: &str) -> crate::ir::TemporalMetadata {
+        crate::ir::TemporalMetadata {
+            git_commit: commit.to_owned(),
+            git_parent_commits: Vec::new(),
+            valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            author_time: None,
+            observed_at: "2026-01-01T00:00:00Z".to_owned(),
+            valid_time_source: None,
+        }
+    }
+
+    #[test]
+    fn temporal_snapshots_of_one_id_are_all_kept() {
+        let records = vec![
+            symbol("s1", "f", 3).with_temporal(temporal("c1")),
+            symbol("s1", "f", 9).with_temporal(temporal("c2")),
+        ];
+        assert_eq!(report(&records).total_symbol_count, 2);
+    }
+
+    #[test]
+    fn tombstoned_symbol_is_not_ranked() {
+        let records = vec![
+            symbol("s1", "f", 3),
+            symbol("s2", "g", 5),
+            GraphRecord::Tombstone {
+                id: "tomb:s1".to_owned(),
+                schema_version: 1,
+                deleted_id: "s1".to_owned(),
+                summary: "gone".to_owned(),
+                producer: None,
+            },
+        ];
+        let out = report(&records);
+        assert_eq!(out.total_symbol_count, 1);
+        assert_eq!(out.symbols[0].symbol_record_id, "s2");
+    }
 }

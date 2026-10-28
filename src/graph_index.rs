@@ -11,19 +11,20 @@
 //! byte-identical with the cold scan, so every migrated lane's stdout and exit
 //! code are unchanged (proven by differential tests). Validity is
 //! content-addressed on the graph file's BLAKE3 + length; any mismatch makes the
-//! caller transparently fall back to the cold scan. `eg index` is the only
-//! writer. This is a SEPARATE mechanism from the scan-time incremental cache
+//! caller transparently fall back to the cold scan. A query checks validity
+//! cheaply first (length, modification time, sampled blocks) and reads the
+//! index in place, so its cost does not grow with the graph (issue #120).
+//! `eg index` is the only writer. This is a SEPARATE mechanism from the scan-time incremental cache
 //! (`crate::incremental`); it shares that module's versioned self-invalidation
 //! discipline but none of its code.
 
 use std::{
+    cell::Cell,
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{BufRead, BufReader, Seek, SeekFrom, Write},
+    io::Write,
     path::{Path, PathBuf},
 };
-
-use serde::{Deserialize, Serialize};
 
 use crate::{
     adapters::records_from_jsonl,
@@ -36,14 +37,37 @@ use crate::{
 /// Bumped whenever the header or body layout changes; an index whose stored
 /// version differs is treated as invalid and the caller cold-scans
 /// (self-invalidation, mirroring `crate::incremental`).
-pub const INDEX_FORMAT_VERSION: u32 = 1;
+///
+/// Version 2 replaced the JSON body with binary tables that a reader searches
+/// in place, so a lookup costs `O(log n)` reads instead of an `O(n)` parse.
+pub const INDEX_FORMAT_VERSION: u32 = 2;
 
 /// File magic identifying an Egregore graph sidecar index.
 const INDEX_MAGIC: &[u8; 4] = b"EGIX";
 
-/// Fixed header width: 4 (magic) + 4 (version `u32`) + 8 (`graph_len` `u64`)
-/// + 32 (`graph_blake3`) = 48 bytes, followed by a single `\n` separator.
-const HEADER_LEN: usize = 4 + 4 + 8 + 32;
+/// Fixed header width, 89 bytes: magic (4), version `u32` (4), `graph_len`
+/// `u64` (8), `graph_blake3` (32), `graph_stat_stamp` `u64` (8), sample
+/// fingerprint (32), history flag (1).
+const HEADER_LEN: usize = 4 + 4 + 8 + 32 + 8 + 32 + 1;
+
+/// One directory entry per table: absolute offset `u64` + length `u64`.
+const DIR_ENTRY_LEN: usize = 16;
+
+/// Number of tables (see [`Table`]).
+const TABLE_COUNT: usize = 6;
+
+/// Bytes before the first table: header, `\n` separator, table directory.
+const PREAMBLE_LEN: usize = HEADER_LEN + 1 + TABLE_COUNT * DIR_ENTRY_LEN;
+
+/// One table entry: key offset `u64`, key length `u32`, posting count `u32`,
+/// posting offset `u64`. Offsets are relative to the table start.
+const ENTRY_LEN: usize = 24;
+
+/// Bytes hashed per sampled block of the graph file.
+const SAMPLE_BLOCK: u64 = 4096;
+
+/// Number of evenly spaced blocks in the sample fingerprint.
+const SAMPLE_BLOCKS: u64 = 64;
 
 /// Returns the sidecar index path for a graph file (`foo.jsonl` →
 /// `foo.jsonl.idx`).
@@ -59,7 +83,7 @@ pub fn index_path_for(graph: &Path) -> PathBuf {
 /// `Whole` is the cold-scan escape hatch (byte-identical to today). The other
 /// variants name a closure the sidecar index can hydrate by seek; each is a
 /// SUPERSET chosen so the migrated lane's output is byte-identical to the cold
-/// path (see [`GraphIndex::hydrate`]). Closed + minimal for v1.
+/// path (see [`LazyGraphIndex::hydrate`]). Closed + minimal for v1.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Selector {
     /// Every record (cold scan).
@@ -72,14 +96,19 @@ pub enum Selector {
     ByPath(String),
     /// Every node of one kind string (e.g. `Import` for who-imports).
     ByKind(String),
+    /// One record, its incident edges, and each neighbour's lineage. Smaller
+    /// than [`Selector::ById`]: it does not pull the neighbours' own edges.
+    Anchored(String),
+    /// One record's versions, tombstones, and containment ancestry only.
+    Lineage(String),
 }
 
-/// The serializable body of a [`GraphIndex`]: sorted maps from lookup keys to
+/// The in-memory form of a [`GraphIndex`]: sorted maps from lookup keys to
 /// sorted line-start byte offsets.
 ///
 /// `BTreeMap`/sorted `Vec`s make the serialized bytes deterministic
 /// (byte-identical across builds of an unchanged graph).
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct GraphIndexBody {
     /// Record `id()` → sorted line-start offsets of ALL physical versions.
     pub by_id: BTreeMap<String, Vec<u64>>,
@@ -104,13 +133,66 @@ pub struct GraphIndexBody {
     /// supplied by a closure, so the loader falls back to a cold whole-file scan
     /// for a history store (see `load_records_from_jsonl_selected`). A plain
     /// current-tree `scan` graph carries no temporal records, so this stays
-    /// `false` and the #447 fast path applies. `#[serde(default)]` keeps the
-    /// body format tolerant (the field is additive within v1); `eg index` — the
-    /// only writer — always emits it, and every index freshly built by this
-    /// binary carries the correct value.
-    #[serde(default)]
+    /// `false` and the #447 fast path applies.
     pub has_temporal_history: bool,
 }
+
+/// The six lookup tables, in on-disk order.
+#[derive(Debug, Clone, Copy)]
+enum Table {
+    ById,
+    DeletedId,
+    Name,
+    Path,
+    Kind,
+    Adjacency,
+}
+
+impl Table {
+    const fn slot(self) -> usize {
+        match self {
+            Self::ById => 0,
+            Self::DeletedId => 1,
+            Self::Name => 2,
+            Self::Path => 3,
+            Self::Kind => 4,
+            Self::Adjacency => 5,
+        }
+    }
+}
+
+impl GraphIndexBody {
+    const fn map(&self, table: Table) -> &BTreeMap<String, Vec<u64>> {
+        match table {
+            Table::ById => &self.by_id,
+            Table::DeletedId => &self.by_deleted_id,
+            Table::Name => &self.by_name,
+            Table::Path => &self.by_path,
+            Table::Kind => &self.by_kind,
+            Table::Adjacency => &self.adjacency,
+        }
+    }
+
+    const fn map_mut(&mut self, table: Table) -> &mut BTreeMap<String, Vec<u64>> {
+        match table {
+            Table::ById => &mut self.by_id,
+            Table::DeletedId => &mut self.by_deleted_id,
+            Table::Name => &mut self.by_name,
+            Table::Path => &mut self.by_path,
+            Table::Kind => &mut self.by_kind,
+            Table::Adjacency => &mut self.adjacency,
+        }
+    }
+}
+
+const TABLES: [Table; TABLE_COUNT] = [
+    Table::ById,
+    Table::DeletedId,
+    Table::Name,
+    Table::Path,
+    Table::Kind,
+    Table::Adjacency,
+];
 
 /// A parsed sidecar index: the content-addressing header plus the offset body.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +201,11 @@ pub struct GraphIndex {
     pub graph_len: u64,
     /// BLAKE3 of the graph file bytes the index was built over.
     pub graph_blake3: [u8; 32],
+    /// Stamp of the graph file's times and identity when the index was built
+    /// (`0` when unknown). See `stat_stamp`.
+    pub graph_stat_stamp: u64,
+    /// BLAKE3 over the length and a fixed sample of graph blocks.
+    pub sample_fingerprint: [u8; 32],
     /// The offset maps.
     pub body: GraphIndexBody,
 }
@@ -172,6 +259,353 @@ pub enum LoadError {
     Stale,
 }
 
+/// The `(offset, length)` pairs of the byte ranges the sample fingerprint
+/// covers for a graph of `len` bytes.
+fn sample_ranges(len: u64) -> Vec<(u64, usize)> {
+    let block = |offset: u64| -> (u64, usize) {
+        let size = SAMPLE_BLOCK.min(len - offset);
+        (offset, usize::try_from(size).unwrap_or(0))
+    };
+    let mut ranges = Vec::new();
+    if len == 0 {
+        return ranges;
+    }
+    ranges.push(block(0));
+    for i in 1..SAMPLE_BLOCKS {
+        let offset =
+            u64::try_from(u128::from(len) * u128::from(i) / u128::from(SAMPLE_BLOCKS)).unwrap_or(0);
+        ranges.push(block(offset.min(len - 1)));
+    }
+    ranges.push(block(len.saturating_sub(SAMPLE_BLOCK)));
+    ranges
+}
+
+/// Sample fingerprint of in-memory graph bytes.
+fn sample_fingerprint_bytes(bytes: &[u8]) -> [u8; 32] {
+    let len = bytes.len() as u64;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&len.to_le_bytes());
+    for (offset, size) in sample_ranges(len) {
+        let start = usize::try_from(offset).unwrap_or(0);
+        hasher.update(&offset.to_le_bytes());
+        hasher.update(&bytes[start..start + size]);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+/// Sample fingerprint of a graph file, by positional reads.
+fn sample_fingerprint_file(file: &fs::File, len: u64) -> std::io::Result<[u8; 32]> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&len.to_le_bytes());
+    let mut buf = vec![0u8; usize::try_from(SAMPLE_BLOCK).unwrap_or(4096)];
+    for (offset, size) in sample_ranges(len) {
+        hasher.update(&offset.to_le_bytes());
+        read_exact_at(file, &mut buf[..size], offset)?;
+        hasher.update(&buf[..size]);
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+/// A stamp of a file's identity and change times (`0` when the platform
+/// cannot give a reliable one). On Unix it mixes the modification time, the
+/// change time, the inode, and the device, so a copy that keeps the
+/// modification time (`cp -p`, `rsync -t`) still gets a different stamp.
+/// Other platforms report `0`, so every query there checks the full BLAKE3.
+fn stat_stamp(meta: &fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(0));
+        if mtime == 0 {
+            return 0;
+        }
+        let mut hasher = blake3::Hasher::new();
+        for part in [
+            mtime,
+            meta.ctime().cast_unsigned(),
+            meta.ctime_nsec().cast_unsigned(),
+            meta.ino(),
+            meta.dev(),
+        ] {
+            hasher.update(&part.to_le_bytes());
+        }
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+        // `0` means "no stamp"; keep a real stamp non-zero.
+        u64::from_le_bytes(raw).max(1)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        0
+    }
+}
+
+/// Reads exactly `buf.len()` bytes at `offset` without moving a cursor.
+#[cfg(unix)]
+fn read_exact_at(file: &fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+}
+
+/// Reads exactly `buf.len()` bytes at `offset` on a target with no
+/// positional read. The index is then unusable, so callers cold-scan.
+#[cfg(not(any(unix, windows)))]
+fn read_exact_at(_file: &fs::File, _buf: &mut [u8], _offset: u64) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+/// Reads exactly `buf.len()` bytes at `offset` without a shared cursor.
+#[cfg(windows)]
+fn read_exact_at(file: &fs::File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        let read = std::os::windows::fs::FileExt::seek_read(file, buf, offset)?;
+        if read == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        buf = &mut buf[read..];
+        offset += read as u64;
+    }
+    Ok(())
+}
+
+/// Reads the record line that starts at `offset` in a graph file. Returns
+/// `Ok(None)` when the line does not parse.
+fn read_record_in_file(file: &fs::File, offset: u64) -> std::io::Result<Option<GraphRecord>> {
+    const CHUNK: usize = 8192;
+    let file_len = file.metadata()?.len();
+    let mut line: Vec<u8> = Vec::new();
+    let mut at = offset;
+    loop {
+        if at >= file_len {
+            break;
+        }
+        let want = CHUNK.min(usize::try_from(file_len - at).unwrap_or(CHUNK));
+        let mut chunk = vec![0u8; want];
+        read_exact_at(file, &mut chunk, at)?;
+        if let Some(end) = chunk.iter().position(|b| *b == b'\n') {
+            line.extend_from_slice(&chunk[..end]);
+            break;
+        }
+        line.extend_from_slice(&chunk);
+        at += want as u64;
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    let Ok(text) = std::str::from_utf8(&line) else {
+        return Ok(None);
+    };
+    Ok(match read_record_line(text) {
+        Ok(RecordLineRead::Record(record)) => Some(*record),
+        _ => None,
+    })
+}
+
+/// Encodes one lookup table: count, sorted entries, key blob, posting blob.
+fn encode_table(map: &BTreeMap<String, Vec<u64>>) -> Vec<u8> {
+    let head = 8 + map.len() * ENTRY_LEN;
+    let keys_total: usize = map.keys().map(String::len).sum();
+    let mut entries = Vec::with_capacity(head);
+    entries.extend_from_slice(&(map.len() as u64).to_le_bytes());
+    let mut keys = Vec::with_capacity(keys_total);
+    let mut posts: Vec<u8> = Vec::new();
+    for (key, offsets) in map {
+        let key_off = (head + keys.len()) as u64;
+        let post_off = (head + keys_total + posts.len()) as u64;
+        entries.extend_from_slice(&key_off.to_le_bytes());
+        entries.extend_from_slice(&u32::try_from(key.len()).unwrap_or(u32::MAX).to_le_bytes());
+        entries.extend_from_slice(
+            &u32::try_from(offsets.len())
+                .unwrap_or(u32::MAX)
+                .to_le_bytes(),
+        );
+        entries.extend_from_slice(&post_off.to_le_bytes());
+        keys.extend_from_slice(key.as_bytes());
+        for offset in offsets {
+            posts.extend_from_slice(&offset.to_le_bytes());
+        }
+    }
+    entries.extend_from_slice(&keys);
+    entries.extend_from_slice(&posts);
+    entries
+}
+
+fn u32_at(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+}
+
+fn u64_at(bytes: &[u8], at: usize) -> u64 {
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&bytes[at..at + 8]);
+    u64::from_le_bytes(raw)
+}
+
+fn corrupt(message: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message.to_owned())
+}
+
+/// A decoded table entry.
+struct Entry {
+    key_off: u64,
+    key_len: u32,
+    post_cnt: u32,
+    post_off: u64,
+}
+
+fn decode_entry(raw: &[u8; ENTRY_LEN]) -> Entry {
+    Entry {
+        key_off: u64_at(raw, 0),
+        key_len: u32_at(raw, 8),
+        post_cnt: u32_at(raw, 12),
+        post_off: u64_at(raw, 16),
+    }
+}
+
+/// Reads one table of an index file in place.
+struct FileTable<'a> {
+    file: &'a fs::File,
+    start: u64,
+    len: u64,
+}
+
+impl FileTable<'_> {
+    fn count(&self) -> std::io::Result<u64> {
+        let mut raw = [0u8; 8];
+        if self.len < 8 {
+            return Err(corrupt("table shorter than its count"));
+        }
+        read_exact_at(self.file, &mut raw, self.start)?;
+        let count = u64::from_le_bytes(raw);
+        let entries = count
+            .checked_mul(ENTRY_LEN as u64)
+            .and_then(|n| n.checked_add(8))
+            .ok_or_else(|| corrupt("table count overflows"))?;
+        if entries > self.len {
+            return Err(corrupt("table entries exceed the table"));
+        }
+        Ok(count)
+    }
+
+    fn entry(&self, index: u64) -> std::io::Result<Entry> {
+        let mut raw = [0u8; ENTRY_LEN];
+        read_exact_at(
+            self.file,
+            &mut raw,
+            self.start + 8 + index * ENTRY_LEN as u64,
+        )?;
+        let entry = decode_entry(&raw);
+        let key_end = entry.key_off.checked_add(u64::from(entry.key_len));
+        let post_end = u64::from(entry.post_cnt)
+            .checked_mul(8)
+            .and_then(|n| n.checked_add(entry.post_off));
+        if key_end.is_none_or(|end| end > self.len) || post_end.is_none_or(|end| end > self.len) {
+            return Err(corrupt("table entry points outside the table"));
+        }
+        Ok(entry)
+    }
+
+    fn key(&self, entry: &Entry) -> std::io::Result<Vec<u8>> {
+        let mut key = vec![0u8; entry.key_len as usize];
+        read_exact_at(self.file, &mut key, self.start + entry.key_off)?;
+        Ok(key)
+    }
+
+    fn postings(&self, entry: &Entry) -> std::io::Result<Vec<u64>> {
+        let mut raw = vec![0u8; entry.post_cnt as usize * 8];
+        read_exact_at(self.file, &mut raw, self.start + entry.post_off)?;
+        Ok(raw.chunks_exact(8).map(|c| u64_at(c, 0)).collect())
+    }
+
+    /// Binary search for `key`; the postings of a hit, else empty.
+    fn lookup(&self, key: &str) -> std::io::Result<Vec<u64>> {
+        let (mut lo, mut hi) = (0u64, self.count()?);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let entry = self.entry(mid)?;
+            match self.key(&entry)?.as_slice().cmp(key.as_bytes()) {
+                std::cmp::Ordering::Equal => return self.postings(&entry),
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    fn keys(&self) -> std::io::Result<Vec<String>> {
+        (0..self.count()?)
+            .map(|i| {
+                let entry = self.entry(i)?;
+                String::from_utf8(self.key(&entry)?).map_err(|_| corrupt("table key is not UTF-8"))
+            })
+            .collect()
+    }
+}
+
+/// What the closure walk needs from an index: posting lists and record reads.
+trait IndexView {
+    fn postings(&self, table: Table, key: &str) -> Vec<u64>;
+    fn record_at(&self, offset: u64) -> Option<GraphRecord>;
+}
+
+/// An index body plus the graph bytes, both in memory.
+struct MemView<'a> {
+    body: &'a GraphIndexBody,
+    bytes: &'a [u8],
+}
+
+impl IndexView for MemView<'_> {
+    fn postings(&self, table: Table, key: &str) -> Vec<u64> {
+        self.body.map(table).get(key).cloned().unwrap_or_default()
+    }
+
+    fn record_at(&self, offset: u64) -> Option<GraphRecord> {
+        read_record_at(self.bytes, offset)
+    }
+}
+
+/// An index file and graph file read in place. A failed read sets `failed`
+/// so the caller falls back to the cold scan instead of using a partial answer.
+struct FileView {
+    idx: fs::File,
+    graph: fs::File,
+    tables: [(u64, u64); TABLE_COUNT],
+    failed: Cell<bool>,
+}
+
+impl FileView {
+    const fn table(&self, table: Table) -> FileTable<'_> {
+        let (start, len) = self.tables[table.slot()];
+        FileTable {
+            file: &self.idx,
+            start,
+            len,
+        }
+    }
+}
+
+impl IndexView for FileView {
+    fn postings(&self, table: Table, key: &str) -> Vec<u64> {
+        self.table(table).lookup(key).unwrap_or_else(|_| {
+            self.failed.set(true);
+            Vec::new()
+        })
+    }
+
+    fn record_at(&self, offset: u64) -> Option<GraphRecord> {
+        let record = read_record_in_file(&self.graph, offset).unwrap_or(None);
+        if record.is_none() {
+            // A validated index only points at lines that parsed at build
+            // time, so a miss means damage or a changed graph.
+            self.failed.set(true);
+        }
+        record
+    }
+}
+
 impl GraphIndex {
     /// Builds an index over a graph JSONL file, streaming it once.
     ///
@@ -185,11 +619,17 @@ impl GraphIndex {
     /// Returns [`BuildError`] if the file cannot be read or a line is not an
     /// indexable record.
     pub fn build(graph: &Path) -> Result<Self, BuildError> {
-        let bytes = fs::read(graph).map_err(|source| BuildError::Read {
+        let read_error = |source| BuildError::Read {
             path: graph.display().to_string(),
             source,
-        })?;
-        Self::build_from_bytes(&bytes)
+        };
+        // Take the modification time BEFORE reading: a write that lands during
+        // the build then leaves a stale time, never a fresh-looking one.
+        let mtime = stat_stamp(&fs::metadata(graph).map_err(read_error)?);
+        let bytes = fs::read(graph).map_err(read_error)?;
+        let mut index = Self::build_from_bytes(&bytes)?;
+        index.graph_stat_stamp = mtime;
+        Ok(index)
     }
 
     /// Builds an index from graph bytes already in memory (the unit-test entry
@@ -202,6 +642,7 @@ impl GraphIndex {
     pub fn build_from_bytes(bytes: &[u8]) -> Result<Self, BuildError> {
         let graph_len = bytes.len() as u64;
         let graph_blake3 = *blake3::hash(bytes).as_bytes();
+        let sample_fingerprint = sample_fingerprint_bytes(bytes);
         let mut body = GraphIndexBody::default();
 
         // Stream the file tracking a running byte cursor at each line start.
@@ -255,15 +696,8 @@ impl GraphIndex {
         }
 
         // Every offset list is sorted for determinism.
-        for map in [
-            &mut body.by_id,
-            &mut body.by_deleted_id,
-            &mut body.by_name,
-            &mut body.by_path,
-            &mut body.by_kind,
-            &mut body.adjacency,
-        ] {
-            for offsets in map.values_mut() {
+        for table in TABLES {
+            for offsets in body.map_mut(table).values_mut() {
                 offsets.sort_unstable();
                 offsets.dedup();
             }
@@ -272,24 +706,41 @@ impl GraphIndex {
         Ok(Self {
             graph_len,
             graph_blake3,
+            graph_stat_stamp: 0,
+            sample_fingerprint,
             body,
         })
     }
 
-    /// Serializes the index to its on-disk byte form (header + `\n` + JSON body).
+    /// Serializes the index to its on-disk byte form: header, `\n`, table
+    /// directory, then the six binary tables.
     ///
     /// # Errors
     ///
-    /// Returns an error if the body cannot be serialized to JSON.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
-        let json = serde_json::to_vec(&self.body)?;
-        let mut out = Vec::with_capacity(HEADER_LEN + 1 + json.len());
+    /// Never fails today; the `Result` keeps the writer's signature stable.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, std::io::Error> {
+        let tables: Vec<Vec<u8>> = TABLES
+            .iter()
+            .map(|table| encode_table(self.body.map(*table)))
+            .collect();
+        let mut out = Vec::new();
         out.extend_from_slice(INDEX_MAGIC);
         out.extend_from_slice(&INDEX_FORMAT_VERSION.to_le_bytes());
         out.extend_from_slice(&self.graph_len.to_le_bytes());
         out.extend_from_slice(&self.graph_blake3);
+        out.extend_from_slice(&self.graph_stat_stamp.to_le_bytes());
+        out.extend_from_slice(&self.sample_fingerprint);
+        out.push(u8::from(self.body.has_temporal_history));
         out.push(b'\n');
-        out.extend_from_slice(&json);
+        let mut offset = PREAMBLE_LEN as u64;
+        for table in &tables {
+            out.extend_from_slice(&offset.to_le_bytes());
+            out.extend_from_slice(&(table.len() as u64).to_le_bytes());
+            offset += table.len() as u64;
+        }
+        for table in &tables {
+            out.extend_from_slice(table);
+        }
         Ok(out)
     }
 
@@ -300,9 +751,7 @@ impl GraphIndex {
     ///
     /// Returns an error if serialization, the temp write, or the rename fails.
     pub fn write_atomic(&self, index_path: &Path) -> std::io::Result<()> {
-        let bytes = self
-            .to_bytes()
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let bytes = self.to_bytes()?;
         let mut tmp = index_path.as_os_str().to_os_string();
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
@@ -314,226 +763,402 @@ impl GraphIndex {
         fs::rename(&tmp, index_path)
     }
 
-    /// Parses the header + body from raw index bytes WITHOUT validating them
-    /// against a graph file. Callers use [`load_for`](Self::load_for) to also
-    /// enforce content-addressed validity.
+    /// Parses the header + tables from raw index bytes into memory WITHOUT
+    /// validating them against a graph file. Query lanes use
+    /// [`LazyGraphIndex::open`], which validates and reads in place.
     ///
     /// # Errors
     ///
     /// Returns [`LoadError::Corrupt`] / [`LoadError::VersionMismatch`] on a bad
-    /// header or body.
+    /// header or table.
     pub fn parse(bytes: &[u8]) -> Result<Self, LoadError> {
-        if bytes.len() < HEADER_LEN + 1 {
-            return Err(LoadError::Corrupt("file shorter than header".to_owned()));
+        let header = parse_header(bytes)?;
+        let mut body = GraphIndexBody {
+            has_temporal_history: header.has_temporal_history,
+            ..GraphIndexBody::default()
+        };
+        for table in TABLES {
+            let (start, len) = header.tables[table.slot()];
+            let range = usize::try_from(start)
+                .ok()
+                .zip(usize::try_from(len).ok())
+                .and_then(|(s, l)| bytes.get(s..s.checked_add(l)?))
+                .ok_or_else(|| LoadError::Corrupt("table outside the file".to_owned()))?;
+            *body.map_mut(table) = decode_table(range)
+                .map_err(|error| LoadError::Corrupt(format!("table: {error}")))?;
         }
-        if &bytes[0..4] != INDEX_MAGIC {
-            return Err(LoadError::Corrupt("bad magic".to_owned()));
-        }
-        // The length check above guarantees at least `HEADER_LEN + 1` bytes, so
-        // these fixed-width reads never index out of range; building the arrays
-        // by element avoids a fallible `try_into` (and its panic-doc lint).
-        let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-        if version != INDEX_FORMAT_VERSION {
-            return Err(LoadError::VersionMismatch {
-                found: version,
-                expected: INDEX_FORMAT_VERSION,
-            });
-        }
-        let graph_len = u64::from_le_bytes([
-            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
-        ]);
-        let mut graph_blake3 = [0u8; 32];
-        graph_blake3.copy_from_slice(&bytes[16..48]);
-        if bytes[HEADER_LEN] != b'\n' {
-            return Err(LoadError::Corrupt("missing header separator".to_owned()));
-        }
-        let body: GraphIndexBody = serde_json::from_slice(&bytes[HEADER_LEN + 1..])
-            .map_err(|error| LoadError::Corrupt(format!("body JSON: {error}")))?;
         Ok(Self {
-            graph_len,
-            graph_blake3,
+            graph_len: header.graph_len,
+            graph_blake3: header.graph_blake3,
+            graph_stat_stamp: header.graph_stat_stamp,
+            sample_fingerprint: header.sample_fingerprint,
             body,
         })
     }
 
-    /// Loads and validates the sidecar index for a graph file, returning it only
-    /// when it is present, well-formed, the current format version, and
-    /// content-addressed to the graph's current length and BLAKE3.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`LoadError`] for every reason to fall back to a cold scan
-    /// (absent, unreadable, corrupt, version mismatch, stale). Callers treat any
-    /// error as "cold-scan"; none is a user-facing failure.
-    pub fn load_for(graph: &Path) -> Result<Self, LoadError> {
-        let index_path = index_path_for(graph);
-        let idx_bytes = match fs::read(&index_path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(LoadError::Absent);
-            }
-            Err(error) => return Err(LoadError::Read(error)),
-        };
-        let index = Self::parse(&idx_bytes)?;
-        let graph_len = fs::metadata(graph).map_err(LoadError::Read)?.len();
-        if graph_len != index.graph_len {
-            return Err(LoadError::Stale);
-        }
-        let graph_bytes = fs::read(graph).map_err(LoadError::Read)?;
-        if *blake3::hash(&graph_bytes).as_bytes() != index.graph_blake3 {
-            return Err(LoadError::Stale);
-        }
-        Ok(index)
-    }
-
-    /// Computes the sorted set of line-start offsets the selector's closure needs.
+    /// Computes the sorted set of line-start byte offsets the selector's closure needs.
     ///
     /// `Whole` returns `None` (the caller cold-scans). Every other selector
     /// returns the byte offsets to hydrate; see the module SPEC for the closure
     /// definition. Offsets are returned ascending, i.e. file order.
     #[must_use]
     pub fn closure_offsets(&self, selector: &Selector, graph_bytes: &[u8]) -> Option<Vec<u64>> {
-        let mut offsets: BTreeSet<u64> = BTreeSet::new();
-        // Track ids already fully expanded so cycles and shared neighbours do not
-        // loop or re-walk.
-        let mut expanded: BTreeSet<String> = BTreeSet::new();
-        let mut climbed: BTreeSet<String> = BTreeSet::new();
+        let view = MemView {
+            body: &self.body,
+            bytes: graph_bytes,
+        };
+        closure_offsets_in(&view, selector)
+    }
+}
 
-        match selector {
-            Selector::Whole => return None,
-            Selector::ById(id) => {
-                self.expand_by_id(id, graph_bytes, &mut offsets, &mut expanded, &mut climbed);
+/// The fixed header fields of an index file.
+struct Header {
+    graph_len: u64,
+    graph_blake3: [u8; 32],
+    graph_stat_stamp: u64,
+    sample_fingerprint: [u8; 32],
+    has_temporal_history: bool,
+    tables: [(u64, u64); TABLE_COUNT],
+}
+
+/// Checks the magic/version and reads the header plus table directory from
+/// the first [`PREAMBLE_LEN`] bytes of an index.
+fn parse_header(bytes: &[u8]) -> Result<Header, LoadError> {
+    if bytes.len() < 8 || &bytes[0..4] != INDEX_MAGIC {
+        return Err(LoadError::Corrupt(if bytes.len() < 8 {
+            "file shorter than header".to_owned()
+        } else {
+            "bad magic".to_owned()
+        }));
+    }
+    let version = u32_at(bytes, 4);
+    if version != INDEX_FORMAT_VERSION {
+        return Err(LoadError::VersionMismatch {
+            found: version,
+            expected: INDEX_FORMAT_VERSION,
+        });
+    }
+    if bytes.len() < PREAMBLE_LEN {
+        return Err(LoadError::Corrupt("file shorter than header".to_owned()));
+    }
+    if bytes[HEADER_LEN] != b'\n' {
+        return Err(LoadError::Corrupt("missing header separator".to_owned()));
+    }
+    let mut graph_blake3 = [0u8; 32];
+    graph_blake3.copy_from_slice(&bytes[16..48]);
+    let mut sample_fingerprint = [0u8; 32];
+    sample_fingerprint.copy_from_slice(&bytes[56..88]);
+    let mut tables = [(0u64, 0u64); TABLE_COUNT];
+    for (slot, entry) in tables.iter_mut().enumerate() {
+        let at = HEADER_LEN + 1 + slot * DIR_ENTRY_LEN;
+        *entry = (u64_at(bytes, at), u64_at(bytes, at + 8));
+    }
+    Ok(Header {
+        graph_len: u64_at(bytes, 8),
+        graph_blake3,
+        graph_stat_stamp: u64_at(bytes, 48),
+        sample_fingerprint,
+        has_temporal_history: bytes[88] != 0,
+        tables,
+    })
+}
+
+/// Decodes a whole table into a map (the in-memory parse path).
+fn decode_table(raw: &[u8]) -> std::io::Result<BTreeMap<String, Vec<u64>>> {
+    if raw.len() < 8 {
+        return Err(corrupt("table shorter than its count"));
+    }
+    let count = usize::try_from(u64_at(raw, 0)).map_err(|_| corrupt("count overflows"))?;
+    let head = count
+        .checked_mul(ENTRY_LEN)
+        .and_then(|n| n.checked_add(8))
+        .filter(|head| *head <= raw.len())
+        .ok_or_else(|| corrupt("table entries exceed the table"))?;
+    let _ = head;
+    let mut map = BTreeMap::new();
+    for i in 0..count {
+        let at = 8 + i * ENTRY_LEN;
+        let mut entry_raw = [0u8; ENTRY_LEN];
+        entry_raw.copy_from_slice(&raw[at..at + ENTRY_LEN]);
+        let entry = decode_entry(&entry_raw);
+        let key_start = usize::try_from(entry.key_off).map_err(|_| corrupt("key offset"))?;
+        let key = key_start
+            .checked_add(entry.key_len as usize)
+            .and_then(|end| raw.get(key_start..end))
+            .ok_or_else(|| corrupt("key outside the table"))?;
+        let key = String::from_utf8(key.to_vec()).map_err(|_| corrupt("key is not UTF-8"))?;
+        let post_start = usize::try_from(entry.post_off).map_err(|_| corrupt("post offset"))?;
+        let posts = (entry.post_cnt as usize)
+            .checked_mul(8)
+            .and_then(|n| post_start.checked_add(n))
+            .and_then(|end| raw.get(post_start..end))
+            .ok_or_else(|| corrupt("postings outside the table"))?;
+        map.insert(key, posts.chunks_exact(8).map(|c| u64_at(c, 0)).collect());
+    }
+    Ok(map)
+}
+
+/// A validated sidecar index read in place.
+///
+/// There is no whole-file read and no parse of the tables. A lookup costs
+/// `O(log n)` positional reads, so a targeted query's index cost does not grow
+/// with the graph (issue #120).
+pub struct LazyGraphIndex {
+    view: FileView,
+    has_temporal_history: bool,
+}
+
+impl LazyGraphIndex {
+    /// Opens and validates the sidecar index for a graph file.
+    ///
+    /// Valid means present, well-formed, the current format version, and
+    /// matching the graph. Matching is checked cheaply first: same length,
+    /// same modification time, and same sample fingerprint. When only the
+    /// time differs (a copy or a touch), the full BLAKE3 decides, so a changed
+    /// graph is never served from a stale index.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`LoadError`] for every reason to fall back to a cold scan.
+    /// Callers treat any error as "cold-scan"; none is a user-facing failure.
+    pub fn open(graph: &Path) -> Result<Self, LoadError> {
+        let idx = match fs::File::open(index_path_for(graph)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(LoadError::Absent);
             }
-            Selector::ByName(name) => {
-                for id in Self::ids_at(&self.body.by_name, name, graph_bytes) {
-                    self.expand_by_id(&id, graph_bytes, &mut offsets, &mut expanded, &mut climbed);
-                }
-            }
-            Selector::ByPath(path) => {
-                let ids = Self::ids_at(&self.body.by_path, path, graph_bytes);
-                for id in &ids {
-                    self.add_id_versions(id, &mut offsets);
-                }
-                // Ancestry climb so RepositoryIndex owner/display attribution
-                // reproduces the cold answer (at/locate/file emit repository_id).
-                for id in &ids {
-                    self.climb_ancestry(id, graph_bytes, &mut offsets, &mut climbed);
-                }
-            }
-            Selector::ByKind(kind) => {
-                let ids = Self::ids_at(&self.body.by_kind, kind, graph_bytes);
-                for id in &ids {
-                    self.add_id_versions(id, &mut offsets);
-                }
+            Err(error) => return Err(LoadError::Read(error)),
+        };
+        let idx_len = idx.metadata().map_err(LoadError::Read)?.len();
+        let take = usize::try_from(idx_len.min(PREAMBLE_LEN as u64)).unwrap_or(0);
+        let mut preamble = vec![0u8; take];
+        read_exact_at(&idx, &mut preamble, 0).map_err(LoadError::Read)?;
+        let header = parse_header(&preamble)?;
+        for (start, len) in header.tables {
+            if start.checked_add(len).is_none_or(|end| end > idx_len) {
+                return Err(LoadError::Corrupt("table outside the file".to_owned()));
             }
         }
-        Some(offsets.into_iter().collect())
+
+        let graph_file = fs::File::open(graph).map_err(LoadError::Read)?;
+        let meta = graph_file.metadata().map_err(LoadError::Read)?;
+        if meta.len() != header.graph_len {
+            return Err(LoadError::Stale);
+        }
+        let quick = header.graph_stat_stamp != 0
+            && stat_stamp(&meta) == header.graph_stat_stamp
+            && sample_fingerprint_file(&graph_file, meta.len()).map_err(LoadError::Read)?
+                == header.sample_fingerprint;
+        if !quick {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update_reader(&graph_file).map_err(LoadError::Read)?;
+            if *hasher.finalize().as_bytes() != header.graph_blake3 {
+                return Err(LoadError::Stale);
+            }
+        }
+        Ok(Self {
+            view: FileView {
+                idx,
+                graph: graph_file,
+                tables: header.tables,
+                failed: Cell::new(false),
+            },
+            has_temporal_history: header.has_temporal_history,
+        })
     }
 
-    /// Hydrates the closure for a selector by seeking to each offset and reading
-    /// exactly one line, reproducing the records the cold path would produce.
+    /// Whether the indexed graph is a history / corpus store (see
+    /// [`GraphIndexBody::has_temporal_history`]).
+    #[must_use]
+    pub const fn has_temporal_history(&self) -> bool {
+        self.has_temporal_history
+    }
+
+    /// The node-kind keys present in the graph, sorted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the kind table cannot be read.
+    pub fn kind_keys(&self) -> std::io::Result<Vec<String>> {
+        self.view.table(Table::Kind).keys()
+    }
+
+    /// Hydrates the closure for a selector by reading exactly one line per
+    /// offset, reproducing the records the cold path would produce.
     ///
     /// Returns `None` for [`Selector::Whole`] (the caller cold-scans).
     ///
     /// # Errors
     ///
-    /// Returns an error if the graph file cannot be opened/read or a hydrated
-    /// line does not parse. (A validated index guarantees every indexed line
-    /// parsed at build time, so a parse error here means the file changed under
-    /// an unvalidated caller.)
-    pub fn hydrate(
+    /// Returns an error if any read fails or a hydrated line does not parse
+    /// (the graph changed under a validated index, or the index is damaged).
+    pub fn hydrate(&self, selector: &Selector) -> std::io::Result<Option<Vec<GraphRecord>>> {
+        self.hydrate_many(std::slice::from_ref(selector))
+    }
+
+    /// Hydrates the union of several selectors' closures, each record once, in
+    /// file order. Returns `None` when any selector is [`Selector::Whole`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`hydrate`](Self::hydrate).
+    pub fn hydrate_many(
         &self,
-        graph: &Path,
-        selector: &Selector,
+        selectors: &[Selector],
     ) -> std::io::Result<Option<Vec<GraphRecord>>> {
-        let graph_bytes = fs::read(graph)?;
-        let Some(offsets) = self.closure_offsets(selector, &graph_bytes) else {
-            return Ok(None);
-        };
-        let file = fs::File::open(graph)?;
-        let mut reader = BufReader::new(file);
+        let mut offsets: BTreeSet<u64> = BTreeSet::new();
+        for selector in selectors {
+            let Some(closure) = closure_offsets_in(&self.view, selector) else {
+                return Ok(None);
+            };
+            offsets.extend(closure);
+        }
+        if self.view.failed.get() {
+            return Err(corrupt("index read failed"));
+        }
         let mut records = Vec::with_capacity(offsets.len());
-        let mut line = String::new();
         for offset in offsets {
-            reader.seek(SeekFrom::Start(offset))?;
-            line.clear();
-            reader.read_line(&mut line)?;
-            let text = line.trim_end_matches(['\n', '\r']);
-            if text.trim().is_empty() {
-                continue;
-            }
-            match read_record_line(text) {
-                Ok(RecordLineRead::Record(record)) => records.push(*record),
-                Ok(RecordLineRead::UnknownSchemaVersion(_)) | Err(_) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("hydrated line at offset {offset} did not parse"),
-                    ));
+            match read_record_in_file(&self.view.graph, offset)? {
+                Some(record) => records.push(record),
+                None => {
+                    return Err(corrupt(&format!(
+                        "hydrated line at offset {offset} did not parse"
+                    )));
                 }
             }
         }
         Ok(Some(records))
     }
+}
 
-    // ── closure helpers ──────────────────────────────────────────────────────
+/// Computes the closure offsets for a selector over any [`IndexView`].
+fn closure_offsets_in<V: IndexView>(view: &V, selector: &Selector) -> Option<Vec<u64>> {
+    let mut walk = Closure {
+        view,
+        offsets: BTreeSet::new(),
+        expanded: BTreeSet::new(),
+        climbed: BTreeSet::new(),
+    };
+    match selector {
+        Selector::Whole => return None,
+        Selector::ById(id) => walk.expand_by_id(id),
+        Selector::ByName(name) => {
+            for id in walk.ids_at(Table::Name, name) {
+                walk.expand_by_id(&id);
+            }
+        }
+        Selector::ByPath(path) => {
+            let ids = walk.ids_at(Table::Path, path);
+            for id in &ids {
+                walk.add_id_versions(id);
+            }
+            // Ancestry climb so RepositoryIndex owner/display attribution
+            // reproduces the cold answer (at/locate/file emit repository_id).
+            for id in &ids {
+                walk.climb_ancestry(id);
+            }
+        }
+        Selector::ByKind(kind) => {
+            for id in walk.ids_at(Table::Kind, kind) {
+                walk.add_id_versions(&id);
+            }
+        }
+        Selector::Anchored(id) => walk.anchor(id),
+        Selector::Lineage(id) => {
+            walk.add_id_versions(id);
+            walk.climb_ancestry(id);
+        }
+    }
+    Some(walk.offsets.into_iter().collect())
+}
 
-    /// Reads the ids present at a lookup key's offsets (by seeking to each and
-    /// reading the record's `id()`). Deterministic (a `BTreeSet`).
-    fn ids_at(map: &BTreeMap<String, Vec<u64>>, key: &str, graph_bytes: &[u8]) -> Vec<String> {
+/// The state of one closure walk.
+struct Closure<'v, V: IndexView> {
+    view: &'v V,
+    offsets: BTreeSet<u64>,
+    /// Ids already fully expanded, so cycles and shared neighbours do not loop.
+    expanded: BTreeSet<String>,
+    /// Ids already climbed for ancestry.
+    climbed: BTreeSet<String>,
+}
+
+impl<V: IndexView> Closure<'_, V> {
+    /// Reads the ids present at a lookup key's offsets (by reading each
+    /// record's `id()`). Deterministic (a `BTreeSet`).
+    fn ids_at(&self, table: Table, key: &str) -> Vec<String> {
         let mut ids: BTreeSet<String> = BTreeSet::new();
-        if let Some(offsets) = map.get(key) {
-            for &offset in offsets {
-                if let Some(record) = read_record_at(graph_bytes, offset) {
-                    ids.insert(record.id().to_owned());
-                }
+        for offset in self.view.postings(table, key) {
+            if let Some(record) = self.view.record_at(offset) {
+                ids.insert(record.id().to_owned());
             }
         }
         ids.into_iter().collect()
     }
 
+    /// Adds an edge record's offset and every tombstone that retracts it.
+    fn add_edge(&mut self, offset: u64, edge_id: &str) {
+        self.offsets.insert(offset);
+        self.offsets
+            .extend(self.view.postings(Table::DeletedId, edge_id));
+    }
+
     /// Adds a single id's every physical version plus every tombstone that
     /// retracts it.
-    fn add_id_versions(&self, id: &str, offsets: &mut BTreeSet<u64>) {
-        if let Some(list) = self.body.by_id.get(id) {
-            offsets.extend(list.iter().copied());
-        }
-        if let Some(list) = self.body.by_deleted_id.get(id) {
-            offsets.extend(list.iter().copied());
-        }
+    fn add_id_versions(&mut self, id: &str) {
+        self.offsets.extend(self.view.postings(Table::ById, id));
+        self.offsets
+            .extend(self.view.postings(Table::DeletedId, id));
     }
 
     /// Expands one id into its neighbourhood closure: its versions+tombstones,
     /// its incident edges, each neighbour's versions+tombstones and incident
     /// edges, then a containment-ancestry climb from the id and each neighbour.
-    fn expand_by_id(
-        &self,
-        id: &str,
-        graph_bytes: &[u8],
-        offsets: &mut BTreeSet<u64>,
-        expanded: &mut BTreeSet<String>,
-        climbed: &mut BTreeSet<String>,
-    ) {
-        if !expanded.insert(id.to_owned()) {
+    fn expand_by_id(&mut self, id: &str) {
+        if !self.expanded.insert(id.to_owned()) {
             return;
         }
-        self.add_id_versions(id, offsets);
+        self.add_id_versions(id);
         // Incident edges + one hop of neighbours (with their incident edges).
-        if let Some(edge_offsets) = self.body.adjacency.get(id) {
-            for &edge_offset in edge_offsets {
-                offsets.insert(edge_offset);
-                if let Some(GraphRecord::Edge { source, target, .. }) =
-                    read_record_at(graph_bytes, edge_offset)
-                {
-                    let other = if source == id { &target } else { &source };
-                    self.add_id_versions(other, offsets);
-                    if let Some(neighbour_edges) = self.body.adjacency.get(other) {
-                        offsets.extend(neighbour_edges.iter().copied());
-                    }
-                    self.climb_ancestry(other, graph_bytes, offsets, climbed);
-                }
+        for edge_offset in self.view.postings(Table::Adjacency, id) {
+            self.offsets.insert(edge_offset);
+            if let Some(GraphRecord::Edge {
+                id: edge_id,
+                source,
+                target,
+                ..
+            }) = self.view.record_at(edge_offset)
+            {
+                self.add_edge(edge_offset, &edge_id);
+                let other = if source == id { &target } else { &source };
+                self.add_id_versions(other);
+                self.offsets
+                    .extend(self.view.postings(Table::Adjacency, other));
+                self.climb_ancestry(other);
             }
         }
-        self.climb_ancestry(id, graph_bytes, offsets, climbed);
+        self.climb_ancestry(id);
+    }
+
+    /// Adds `id`, its incident edges, and each neighbour's versions and
+    /// ancestry (see [`Selector::Anchored`]).
+    fn anchor(&mut self, id: &str) {
+        self.add_id_versions(id);
+        for edge_offset in self.view.postings(Table::Adjacency, id) {
+            self.offsets.insert(edge_offset);
+            if let Some(GraphRecord::Edge {
+                id: edge_id,
+                source,
+                target,
+                ..
+            }) = self.view.record_at(edge_offset)
+            {
+                self.add_edge(edge_offset, &edge_id);
+                let other = if source == id { target } else { source };
+                self.add_id_versions(&other);
+                self.climb_ancestry(&other);
+            }
+        }
+        self.climb_ancestry(id);
     }
 
     /// `true` when `id` names an `Import` node.
@@ -542,13 +1167,11 @@ impl GraphIndex {
     /// the node decides, since a node's kind never changes across versions. An
     /// unreadable or absent node reads as `false` (fail closed — the edge is
     /// simply not climbed).
-    fn node_is_import_kind(&self, id: &str, graph_bytes: &[u8]) -> bool {
-        let Some(offsets) = self.body.by_id.get(id) else {
-            return false;
-        };
-        offsets
-            .iter()
-            .filter_map(|o| read_record_at(graph_bytes, *o))
+    fn node_is_import_kind(&self, id: &str) -> bool {
+        self.view
+            .postings(Table::ById, id)
+            .into_iter()
+            .filter_map(|o| self.view.record_at(o))
             .any(|record| {
                 matches!(
                     record,
@@ -570,28 +1193,20 @@ impl GraphIndex {
     /// misattribute the imported module to the importing file. Only the
     /// extractor's `File —IMPORTS→ Import` shape (the import declaration owned
     /// by its file) counts as a parent edge.
-    fn climb_ancestry(
-        &self,
-        id: &str,
-        graph_bytes: &[u8],
-        offsets: &mut BTreeSet<u64>,
-        climbed: &mut BTreeSet<String>,
-    ) {
+    fn climb_ancestry(&mut self, id: &str) {
         let mut stack = vec![id.to_owned()];
         while let Some(node) = stack.pop() {
-            if !climbed.insert(node.clone()) {
+            if !self.climbed.insert(node.clone()) {
                 continue;
             }
-            let Some(edge_offsets) = self.body.adjacency.get(&node) else {
-                continue;
-            };
-            for &edge_offset in edge_offsets {
+            for edge_offset in self.view.postings(Table::Adjacency, &node) {
                 let Some(GraphRecord::Edge {
+                    id: edge_id,
                     label,
                     source,
                     target,
                     ..
-                }) = read_record_at(graph_bytes, edge_offset)
+                }) = self.view.record_at(edge_offset)
                 else {
                     continue;
                 };
@@ -603,15 +1218,14 @@ impl GraphIndex {
                 let is_parent_edge = target == node
                     && match label {
                         EdgeLabel::Contains | EdgeLabel::Defines => true,
-                        EdgeLabel::Imports => self.node_is_import_kind(&node, graph_bytes),
+                        EdgeLabel::Imports => self.node_is_import_kind(&node),
                         _ => false,
                     };
                 if is_parent_edge {
-                    offsets.insert(edge_offset);
-                    self.add_id_versions(&source, offsets);
-                    if let Some(parent_edges) = self.body.adjacency.get(&source) {
-                        offsets.extend(parent_edges.iter().copied());
-                    }
+                    self.add_edge(edge_offset, &edge_id);
+                    self.add_id_versions(&source);
+                    self.offsets
+                        .extend(self.view.postings(Table::Adjacency, &source));
                     stack.push(source);
                 }
             }
@@ -1210,9 +1824,18 @@ mod tests {
         let index = GraphIndex::build_from_bytes(text.as_bytes()).expect("build");
         // Climb from the module: must reach its defining file (via DEFINES)
         // but must NOT cross the IMPORTS edge to the importing file.
-        let mut offsets = BTreeSet::new();
-        let mut climbed = BTreeSet::new();
-        index.climb_ancestry(&module_id, text.as_bytes(), &mut offsets, &mut climbed);
+        let view = MemView {
+            body: &index.body,
+            bytes: text.as_bytes(),
+        };
+        let mut walk = Closure {
+            view: &view,
+            offsets: BTreeSet::new(),
+            expanded: BTreeSet::new(),
+            climbed: BTreeSet::new(),
+        };
+        walk.climb_ancestry(&module_id);
+        let offsets = walk.offsets;
         let importer_offsets = index.body.by_id.get(&importer).cloned().unwrap_or_default();
         for off in &importer_offsets {
             assert!(
@@ -1231,5 +1854,185 @@ mod tests {
             module_file_offsets.iter().any(|off| offsets.contains(off)),
             "module's defining file must be reached via DEFINES"
         );
+    }
+
+    /// Writes the sample graph and its index to a temp dir.
+    fn write_indexed(graph: &Graph) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("g.jsonl");
+        fs::write(&path, jsonl(graph)).expect("write graph");
+        GraphIndex::build(&path)
+            .expect("build")
+            .write_atomic(&index_path_for(&path))
+            .expect("write idx");
+        (dir, path)
+    }
+
+    #[test]
+    fn lazy_hydrate_matches_in_memory_closure() {
+        let (_dir, path) = write_indexed(&sample_graph());
+        let text = fs::read_to_string(&path).expect("read");
+        let eager = GraphIndex::build_from_bytes(text.as_bytes()).expect("build");
+        let lazy = LazyGraphIndex::open(&path).expect("open");
+        let name = Selector::ByName("caller".to_owned());
+        let want: Vec<GraphRecord> = eager
+            .closure_offsets(&name, text.as_bytes())
+            .expect("offsets")
+            .into_iter()
+            .filter_map(|o| read_record_at(text.as_bytes(), o))
+            .collect();
+        assert_eq!(lazy.hydrate(&name).expect("hydrate"), Some(want));
+        assert_eq!(lazy.hydrate(&Selector::Whole).expect("whole"), None);
+    }
+
+    #[test]
+    fn touched_file_with_same_bytes_stays_valid() {
+        let (_dir, path) = write_indexed(&sample_graph());
+        let bytes = fs::read(&path).expect("read");
+        fs::write(&path, &bytes).expect("rewrite same bytes");
+        assert!(LazyGraphIndex::open(&path).is_ok());
+    }
+
+    #[test]
+    fn same_length_edit_is_stale() {
+        let (_dir, path) = write_indexed(&sample_graph());
+        let mut bytes = fs::read(&path).expect("read");
+        let at = bytes.len() / 2;
+        bytes[at] = if bytes[at] == b'a' { b'b' } else { b'a' };
+        fs::write(&path, &bytes).expect("edit in place");
+        assert!(matches!(LazyGraphIndex::open(&path), Err(LoadError::Stale)));
+    }
+
+    #[test]
+    fn damaged_table_fails_hydrate_instead_of_answering() {
+        let (_dir, path) = write_indexed(&sample_graph());
+        let idx = index_path_for(&path);
+        let mut bytes = fs::read(&idx).expect("read idx");
+        // Claim an impossible entry count in the by-id table.
+        bytes[PREAMBLE_LEN..PREAMBLE_LEN + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        fs::write(&idx, &bytes).expect("damage idx");
+        let lazy = LazyGraphIndex::open(&path).expect("header is intact");
+        assert!(lazy.hydrate(&Selector::ById("x".to_owned())).is_err());
+    }
+
+    #[test]
+    fn lean_selectors_are_smaller_than_by_id() {
+        let graph = sample_graph();
+        let text = jsonl(&graph);
+        let index = GraphIndex::build_from_bytes(text.as_bytes()).expect("build");
+        let caller = sym_id("src/a.rs", "caller");
+        let count = |selector: Selector| {
+            index
+                .closure_offsets(&selector, text.as_bytes())
+                .expect("offsets")
+        };
+        let full = count(Selector::ById(caller.clone()));
+        let anchored = count(Selector::Anchored(caller.clone()));
+        let lineage = count(Selector::Lineage(caller.clone()));
+        assert!(lineage.len() <= anchored.len());
+        assert!(anchored.len() <= full.len());
+        assert!(lineage.iter().all(|o| anchored.contains(o)));
+        assert!(anchored.iter().all(|o| full.contains(o)));
+        // Both versions of the symbol are in even the smallest closure.
+        let versions = index.body.by_id.get(&caller).cloned().unwrap_or_default();
+        assert!(versions.iter().all(|o| lineage.contains(o)));
+    }
+
+    #[test]
+    fn sample_fingerprint_of_file_matches_bytes() {
+        let bytes: Vec<u8> = (0..100_000u32).flat_map(u32::to_le_bytes).collect();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("f");
+        fs::write(&path, &bytes).expect("write");
+        let file = fs::File::open(&path).expect("open");
+        assert_eq!(
+            sample_fingerprint_file(&file, bytes.len() as u64).expect("fp"),
+            sample_fingerprint_bytes(&bytes)
+        );
+    }
+
+    #[test]
+    fn climbed_containment_edge_pulls_its_tombstone() {
+        let mut graph = sample_graph();
+        let caller = sym_id("src/a.rs", "caller");
+        let defines_id = GraphRecord::edge(
+            EdgeLabel::Defines,
+            file_id("src/a.rs"),
+            caller.clone(),
+            None,
+            "defines".to_owned(),
+        )
+        .id()
+        .to_owned();
+        graph.push(GraphRecord::Tombstone {
+            id: format!("tomb:{defines_id}"),
+            schema_version: 1,
+            deleted_id: defines_id.clone(),
+            summary: "edge retracted".to_owned(),
+            producer: None,
+        });
+        let text = jsonl(&graph);
+        let index = GraphIndex::build_from_bytes(text.as_bytes()).expect("build");
+        let tombstone_offsets = index
+            .body
+            .by_deleted_id
+            .get(&defines_id)
+            .cloned()
+            .expect("tombstone indexed");
+        for selector in [Selector::Lineage(caller.clone()), Selector::ById(caller)] {
+            let closure = index
+                .closure_offsets(&selector, text.as_bytes())
+                .expect("offsets");
+            assert!(
+                tombstone_offsets.iter().all(|o| closure.contains(o)),
+                "{selector:?} must carry the edge tombstone"
+            );
+        }
+    }
+
+    /// A graph over 400 KB, so some bytes lie outside every sampled block.
+    fn large_graph() -> Graph {
+        let mut graph = Graph::new();
+        for n in 0..3000 {
+            let name = format!("symbol_number_{n:05}");
+            graph.push(GraphRecord::syntax_node(
+                sym_id("src/big.rs", &name),
+                NodeKind::Symbol,
+                "src/big.rs".to_owned(),
+                span(n + 1, n + 2),
+                name.clone(),
+                "rust",
+                format!("fn {name}"),
+            ));
+        }
+        graph
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_length_edit_with_restored_mtime_is_stale() {
+        let (_dir, path) = write_indexed(&large_graph());
+        let meta = fs::metadata(&path).expect("meta");
+        let mtime = meta.modified().expect("mtime");
+        let mut bytes = fs::read(&path).expect("read");
+        let ranges = sample_ranges(bytes.len() as u64);
+        let at = (bytes.len() / 3..bytes.len())
+            .find(|p| {
+                let pos = *p as u64;
+                ranges
+                    .iter()
+                    .all(|(o, n)| pos < *o || pos >= *o + *n as u64)
+                    && bytes[*p].is_ascii_digit()
+            })
+            .expect("an unsampled digit");
+        bytes[at] = if bytes[at] == b'7' { b'8' } else { b'7' };
+        fs::write(&path, &bytes).expect("edit in place");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_modified(mtime)
+            .expect("restore mtime");
+        assert!(matches!(LazyGraphIndex::open(&path), Err(LoadError::Stale)));
     }
 }

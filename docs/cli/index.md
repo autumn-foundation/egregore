@@ -40,35 +40,57 @@ refresh the index.
 
 ## Sidecar location and format
 
-The index is written to `<graph>.idx` adjacent to the graph (`foo.jsonl` →
-`foo.jsonl.idx`). It is a raw little-endian binary header, a `\n`, then one JSON
-line:
+The index is written to `<graph>.idx` next to the graph (`foo.jsonl` →
+`foo.jsonl.idx`). It is a binary file (format version 2):
 
-- **Header:** magic `EGIX`, `format_version` (`u32`), the graph file's byte
-  length (`u64`), and the graph file's BLAKE3 (`[u8; 32]`).
-- **Body:** deterministic sorted maps from record ids, node names,
-  repo-relative paths, node-kind strings, tombstone `deleted_id`s, and edge
-  adjacency to line-start byte offsets, plus a `has_temporal_history` boolean
-  (see below).
+- **Header:** magic `EGIX`, `format_version` (`u32`), graph byte length (`u64`),
+  graph BLAKE3, a stamp of the graph file's times and identity (`u64`), a
+  sample fingerprint (BLAKE3 of the length and 66 sampled 4 KiB blocks), and
+  the `has_temporal_history` flag (see below).
+- **Tables:** six sorted tables (record ids, tombstone `deleted_id`s, node
+  names, repo-relative paths, node kinds, edge adjacency). Each maps a key to
+  line-start byte offsets.
 
-The `has_temporal_history` flag (still format v1, an additive body field) is
-`true` when the indexed graph is a **history / corpus store** — any record
-carries temporal provenance, or a `Commit` node is present. It is recorded at
-build time so the loader can decide, before hydrating, whether the fast path is
-sound (see the next section).
+A query reads the tables in place with binary search. It does not read the
+whole graph and does not parse the index. A lookup needs about log n small
+reads, so its cost stays almost flat as the graph grows (issue #120).
+
+Two builds over the same file give the same bytes. The header holds a stamp of
+the file, so a copy of the file gives different bytes.
+
+The `has_temporal_history` flag is `true` when the indexed graph is a
+**history / corpus store**: any record carries temporal provenance, or a
+`Commit` node is present. The loader uses it to decide, before hydrating,
+whether the fast path is sound (see the next section).
 
 The write is atomic (`.idx.tmp` then rename), so a reader never observes a torn
 index. Repeated builds of an unchanged graph produce a byte-identical `.idx`.
 
 ## Content-addressed validity + transparent fallback
 
-An index is used for a query only when it is present, the magic matches, the
-`format_version` equals the version this build understands, and the stored graph
-length **and** BLAKE3 match the graph file's current bytes. Any mismatch —
-absent, corrupt, truncated, an unknown future version, or a stale hash because
-the graph changed — makes the query lane transparently cold-scan and return the
-current answer. The query path never fails because of the index and never writes
+A query uses an index only when the index is present, its magic and
+`format_version` match, and it matches the graph. The query checks the match in
+two steps:
+
+1. Cheap check: same length, same file stamp, and same sample fingerprint.
+2. Full check, when only the stamp differs (a copy or a touch): the full
+   BLAKE3 of the graph.
+
+On Unix the stamp includes the inode and the change time, so a copy that keeps
+the modification time (`cp -p`) is still seen.
+
+Any mismatch makes the query lane cold-scan and return the current answer. A
+mismatch is an absent, corrupt, truncated, or unknown-version index, or a
+changed graph. The query path never fails because of the index and never writes
 it.
+
+Limits:
+
+- The cheap check can miss a change that keeps the length, the stamp, and every
+  sampled block. Run `eg index` again after you edit a graph.
+- The tables have no checksum. A failed read makes the query cold-scan. A
+  damaged key can still give a missing match. Run `eg index` again if you
+  suspect damage.
 
 `eg index` refuses (exit 2, machine-readable `index_build_error`) any graph a
 cold load would also reject (a parse error or an unknown schema version) and
@@ -86,6 +108,8 @@ the cold scan because they need global topology or the commit timeline):
 - `eg query at <path>:<line>` and `eg query locate <path>:<line>`
 - `eg query file <path>` (current state)
 - `eg query who-imports <module-path>`
+- `eg query drift` (unscoped): it reads the drift nodes, then only the closure
+  of the top `--limit` rows.
 
 Every other `--graph` lane is unchanged (it reads the whole file exactly as
 before). The embedded `--data-dir` store has its own indexes and is out of scope

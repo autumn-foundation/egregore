@@ -80,6 +80,17 @@ fn resolve_query_data_dir_with(
     }
 }
 
+#[cfg(feature = "embeddings")]
+/// Resolve the store for a lane that needs one (no `--graph` form): the flag,
+/// else the pinned `data_dir`, else an error that names both.
+pub(crate) fn require_query_data_dir(lane: &str, data_dir: Option<PathBuf>) -> Result<PathBuf> {
+    resolve_query_data_dir(None, data_dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "`eg query {lane}` needs a store: pass --data-dir or pin `data_dir` in egregore.toml"
+        )
+    })
+}
+
 /// Resolve the effective `--data-dir`: explicit CLI flag > config file value >
 /// built-in default (`.egregore`, exactly as before issue #261).
 pub(crate) fn resolve_data_dir(flag: Option<&Path>) -> PathBuf {

@@ -257,6 +257,7 @@ pub fn stage_local_model_dir(dir: &Path, model_id: &str) -> Result<PathBuf, Reem
     for file in files {
         let target = canonical.join(file);
         let link = snapshot_dir.join(file);
+        #[cfg(unix)]
         if link.exists() {
             continue;
         }
@@ -266,7 +267,7 @@ pub fn stage_local_model_dir(dir: &Path, model_id: &str) -> Result<PathBuf, Reem
             message: error.to_string(),
         })?;
         #[cfg(not(unix))]
-        std::fs::copy(&target, &link).map_err(|error| ReembedError::Io {
+        copy_staged_file(&target, &link).map_err(|error| ReembedError::Io {
             path: link.clone(),
             message: error.to_string(),
         })?;
@@ -282,6 +283,43 @@ pub fn stage_local_model_dir(dir: &Path, model_id: &str) -> Result<PathBuf, Reem
         message: error.to_string(),
     })?;
     Ok(snapshot_dir)
+}
+
+/// Copies `src` to `dst` unless `dst` already holds the same bytes.
+///
+/// Non-Unix staging copies model files. A model directory that is retrained
+/// or replaced in place keeps its file names, so an existing copy is reused
+/// only when its content matches.
+#[cfg_attr(unix, allow(dead_code))]
+fn copy_staged_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if dst.exists() && files_match(src, dst)? {
+        return Ok(());
+    }
+    // Copy to a temporary name, then swap it in: a crash never leaves a
+    // truncated model file, and removing the old file first also clears a
+    // read-only attribute copied from an earlier source.
+    let mut tmp = dst.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::copy(src, &tmp)?;
+    if dst.exists() {
+        std::fs::remove_file(dst)?;
+    }
+    std::fs::rename(&tmp, dst)
+}
+
+/// True when both files have the same length and BLAKE3 digest.
+#[cfg_attr(unix, allow(dead_code))]
+fn files_match(a: &Path, b: &Path) -> std::io::Result<bool> {
+    if std::fs::metadata(a)?.len() != std::fs::metadata(b)?.len() {
+        return Ok(false);
+    }
+    let digest = |path: &Path| -> std::io::Result<blake3::Hash> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update_reader(std::fs::File::open(path)?)?;
+        Ok(hasher.finalize())
+    };
+    Ok(digest(a)? == digest(b)?)
 }
 
 /// Reads the model's DECLARED embedding dimension (`hidden_size` in
@@ -541,6 +579,38 @@ impl std::error::Error for ReembedError {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn staged_copy_is_refreshed_when_source_changes_in_place() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let src = dir.path().join("model.bin");
+        let dst = dir.path().join("copy.bin");
+        std::fs::write(&src, b"weights-v1").expect("write");
+        copy_staged_file(&src, &dst).expect("first copy");
+        // Same length, new bytes: a length-only check would miss it.
+        std::fs::write(&src, b"weights-v2").expect("rewrite");
+        copy_staged_file(&src, &dst).expect("refresh");
+        assert_eq!(std::fs::read(&dst).expect("read"), b"weights-v2");
+    }
+
+    #[test]
+    fn staged_copy_is_left_alone_when_content_matches() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let src = dir.path().join("model.bin");
+        let dst = dir.path().join("copy.bin");
+        std::fs::write(&src, b"same").expect("write");
+        std::fs::write(&dst, b"same").expect("write");
+        let before = std::fs::metadata(&dst)
+            .expect("meta")
+            .modified()
+            .expect("mtime");
+        copy_staged_file(&src, &dst).expect("no-op");
+        let after = std::fs::metadata(&dst)
+            .expect("meta")
+            .modified()
+            .expect("mtime");
+        assert_eq!(before, after);
+    }
+
     use super::*;
 
     /// A Hugging Face id (`org/model`) must resolve as a hub id even though

@@ -2265,9 +2265,10 @@ pub(crate) enum QuerySubcommand {
     Semantic {
         /// Query text (symbol name, description, or code snippet).
         query: String,
-        /// Embedded `AletheiaDB` data directory.
+        /// Embedded `AletheiaDB` data directory. Falls back to the `data_dir`
+        /// pinned in `egregore.toml`.
         #[arg(long)]
-        data_dir: PathBuf,
+        data_dir: Option<PathBuf>,
         /// Route the query through the running daemon instead of opening the store directly.
         #[arg(long)]
         daemon: bool,
@@ -2358,7 +2359,7 @@ pub(crate) enum QuerySubcommand {
         query: String,
         /// Embedded `AletheiaDB` data directory (must be ingested with `--embed`).
         #[arg(long)]
-        data_dir: PathBuf,
+        data_dir: Option<PathBuf>,
         /// Restrict results to one repository (see `eg query symbol --help`).
         #[arg(long)]
         repo: Option<String>,
@@ -2393,7 +2394,7 @@ pub(crate) enum QuerySubcommand {
         query: String,
         /// Embedded `AletheiaDB` data directory.
         #[arg(long)]
-        data_dir: PathBuf,
+        data_dir: Option<PathBuf>,
         /// Restrict results to one repository (see `eg query symbol --help`).
         #[arg(long)]
         repo: Option<String>,
@@ -9203,7 +9204,14 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                     .expect("clap requires --data-dir with --daemon");
                 return query_drift_via_daemon(dir, limit, repo.as_deref(), format);
             }
-            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            // Unscoped `--graph` reads take the sidecar-index fast path (issue
+            // #120): the answer needs only the top drift rows and their
+            // targets. `--repo` needs every repository to resolve its
+            // selector, so it reads the whole graph.
+            let records = match (graph.as_deref(), data_dir.as_deref(), repo.as_deref()) {
+                (Some(path), None, None) => load_drift_records(path, limit)?,
+                _ => load_query_records(graph.as_deref(), data_dir.as_deref())?,
+            };
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_drift(&records, limit, format, &index, selected.as_deref())
@@ -9269,6 +9277,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             format,
             embed_model,
         } => {
+            let data_dir = require_query_data_dir("semantic", data_dir)?;
             if daemon {
                 // `--under` conflicts with `--daemon` at the CLI layer (scoped
                 // retrieval is a local-CLI surface for this slice, issue #198),
@@ -9293,11 +9302,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             limit,
             format,
         } => {
-            let Some(data_dir) = resolve_query_data_dir(None, data_dir) else {
-                anyhow::bail!(
-                    "`eg query similar` needs a store: pass --data-dir or pin `data_dir` in egregore.toml"
-                );
-            };
+            let data_dir = require_query_data_dir("similar", data_dir)?;
             similar::query_similar_cmd(&handle, &data_dir, limit, format)
         }
         #[cfg(feature = "embeddings")]
@@ -9308,14 +9313,17 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             limit,
             min_score,
             supersession,
-        } => query_semantic_context(
-            &query,
-            &data_dir,
-            limit,
-            min_score,
-            repo.as_deref(),
-            supersession,
-        ),
+        } => {
+            let data_dir = require_query_data_dir("semantic-context", data_dir)?;
+            query_semantic_context(
+                &query,
+                &data_dir,
+                limit,
+                min_score,
+                repo.as_deref(),
+                supersession,
+            )
+        }
         #[cfg(feature = "embeddings")]
         QuerySubcommand::SemanticMemory {
             query,
@@ -9331,21 +9339,24 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             similarity_threshold,
             collapse_mode,
             include_retired,
-        } => query_semantic_memory(
-            &query,
-            &data_dir,
-            limit,
-            repo.as_deref(),
-            verified_only,
-            agent.as_deref(),
-            not_agent.as_deref(),
-            format,
-            supersession,
-            collapse,
-            similarity_threshold,
-            collapse_mode,
-            include_retired,
-        ),
+        } => {
+            let data_dir = require_query_data_dir("semantic-memory", data_dir)?;
+            query_semantic_memory(
+                &query,
+                &data_dir,
+                limit,
+                repo.as_deref(),
+                verified_only,
+                agent.as_deref(),
+                not_agent.as_deref(),
+                format,
+                supersession,
+                collapse,
+                similarity_threshold,
+                collapse_mode,
+                include_retired,
+            )
+        }
         QuerySubcommand::Context {
             name,
             graph,
@@ -9404,12 +9415,15 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // store (cold scan, `Whole` selector, or `--data-dir`).
             let store_coverage = graph.as_deref().map_or_else(
                 || query::StoreCoverage::from_records(&records),
-                |path| match crate::graph_index::GraphIndex::load_for(path) {
-                    Ok(index) if !index.body.has_temporal_history => {
-                        query::StoreCoverage::from_index_kind_keys(
-                            index.body.by_kind.keys().map(String::as_str),
-                        )
-                    }
+                |path| match crate::graph_index::LazyGraphIndex::open(path) {
+                    Ok(index) if !index.has_temporal_history() => index.kind_keys().map_or_else(
+                        |_| query::StoreCoverage::from_records(&records),
+                        |keys| {
+                            query::StoreCoverage::from_index_kind_keys(
+                                keys.iter().map(String::as_str),
+                            )
+                        },
+                    ),
                     _ => query::StoreCoverage::from_records(&records),
                 },
             );

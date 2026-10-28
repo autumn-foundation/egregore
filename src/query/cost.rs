@@ -26,6 +26,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::BTreeMap;
+
+use super::liveness::Liveness;
 use crate::ir::{
     COST_USAGE_DERIVATION_TRANSCRIPT, CostUsagePayload, EdgeLabel, GraphRecord, NodeKind,
 };
@@ -189,8 +192,10 @@ pub fn bounded_cost_text(value: &str) -> String {
 pub fn cost_rollup(records: &[GraphRecord], filters: &CostFilters, limit: usize) -> CostRollup {
     let mut rows: Vec<CostRow> = Vec::new();
     let mut diagnostics: Vec<CostDiagnostic> = Vec::new();
+    let liveness = Liveness::new(records);
+    let runs = authored_by_runs(records, &liveness);
 
-    for record in records {
+    for (index, record) in records.iter().enumerate() {
         let GraphRecord::Node {
             id,
             kind,
@@ -203,6 +208,11 @@ pub fn cost_rollup(records: &[GraphRecord], filters: &CostFilters, limit: usize)
             continue;
         };
         if *kind != NodeKind::CostUsage {
+            continue;
+        }
+        // Latest write wins, as in the embedded read: skip forgotten
+        // records and superseded versions.
+        if liveness.deleted(id) || !liveness.is_latest_node_version(id, index) {
             continue;
         }
         let payload: CostUsagePayload = match text
@@ -248,7 +258,7 @@ pub fn cost_rollup(records: &[GraphRecord], filters: &CostFilters, limit: usize)
             }
         }
 
-        let run_id = authored_by_run(records, id);
+        let run_id = runs.get(id.as_str()).map(|run| (*run).to_owned());
         if run_id.is_none() {
             diagnostics.push(CostDiagnostic {
                 code: "cost_usage_without_run_edge".to_owned(),
@@ -301,21 +311,31 @@ pub fn cost_rollup(records: &[GraphRecord], filters: &CostFilters, limit: usize)
     }
 }
 
-/// Resolve the `AgentRun` a `CostUsage` node belongs to via its `AuthoredBy`
-/// edge (edge-derived membership, never a matching ID string).
-fn authored_by_run(records: &[GraphRecord], cost_id: &str) -> Option<String> {
-    records.iter().find_map(|r| {
+/// Map each source ID to the `AgentRun` its first live `AuthoredBy` edge names
+/// (edge-derived membership, never a matching ID string). One pass keeps the
+/// rollup linear in the record count.
+fn authored_by_runs<'a>(
+    records: &'a [GraphRecord],
+    liveness: &Liveness<'_>,
+) -> BTreeMap<&'a str, &'a str> {
+    let mut runs = BTreeMap::new();
+    for (index, record) in records.iter().enumerate() {
         let GraphRecord::Edge {
-            label,
+            id,
+            label: EdgeLabel::AuthoredBy,
             source,
             target,
             ..
-        } = r
+        } = record
         else {
-            return None;
+            continue;
         };
-        (*label == EdgeLabel::AuthoredBy && source == cost_id).then(|| target.clone())
-    })
+        if liveness.deleted(id) || !liveness.is_latest_edge_version(id, index) {
+            continue;
+        }
+        runs.entry(source.as_str()).or_insert(target.as_str());
+    }
+    runs
 }
 
 /// Sum the present values of every matching row. A measurement no row carries
@@ -354,5 +374,102 @@ const fn add_opt_u64(acc: Option<u64>, v: Option<u64>) -> Option<u64> {
         (Some(a), None) => Some(a),
         (None, Some(b)) => Some(b),
         (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cost_node(id: &str, tokens: u64) -> GraphRecord {
+        let mut node = GraphRecord::node(
+            id.to_owned(),
+            NodeKind::CostUsage,
+            None,
+            None,
+            None,
+            "cost".to_owned(),
+        );
+        if let GraphRecord::Node {
+            text, session_id, ..
+        } = &mut node
+        {
+            *text = Some(
+                serde_json::json!({
+                    "derivation": COST_USAGE_DERIVATION_TRANSCRIPT,
+                    "prompt_tokens": tokens,
+                })
+                .to_string(),
+            );
+            *session_id = Some("sess".to_owned());
+        }
+        node
+    }
+
+    fn tombstone(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("tomb:{deleted_id}"),
+            schema_version: 1,
+            deleted_id: deleted_id.to_owned(),
+            summary: "gone".to_owned(),
+            producer: None,
+        }
+    }
+
+    fn authored_by(cost: &str, run: &str) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::AuthoredBy,
+            cost.to_owned(),
+            run.to_owned(),
+            None,
+            "authored".to_owned(),
+        )
+    }
+
+    fn rollup(records: &[GraphRecord]) -> CostRollup {
+        cost_rollup(records, &CostFilters::default(), COST_DEFAULT_LIMIT)
+    }
+
+    #[test]
+    fn same_id_rewrite_counts_once_with_latest_values() {
+        let records = vec![cost_node("c1", 10), cost_node("c1", 25)];
+        let out = rollup(&records);
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.totals.matching_rows, 1);
+        assert_eq!(out.totals.prompt_tokens, Some(25));
+    }
+
+    #[test]
+    fn tombstoned_record_is_excluded_from_rows_totals_and_diagnostics() {
+        let records = vec![cost_node("c1", 10), cost_node("c2", 5), tombstone("c1")];
+        let out = rollup(&records);
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0].record_id, "c2");
+        assert_eq!(out.totals.prompt_tokens, Some(5));
+        assert!(out.diagnostics.iter().all(|d| d.record_id != "c1"));
+    }
+
+    #[test]
+    fn record_revived_after_tombstone_is_live() {
+        let records = vec![cost_node("c1", 10), tombstone("c1"), cost_node("c1", 12)];
+        let out = rollup(&records);
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.totals.prompt_tokens, Some(12));
+    }
+
+    #[test]
+    fn run_id_comes_from_the_live_authored_by_edge() {
+        let records = vec![cost_node("c1", 1), authored_by("c1", "run-a")];
+        assert_eq!(rollup(&records).rows[0].run_id.as_deref(), Some("run-a"));
+    }
+
+    #[test]
+    fn tombstoned_authored_by_edge_leaves_run_unknown() {
+        let edge = authored_by("c1", "run-a");
+        let edge_id = edge.id().to_owned();
+        let records = vec![cost_node("c1", 1), edge, tombstone(&edge_id)];
+        let out = rollup(&records);
+        assert_eq!(out.rows[0].run_id, None);
+        assert_eq!(out.diagnostics.len(), 1);
     }
 }

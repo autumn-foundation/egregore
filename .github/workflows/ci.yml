@@ -93,11 +93,6 @@ jobs:
     name: structural query latency budget + scaling gate
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Expected-red until the optimization slice lands (issue #120 is the
-    # measurement slice; current scaling is ~10x vs the 2.0x ceiling because
-    # the query path loads the whole store per invocation). The failure stays
-    # visible in the UI without blocking CI; remove this once the gate is green.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Cache cargo build
