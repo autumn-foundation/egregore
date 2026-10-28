@@ -307,40 +307,42 @@ fn sample_fingerprint_file(file: &fs::File, len: u64) -> std::io::Result<[u8; 32
 }
 
 /// A stamp of a file's identity and change times (`0` when the platform
-/// reports none). On Unix it mixes the modification time, the change time,
-/// the inode, and the device, so a copy that keeps the modification time
-/// (`cp -p`, `rsync -t`) still gets a different stamp.
+/// cannot give a reliable one). On Unix it mixes the modification time, the
+/// change time, the inode, and the device, so a copy that keeps the
+/// modification time (`cp -p`, `rsync -t`) still gets a different stamp.
+/// Other platforms report `0`, so every query there checks the full BLAKE3.
 fn stat_stamp(meta: &fs::Metadata) -> u64 {
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(0));
-    if mtime == 0 {
-        return 0;
-    }
     #[cfg(unix)]
-    let extra = {
+    {
         use std::os::unix::fs::MetadataExt;
-        [
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(0));
+        if mtime == 0 {
+            return 0;
+        }
+        let mut hasher = blake3::Hasher::new();
+        for part in [
+            mtime,
             meta.ctime().cast_unsigned(),
             meta.ctime_nsec().cast_unsigned(),
             meta.ino(),
             meta.dev(),
-        ]
-    };
-    #[cfg(not(unix))]
-    let extra = [0u64; 4];
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&mtime.to_le_bytes());
-    for part in extra {
-        hasher.update(&part.to_le_bytes());
+        ] {
+            hasher.update(&part.to_le_bytes());
+        }
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+        // `0` means "no stamp"; keep a real stamp non-zero.
+        u64::from_le_bytes(raw).max(1)
     }
-    let digest = hasher.finalize();
-    let mut raw = [0u8; 8];
-    raw.copy_from_slice(&digest.as_bytes()[..8]);
-    // `0` means "no stamp"; keep a real stamp non-zero.
-    u64::from_le_bytes(raw).max(1)
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        0
+    }
 }
 
 /// Reads exactly `buf.len()` bytes at `offset` without moving a cursor.
