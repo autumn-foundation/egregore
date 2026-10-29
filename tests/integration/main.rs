@@ -13,6 +13,7 @@ mod asof_file_symbols;
 mod author_attribution_doc;
 mod autoindex;
 mod brief;
+mod bulk_ingest;
 mod bundle;
 mod capture_bench;
 mod capture_coverage;

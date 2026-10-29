@@ -1227,6 +1227,23 @@ pub(crate) enum Commands {
         #[cfg(feature = "embedded-aletheiadb")]
         #[arg(long)]
         force: bool,
+        /// Do not use the bulk (batched-transaction) write path for
+        /// `--adapter embedded`. By default the embedded sink commits
+        /// records in multi-record transactions — the JSONL analog of
+        /// `AletheiaDB`'s bulk CSV import path — and classifies edges
+        /// against a single-pass index instead of one store scan per edge.
+        /// `--no-bulk` restores the historical one-transaction-per-record
+        /// path. The ingest report and the resulting store are identical
+        /// either way.
+        #[cfg(feature = "embedded-aletheiadb")]
+        #[arg(long)]
+        no_bulk: bool,
+        /// Records committed per bulk transaction for `--adapter embedded`
+        /// (default 1000, matching `AletheiaDB`'s bulk importer batch
+        /// size). Ignored with `--no-bulk`.
+        #[cfg(feature = "embedded-aletheiadb")]
+        #[arg(long, default_value_t = 1000)]
+        bulk_batch_size: usize,
         /// Dangling cross-domain evidence citation policy (issue #241):
         /// `quarantine` (default) skips records whose evidence citations cite
         /// no live node and ingests the rest of the batch; `reject-batch`
@@ -7049,6 +7066,10 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             #[cfg(feature = "embedded-aletheiadb")]
             force,
             #[cfg(feature = "embedded-aletheiadb")]
+            no_bulk,
+            #[cfg(feature = "embedded-aletheiadb")]
+            bulk_batch_size,
+            #[cfg(feature = "embedded-aletheiadb")]
             encrypted,
             #[cfg(feature = "embedded-aletheiadb")]
             key_file,
@@ -7069,6 +7090,10 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             embed_model,
             #[cfg(feature = "embedded-aletheiadb")]
             force,
+            #[cfg(feature = "embedded-aletheiadb")]
+            no_bulk,
+            #[cfg(feature = "embedded-aletheiadb")]
+            bulk_batch_size,
             #[cfg(feature = "embedded-aletheiadb")]
             encrypted,
             #[cfg(feature = "embedded-aletheiadb")]

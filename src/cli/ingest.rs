@@ -154,6 +154,10 @@ pub(crate) fn ingest(
     #[cfg(feature = "embeddings")] embed: bool,
     #[cfg(feature = "embeddings")] embed_model: Option<String>,
     #[cfg(feature = "embedded-aletheiadb")] force: bool,
+    // Bulk (batched-transaction) write path for the embedded sink
+    // (`--no-bulk` / `--bulk-batch-size`).
+    #[cfg(feature = "embedded-aletheiadb")] no_bulk: bool,
+    #[cfg(feature = "embedded-aletheiadb")] bulk_batch_size: usize,
     // Encrypted local store mode (issue #54): creation-time opt-in.
     #[cfg(feature = "embedded-aletheiadb")] encrypted: bool,
     #[cfg(feature = "embedded-aletheiadb")] key_file: Option<&Path>,
@@ -258,6 +262,12 @@ pub(crate) fn ingest(
             #[cfg(not(feature = "embeddings"))]
             let mut sink = EmbeddedAletheiaSink::open(&data_dir)
                 .map_err(|error| embedded_write_open_error(&data_dir, error))?;
+            // Bulk write path (default on): batched-transaction commits via
+            // `write_and_verify_records`; `--no-bulk` restores per-record
+            // transactions. Applies to the `--embed` sink identically — the
+            // prepared node write carries the embedding vector either way,
+            // and matched-node backfill runs in both paths.
+            sink.set_bulk_writes(!no_bulk, bulk_batch_size);
             // Issue #54: fresh store + --encrypted — flip the engine's
             // durable encryption authority, then the marker is written inside
             // `enable_store_encryption`. Must happen before any record is

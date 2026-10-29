@@ -14,6 +14,40 @@ eg ingest graph.jsonl --adapter daemon --data-dir .egregore --idempotency-key <k
 through a running daemon). Concurrency rules for the embedded/daemon writers are
 in [`embedded-concurrency.md`](embedded-concurrency.md).
 
+## Bulk write path (batched transactions)
+
+For `--adapter embedded`, records are committed in **multi-record
+transactions** by default — the JSONL analog of `AletheiaDB`'s bulk CSV
+import path (`nodes_from_csv` / `edges_from_csv`, which commit
+`batch_size`-row chunks through a single `db.write`). The embedded sink
+classifies each record against shared snapshots (one active-tombstone set
+per chunk; one edge index per ingest, maintained as chunks commit) instead
+of paying one transaction commit per record plus — for edges — one full
+store scan per record. A chunk whose transaction fails is redone through
+the per-record path, and a record that fails inside a chunk fails alone
+with the same message it would have produced per-record. An edge whose
+endpoint resolution could depend on a node write pending in the same
+chunk (a temporal edge, or an edge to a node being rewritten) is likewise
+routed through the per-record path at its exact stream position, after
+the pending writes commit. The ingest report and the resulting store are
+identical either way; only the cost changes. Measured on this repo's
+dogfood corpora (debug build, 2026-10-28): the 14,613-record hipp graph
+ingests in 10.1 s instead of 720.5 s through `--no-bulk` with the same
+binary (856 s with the previous release binary), and a 1,805-record
+LintSuppression-heavy slice in 3.4 s instead of 64.0 s — with
+byte-identical `eg export` dumps from the two paths' stores.
+
+- `--bulk-batch-size <N>` sets the records committed per transaction
+  (default 1000, matching `AletheiaDB`'s importer default).
+- `--no-bulk` restores the historical one-transaction-per-record path.
+
+The daemon adapter routes through the daemon's own ingest handler, which
+uses the same sink machinery server-side; the flags themselves apply to
+the embedded adapter only. `--embed` ingests use the bulk path too: the
+prepared node write carries the record's embedding vector exactly as the
+per-record write does, and matched-node embedding backfill runs in both
+paths.
+
 ## Sidecar index auto-build (issue #447)
 
 After a successful ingest — every adapter, `dry-run` included — `eg ingest`

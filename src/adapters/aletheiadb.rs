@@ -15,7 +15,7 @@ use crate::embeddings::{EmbeddingVectorKey, EmbeddingVectorMap};
 use crate::{
     adapters::{
         AdapterError, AdapterResult, ExpectedRecordState, GraphSink, InspectStoreReport,
-        WriteOutcome, validate_adapter_record_version,
+        WriteOutcome, validate_adapter_record_version, write_and_verify,
     },
     daemon::StoreLease,
     identity::{is_local_remote_url, repository_id_matches_payload},
@@ -149,6 +149,13 @@ pub struct EmbeddedAletheiaSink {
     /// `egregore_seq` system was introduced (i.e., they have no `egregore_seq` property).
     /// Used as a fallback staleness check when both the edge and tombstone lack sequence metadata.
     legacy_edge_counts: BTreeMap<String, usize>,
+    /// Whether the bulk (batched-transaction) write path serves
+    /// `write_and_verify_records`. On by default; `eg ingest --no-bulk`
+    /// disables it, restoring one transaction per record.
+    bulk_enabled: bool,
+    /// Records committed per bulk transaction (the JSONL analog of
+    /// `AletheiaDB`'s bulk-import `batch_size`).
+    bulk_batch_size: usize,
     /// Root the store was opened from, retained so the vector-index state probe
     /// (issue #489) can tell a skipped-at-load index from one that never
     /// existed. Read-only: never written through, never re-persisted.
@@ -164,11 +171,147 @@ pub struct EmbeddedAletheiaSink {
     _store_gate_permit: embedded_store_gate::StorePermit,
 }
 
+/// Default number of records committed per bulk transaction, matching
+/// `AletheiaDB`'s bulk importer default (`ImportConfig::batch_size`).
+const DEFAULT_BULK_BATCH_SIZE: usize = 1000;
+
 #[derive(Debug, Clone, Copy)]
 enum StoredRecord {
     Node(::aletheiadb::NodeId),
     Edge(::aletheiadb::EdgeId),
     Tombstone(::aletheiadb::NodeId),
+}
+
+/// A node write prepared for commit: label plus the full property map
+/// (including the `egregore_seq` stamp, assigned at prepare time so
+/// prepares happen in write order). Built by
+/// [`EmbeddedAletheiaSink::prepare_node_write`], shared by the per-record
+/// and bulk write paths; committing and bookkeeping stay with the caller.
+struct PreparedNodeWrite {
+    label: &'static str,
+    properties: ::aletheiadb::PropertyMap,
+}
+
+/// An edge write prepared for commit, built by
+/// [`EmbeddedAletheiaSink::prepare_edge_write`].
+struct PreparedEdgeWrite {
+    label: String,
+    properties: ::aletheiadb::PropertyMap,
+    seq: u64,
+}
+
+/// A tombstone write prepared for commit, built by
+/// [`EmbeddedAletheiaSink::prepare_tombstone_write`].
+struct PreparedTombstoneWrite {
+    properties: ::aletheiadb::PropertyMap,
+    seq: u64,
+}
+
+/// One record's write prepared for a bulk chunk commit
+/// ([`EmbeddedAletheiaSink::commit_prepared`]).
+enum PreparedWrite {
+    /// A node (or tombstone-node) creation.
+    Node {
+        /// Stable record ID, used to resolve deferred edge endpoints.
+        record_id: String,
+        /// `AletheiaDB` node label.
+        label: &'static str,
+        /// Full property map.
+        properties: ::aletheiadb::PropertyMap,
+    },
+    /// An edge creation.
+    Edge {
+        /// `AletheiaDB` edge label.
+        label: String,
+        /// Full property map.
+        properties: ::aletheiadb::PropertyMap,
+        /// The `egregore_seq` stamped into the properties, kept for
+        /// post-commit bookkeeping.
+        seq: u64,
+        /// Source endpoint.
+        source: EndpointRef,
+        /// Target endpoint.
+        target: EndpointRef,
+    },
+    /// A tombstone (stored as a node with the tombstone label).
+    Tombstone {
+        /// Full property map.
+        properties: ::aletheiadb::PropertyMap,
+        /// The `egregore_seq` stamped into the properties.
+        seq: u64,
+    },
+}
+
+/// How a prepared edge's endpoint is resolved at chunk commit time.
+enum EndpointRef {
+    /// A physical node that already exists (resolved against the store's
+    /// lookup index before the chunk commits).
+    Known(::aletheiadb::NodeId),
+    /// The stable record ID of a node created earlier in the same chunk;
+    /// resolved from the transaction's own creations.
+    Deferred(String),
+}
+
+/// The outcome of resolving one edge endpoint for a bulk chunk.
+enum BulkEndpoint {
+    /// The endpoint is settled: a stored physical node, or deferred to a
+    /// node created earlier in the same chunk (provably the node the
+    /// sequential path would pick — see `bulk_endpoint_ref`).
+    Resolved(EndpointRef),
+    /// The endpoint's resolution depends on a node write pending in this
+    /// chunk, so no classification made now can be trusted: the edge must
+    /// go through the exact per-record path at its stream position, after
+    /// the pending writes commit.
+    PerRecord,
+    /// Resolution failed and no in-chunk write can change that: this is
+    /// the record's failure, identical to the per-record path's.
+    Failed(AdapterError),
+}
+
+/// The outcome of one bulk chunk pass.
+enum ChunkPass {
+    /// Every record in the chunk has a result.
+    Done(Vec<AdapterResult<WriteOutcome>>),
+    /// The record at this slot must be written per-record (its endpoint
+    /// resolution is order-sensitive); the partial pass committed
+    /// nothing, and the caller re-drives the surrounding records.
+    SplitAt(usize),
+}
+
+/// One record's classification outcome inside a bulk chunk, before the
+/// chunk commits.
+enum BulkChunkItem {
+    /// The sink already holds byte-identical state; nothing to write.
+    Unchanged,
+    /// A prepared write, taken out when the chunk's ops are assembled.
+    Write(Option<PreparedWrite>),
+    /// Classification failed; this is the record's result.
+    Failed(AdapterError),
+}
+
+/// A physical write created by a bulk chunk commit, handed back for
+/// post-commit bookkeeping.
+enum CreatedWrite {
+    /// A created node.
+    Node(::aletheiadb::NodeId),
+    /// A created edge with its resolved endpoints and `egregore_seq`.
+    Edge {
+        /// Physical edge ID.
+        edge_id: ::aletheiadb::EdgeId,
+        /// Resolved source node.
+        source: ::aletheiadb::NodeId,
+        /// Resolved target node.
+        target: ::aletheiadb::NodeId,
+        /// The `egregore_seq` stamped at prepare time.
+        seq: u64,
+    },
+    /// A created tombstone node with its `egregore_seq`.
+    Tombstone {
+        /// Physical node ID.
+        node_id: ::aletheiadb::NodeId,
+        /// The `egregore_seq` stamped at prepare time.
+        seq: u64,
+    },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -425,6 +568,8 @@ impl EmbeddedAletheiaSink {
             edge_seqs: BTreeMap::new(),
             tombstone_node_seqs: BTreeMap::new(),
             legacy_edge_counts: BTreeMap::new(),
+            bulk_enabled: true,
+            bulk_batch_size: DEFAULT_BULK_BATCH_SIZE,
             data_dir: data_dir.to_path_buf(),
             _lease: lease,
             #[cfg(feature = "embeddings")]
@@ -710,6 +855,19 @@ impl EmbeddedAletheiaSink {
         self.db
             .persist_indexes()
             .map_err(|error| classify_store_error("embedded-store", error.to_string()))
+    }
+
+    /// Configures the bulk (batched-transaction) write path that serves
+    /// [`GraphSink::write_and_verify_records`] for this sink.
+    ///
+    /// Enabled by default with [`DEFAULT_BULK_BATCH_SIZE`]. `enabled =
+    /// false` restores the historical one-transaction-per-record behavior
+    /// (`eg ingest --no-bulk`); `batch_size` is clamped to at least 1, where
+    /// 1 degenerates to per-record commits through the bulk machinery. The
+    /// per-record result contract is identical either way.
+    pub fn set_bulk_writes(&mut self, enabled: bool, batch_size: usize) {
+        self.bulk_enabled = enabled;
+        self.bulk_batch_size = batch_size.max(1);
     }
 
     /// Reads all records from the embedded store for query purposes.
@@ -2628,6 +2786,13 @@ impl GraphSink for EmbeddedAletheiaSink {
         self.read_back_until(record_id, None)
     }
 
+    fn write_and_verify_records(
+        &mut self,
+        records: &[&GraphRecord],
+    ) -> Vec<AdapterResult<WriteOutcome>> {
+        self.write_records_bulk(records)
+    }
+
     fn verify_record(&self, record: &GraphRecord) -> AdapterResult<()> {
         let Some(handle) = self.record_handles.get(record.id()).copied() else {
             // The write was skipped because `expected_record_state` reported
@@ -2803,6 +2968,22 @@ impl EmbeddedAletheiaSink {
             self.backfill_embedding_for_matched_node(record)?;
             return Ok(WriteOutcome::Unchanged);
         }
+        let prepared = self.prepare_node_write(record);
+        let node_id = self
+            .db
+            .create_node(prepared.label, prepared.properties)
+            .map_err(|error| classify_store_error(record.id(), error.to_string()))?;
+        self.bookkeep_node_write(record, node_id)?;
+        Ok(WriteOutcome::Inserted)
+    }
+
+    /// Builds the physical write for a node record without committing it:
+    /// assigns the `egregore_seq` stamp and builds the full property map
+    /// (including the embedding vector when the sink carries one for the
+    /// record). Shared by the per-record write path and the bulk write
+    /// path; committing and bookkeeping stay with the caller.
+    #[allow(clippy::too_many_lines)]
+    fn prepare_node_write(&mut self, record: &GraphRecord) -> PreparedNodeWrite {
         let GraphRecord::Node {
             id,
             kind,
@@ -3260,10 +3441,26 @@ impl EmbeddedAletheiaSink {
             builder = builder.insert_vector("embedding", &vector);
         }
 
-        let node_id = self
-            .db
-            .create_node(node_label(*kind), builder.build())
-            .map_err(|error| classify_store_error(id, error.to_string()))?;
+        PreparedNodeWrite {
+            label: node_label(*kind),
+            properties: builder.build(),
+        }
+    }
+
+    /// Post-commit bookkeeping for a created node: verifies the stored
+    /// `codegraph_id` and registers the record in the lookup index and the
+    /// handle map. Shared by the per-record and bulk write paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError::ReadBack`] when the created node cannot be
+    /// read back or carries a different `codegraph_id`.
+    fn bookkeep_node_write(
+        &mut self,
+        record: &GraphRecord,
+        node_id: ::aletheiadb::NodeId,
+    ) -> AdapterResult<()> {
+        let id = record.id().to_owned();
         let node = self
             .db
             .get_node(node_id)
@@ -3277,16 +3474,15 @@ impl EmbeddedAletheiaSink {
             != Some(id.as_str())
         {
             return Err(AdapterError::ReadBack {
-                record_id: id.clone(),
+                record_id: id,
                 message: "embedded node codegraph_id mismatch".to_owned(),
             });
         }
 
-        let temporal_key = temporal_read_key_from_properties(id, |key| node.get_property(key))?;
+        let temporal_key = temporal_read_key_from_properties(&id, |key| node.get_property(key))?;
         self.node_lookup.insert(id.clone(), node_id, temporal_key);
-        self.record_handles
-            .insert(id.clone(), StoredRecord::Node(node_id));
-        Ok(WriteOutcome::Inserted)
+        self.record_handles.insert(id, StoredRecord::Node(node_id));
+        Ok(())
     }
 
     #[cfg(feature = "embeddings")]
@@ -3603,6 +3799,24 @@ impl EmbeddedAletheiaSink {
         {
             return Ok(WriteOutcome::Unchanged);
         }
+        let prepared = self.prepare_tombstone_write(record);
+        let node_id = self
+            .db
+            .create_node(
+                crate::schema_constraints::TOMBSTONE_LABEL,
+                prepared.properties,
+            )
+            .map_err(|error| AdapterError::Rejected {
+                record_id: record.id().to_owned(),
+                message: error.to_string(),
+            })?;
+        self.bookkeep_tombstone_write(record, node_id, prepared.seq)?;
+        Ok(WriteOutcome::Inserted)
+    }
+
+    /// Builds the physical write for a tombstone record without committing
+    /// it. Shared by the per-record write path and the bulk write path.
+    fn prepare_tombstone_write(&mut self, record: &GraphRecord) -> PreparedTombstoneWrite {
         let GraphRecord::Tombstone {
             id,
             schema_version,
@@ -3625,13 +3839,23 @@ impl EmbeddedAletheiaSink {
             builder = builder.insert("producer_json", json.as_str());
         }
         let properties = builder.build();
-        let node_id = self
-            .db
-            .create_node(crate::schema_constraints::TOMBSTONE_LABEL, properties)
-            .map_err(|error| AdapterError::Rejected {
-                record_id: id.clone(),
-                message: error.to_string(),
-            })?;
+        PreparedTombstoneWrite { properties, seq }
+    }
+
+    /// Post-commit bookkeeping for a created tombstone node. Shared by the
+    /// per-record and bulk write paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError::ReadBack`] when the created tombstone node
+    /// cannot be read back or carries a different `codegraph_id`.
+    fn bookkeep_tombstone_write(
+        &mut self,
+        record: &GraphRecord,
+        node_id: ::aletheiadb::NodeId,
+        seq: u64,
+    ) -> AdapterResult<()> {
+        let id = record.id().to_owned();
         let node = self
             .db
             .get_node(node_id)
@@ -3645,7 +3869,7 @@ impl EmbeddedAletheiaSink {
             != Some(id.as_str())
         {
             return Err(AdapterError::ReadBack {
-                record_id: id.clone(),
+                record_id: id,
                 message: "embedded tombstone codegraph_id mismatch".to_owned(),
             });
         }
@@ -3653,8 +3877,8 @@ impl EmbeddedAletheiaSink {
         self.tombstone_ids.insert(id.clone(), node_id);
         self.tombstone_node_seqs.insert(node_id, seq);
         self.record_handles
-            .insert(id.clone(), StoredRecord::Tombstone(node_id));
-        Ok(WriteOutcome::Inserted)
+            .insert(id, StoredRecord::Tombstone(node_id));
+        Ok(())
     }
 
     fn write_edge(&mut self, record: &GraphRecord) -> AdapterResult<WriteOutcome> {
@@ -3675,6 +3899,35 @@ impl EmbeddedAletheiaSink {
 
         let GraphRecord::Edge {
             id,
+            source,
+            target,
+            temporal,
+            ..
+        } = record
+        else {
+            unreachable!("write_edge called with non-edge record");
+        };
+        let source_id = self.resolve_node_id(id, source, temporal.as_ref(), "source")?;
+        let target_id = self.resolve_node_id(id, target, temporal.as_ref(), "target")?;
+        let prepared = self.prepare_edge_write(record);
+        let edge_id = self
+            .db
+            .create_edge(source_id, target_id, &prepared.label, prepared.properties)
+            .map_err(|error| AdapterError::Rejected {
+                record_id: id.clone(),
+                message: error.to_string(),
+            })?;
+        self.bookkeep_edge_write(record, edge_id, source_id, target_id, prepared.seq)?;
+        Ok(WriteOutcome::Inserted)
+    }
+
+    /// Builds the physical write for an edge record without committing it:
+    /// assigns the `egregore_seq` stamp and builds the full property map.
+    /// Endpoint resolution and bookkeeping stay with the caller. Shared by
+    /// the per-record write path and the bulk write path.
+    fn prepare_edge_write(&mut self, record: &GraphRecord) -> PreparedEdgeWrite {
+        let GraphRecord::Edge {
+            id,
             schema_version,
             label,
             source,
@@ -3693,8 +3946,6 @@ impl EmbeddedAletheiaSink {
         else {
             unreachable!("write_edge called with non-edge record");
         };
-        let source_id = self.resolve_node_id(id, source, temporal.as_ref(), "source")?;
-        let target_id = self.resolve_node_id(id, target, temporal.as_ref(), "target")?;
         self.write_seq += 1;
         let seq = self.write_seq;
         let seq_str = seq.to_string();
@@ -3741,13 +3992,30 @@ impl EmbeddedAletheiaSink {
             builder = builder.insert("producer_json", json.as_str());
         }
 
-        let edge_id = self
-            .db
-            .create_edge(source_id, target_id, label.as_str(), builder.build())
-            .map_err(|error| AdapterError::Rejected {
-                record_id: id.clone(),
-                message: error.to_string(),
-            })?;
+        PreparedEdgeWrite {
+            label: label.as_str().to_owned(),
+            properties: builder.build(),
+            seq,
+        }
+    }
+
+    /// Post-commit bookkeeping for a created edge: verifies the stored
+    /// endpoints and registers the handle and write sequence. Shared by the
+    /// per-record and bulk write paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError::ReadBack`] when the created edge's endpoints
+    /// cannot be read back or differ from the resolved endpoints.
+    fn bookkeep_edge_write(
+        &mut self,
+        record: &GraphRecord,
+        edge_id: ::aletheiadb::EdgeId,
+        source_id: ::aletheiadb::NodeId,
+        target_id: ::aletheiadb::NodeId,
+        seq: u64,
+    ) -> AdapterResult<()> {
+        let id = record.id().to_owned();
         let stored_source =
             self.db
                 .get_edge_source(edge_id)
@@ -3764,15 +4032,15 @@ impl EmbeddedAletheiaSink {
                 })?;
         if stored_source != source_id || stored_target != target_id {
             return Err(AdapterError::ReadBack {
-                record_id: id.clone(),
+                record_id: id,
                 message: "embedded edge endpoint mismatch".to_owned(),
             });
         }
 
         self.record_handles
             .insert(id.clone(), StoredRecord::Edge(edge_id));
-        self.edge_seqs.insert(id.clone(), seq);
-        Ok(WriteOutcome::Inserted)
+        self.edge_seqs.insert(id, seq);
+        Ok(())
     }
 
     fn resolve_node_id(
@@ -3798,6 +4066,584 @@ impl EmbeddedAletheiaSink {
             record_id: edge_id.to_owned(),
             message: format!("{endpoint} node {record_id} has not been written"),
         })
+    }
+
+    /// Commits a chunk of prepared writes in ONE `AletheiaDB` transaction.
+    ///
+    /// This is the JSONL analog of the upstream bulk importer's chunked
+    /// commit (`api::import`'s `commit_node_chunk` / `commit_edge_chunk`,
+    /// the mechanism under `nodes_from_csv` / `edges_from_csv`): the whole
+    /// chunk flows through a single `db.write` — one WAL batch and one
+    /// commit — instead of one transaction per record. Edges whose
+    /// endpoints are [`EndpointRef::Deferred`] resolve against nodes
+    /// created earlier in the same chunk. On any error the transaction
+    /// rolls back, nothing is written, and the caller falls back to
+    /// per-record writes for the chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError::Rejected`] when the transaction fails; the
+    /// chunk is rolled back in full.
+    fn commit_prepared(
+        &self,
+        ops: Vec<(usize, PreparedWrite)>,
+    ) -> AdapterResult<Vec<(usize, CreatedWrite)>> {
+        self.db
+            .write(|tx| {
+                let mut chunk_nodes: std::collections::HashMap<String, ::aletheiadb::NodeId> =
+                    std::collections::HashMap::new();
+                let mut created = Vec::with_capacity(ops.len());
+                for (position, op) in ops {
+                    match op {
+                        PreparedWrite::Node {
+                            record_id,
+                            label,
+                            properties,
+                        } => {
+                            let node_id = tx.create_node(label, properties)?;
+                            chunk_nodes.insert(record_id, node_id);
+                            created.push((position, CreatedWrite::Node(node_id)));
+                        }
+                        PreparedWrite::Edge {
+                            label,
+                            properties,
+                            seq,
+                            source,
+                            target,
+                        } => {
+                            let resolve = |endpoint: EndpointRef,
+                                           chunk_nodes: &std::collections::HashMap<
+                                String,
+                                ::aletheiadb::NodeId,
+                            >| {
+                                match endpoint {
+                                    EndpointRef::Known(node_id) => Ok(node_id),
+                                    EndpointRef::Deferred(record_id) => {
+                                        chunk_nodes.get(&record_id).copied().ok_or_else(|| {
+                                            ::aletheiadb::Error::other(
+                                                "bulk edge endpoint was not created \
+                                                     earlier in the chunk",
+                                            )
+                                        })
+                                    }
+                                }
+                            };
+                            let source_id = resolve(source, &chunk_nodes)?;
+                            let target_id = resolve(target, &chunk_nodes)?;
+                            let edge_id =
+                                tx.create_edge(source_id, target_id, &label, properties)?;
+                            created.push((
+                                position,
+                                CreatedWrite::Edge {
+                                    edge_id,
+                                    source: source_id,
+                                    target: target_id,
+                                    seq,
+                                },
+                            ));
+                        }
+                        PreparedWrite::Tombstone { properties, seq } => {
+                            let node_id = tx.create_node(
+                                crate::schema_constraints::TOMBSTONE_LABEL,
+                                properties,
+                            )?;
+                            created.push((position, CreatedWrite::Tombstone { node_id, seq }));
+                        }
+                    }
+                }
+                Ok::<_, ::aletheiadb::Error>(created)
+            })
+            .map_err(|error| AdapterError::Rejected {
+                record_id: "embedded-store".to_owned(),
+                message: format!("bulk chunk transaction failed and was rolled back: {error}"),
+            })
+    }
+
+    /// Builds the bulk classification edge index: stable record ID → every
+    /// physical edge ID carrying it, in storage order. One pass over the
+    /// store replaces the per-edge full scan `compare_edge_record`
+    /// performs; the bulk driver maintains the index incrementally as
+    /// chunks commit, so it stays exact for the whole bulk call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an edge cannot be read; the caller degrades
+    /// the affected chunk to per-record writes.
+    fn build_edge_index(&self) -> AdapterResult<BTreeMap<String, Vec<::aletheiadb::EdgeId>>> {
+        let mut index: BTreeMap<String, Vec<::aletheiadb::EdgeId>> = BTreeMap::new();
+        for node_id in self.db.get_all_node_ids() {
+            for edge_id in self.db.get_outgoing_edges(node_id) {
+                let edge = self
+                    .db
+                    .get_edge(edge_id)
+                    .map_err(|error| read_back_error("bulk-edge-index", error.to_string()))?;
+                if let Some(record_id) = optional_str_property(
+                    "bulk-edge-index",
+                    "codegraph_id",
+                    edge.get_property("codegraph_id"),
+                )? {
+                    index.entry(record_id).or_default().push(edge_id);
+                }
+            }
+        }
+        Ok(index)
+    }
+
+    /// Classifies an edge record against the bulk edge index. Semantics
+    /// mirror [`Self::compare_edge_record`] exactly: `Matched` when any
+    /// physical edge with the record's stable ID reconstructs to the same
+    /// record (producer start time cleared), `Mismatched` when the ID
+    /// exists but no version matches, `Missing` when it does not.
+    fn classify_edge_with_index(
+        &self,
+        record: &GraphRecord,
+        edge_index: &BTreeMap<String, Vec<::aletheiadb::EdgeId>>,
+    ) -> AdapterResult<ExpectedRecordState> {
+        let mut saw_same_id = false;
+        if let Some(candidates) = edge_index.get(record.id()) {
+            for &edge_id in candidates {
+                saw_same_id = true;
+                if self
+                    .read_edge_record(record.id(), edge_id)?
+                    .with_cleared_producer_started_at()
+                    == record.with_cleared_producer_started_at()
+                {
+                    return Ok(ExpectedRecordState::Matched);
+                }
+            }
+        }
+        if saw_same_id {
+            Ok(ExpectedRecordState::Mismatched)
+        } else {
+            Ok(ExpectedRecordState::Missing)
+        }
+    }
+
+    /// Resolves one edge endpoint for a bulk chunk. The resolution is
+    /// exact only when it cannot depend on a node write pending in the
+    /// same chunk: the sequential path resolves the endpoint AFTER those
+    /// writes, against the post-write lookup, so any endpoint with a
+    /// pending in-chunk write is order-sensitive unless deferral is
+    /// provably identical (see [`BulkEndpoint`]).
+    fn bulk_endpoint_ref(
+        &self,
+        edge: &GraphRecord,
+        endpoint_id: &str,
+        edge_temporal: Option<&TemporalMetadata>,
+        endpoint: &str,
+        chunk_node_writes: &BTreeMap<&str, &GraphRecord>,
+    ) -> BulkEndpoint {
+        let has_pending_write = chunk_node_writes.contains_key(endpoint_id);
+        match self.resolve_node_id(edge.id(), endpoint_id, edge_temporal, endpoint) {
+            Ok(node_id) => {
+                if has_pending_write {
+                    // The lookup still maps the endpoint to its pre-chunk
+                    // physical version; the sequential path would resolve
+                    // to the version the pending write creates.
+                    BulkEndpoint::PerRecord
+                } else {
+                    BulkEndpoint::Resolved(EndpointRef::Known(node_id))
+                }
+            }
+            Err(error) => {
+                // Deferring is exact only when the endpoint has no stored
+                // candidate at all (so no older version can be picked) and
+                // neither record is temporal (so no commit-keyed candidate
+                // selection can pick a different version).
+                let no_stored_candidate = matches!(
+                    self.node_lookup.endpoint_node(
+                        endpoint_id,
+                        edge_temporal.map(|temporal| temporal.git_commit.as_str()),
+                    ),
+                    Ok(None)
+                );
+                let deferrable = edge_temporal.is_none()
+                    && no_stored_candidate
+                    && chunk_node_writes.get(endpoint_id).is_some_and(|node| {
+                        matches!(node, GraphRecord::Node { temporal: None, .. })
+                    });
+                if deferrable {
+                    BulkEndpoint::Resolved(EndpointRef::Deferred(endpoint_id.to_owned()))
+                } else if has_pending_write {
+                    BulkEndpoint::PerRecord
+                } else {
+                    BulkEndpoint::Failed(error)
+                }
+            }
+        }
+    }
+
+    /// Records a per-record-path edge write in the bulk classification
+    /// index, keeping the index exact across the whole bulk call.
+    fn note_bulk_edge_write(
+        &self,
+        edge_index: &mut Option<BTreeMap<String, Vec<::aletheiadb::EdgeId>>>,
+        record: &GraphRecord,
+    ) {
+        if let Some(index) = edge_index.as_mut()
+            && let Some(StoredRecord::Edge(edge_id)) = self.record_handles.get(record.id())
+        {
+            index
+                .entry(record.id().to_owned())
+                .or_default()
+                .push(*edge_id);
+        }
+    }
+
+    /// Runs a chunk through the exact per-record path (the degradation
+    /// used whenever a bulk snapshot cannot be built), maintaining the
+    /// bulk edge index for later chunks.
+    fn per_record_chunk(
+        &mut self,
+        chunk: &[&GraphRecord],
+        edge_index: &mut Option<BTreeMap<String, Vec<::aletheiadb::EdgeId>>>,
+    ) -> Vec<AdapterResult<WriteOutcome>> {
+        chunk
+            .iter()
+            .map(|record| {
+                let result = write_and_verify(record, self);
+                if matches!(result, Ok(WriteOutcome::Inserted)) {
+                    self.note_bulk_edge_write(edge_index, record);
+                }
+                result
+            })
+            .collect()
+    }
+
+    /// The bulk write path behind [`GraphSink::write_and_verify_records`]
+    /// for the embedded sink.
+    ///
+    /// Records are classified against shared snapshots (one active-tombstone
+    /// set per chunk; one edge index per call, maintained as chunks commit)
+    /// and committed in [`Self::bulk_batch_size`]-sized transactions —
+    /// replacing the per-record costs of one transaction commit per record
+    /// and, for edges, one full store scan per record.
+    ///
+    /// Records whose outcome can depend on another record in the same call
+    /// — a stable ID occurring more than once, and a tombstone whose target
+    /// is part of the call — are *interference* records: they are written
+    /// through the exact per-record path at their stream position, with
+    /// pending chunks committed first, so sequential semantics (supersede,
+    /// revive-after-tombstone, staleness) are preserved bit for bit. A
+    /// chunk whose transaction fails is likewise redone per record. Every
+    /// record's result is the per-record composition (validate → write →
+    /// verify) with identical messages and accounting.
+    fn write_records_bulk(&mut self, records: &[&GraphRecord]) -> Vec<AdapterResult<WriteOutcome>> {
+        if !self.bulk_enabled || records.len() < 2 {
+            return records
+                .iter()
+                .map(|record| write_and_verify(record, self))
+                .collect();
+        }
+        let mut id_counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for record in records {
+            *id_counts.entry(record.id()).or_default() += 1;
+        }
+        let input_ids: BTreeSet<&str> = id_counts.keys().copied().collect();
+        let interference: Vec<bool> = records
+            .iter()
+            .map(|record| {
+                id_counts[record.id()] > 1
+                    || matches!(
+                        record,
+                        GraphRecord::Tombstone { deleted_id, .. }
+                            if input_ids.contains(deleted_id.as_str())
+                    )
+            })
+            .collect();
+
+        let mut results: Vec<Option<AdapterResult<WriteOutcome>>> =
+            records.iter().map(|_| None).collect();
+        let mut edge_index: Option<BTreeMap<String, Vec<::aletheiadb::EdgeId>>> = None;
+        let mut position = 0;
+        while position < records.len() {
+            if interference[position] {
+                let result = write_and_verify(records[position], self);
+                if matches!(result, Ok(WriteOutcome::Inserted)) {
+                    self.note_bulk_edge_write(&mut edge_index, records[position]);
+                }
+                results[position] = Some(result);
+                position += 1;
+                continue;
+            }
+            let start = position;
+            while position < records.len()
+                && !interference[position]
+                && position - start < self.bulk_batch_size
+            {
+                position += 1;
+            }
+            let chunk_results = self.write_chunk_bulk(&records[start..position], &mut edge_index);
+            for (slot, result) in results[start..position].iter_mut().zip(chunk_results) {
+                *slot = Some(result);
+            }
+        }
+        results
+            .into_iter()
+            .map(|result| result.expect("every record is processed exactly once"))
+            .collect()
+    }
+
+    /// Classifies, commits, and verifies one bulk chunk. An edge whose
+    /// endpoint resolution is order-sensitive (see [`BulkEndpoint`])
+    /// splits the chunk: the records before it go through this path, the
+    /// edge itself goes through the exact per-record path once the
+    /// pending writes have committed, and the rest follow in a fresh
+    /// chunk pass — stream order (and therefore sequential semantics) is
+    /// preserved exactly. See [`Self::write_records_bulk`] for the
+    /// contract.
+    fn write_chunk_bulk(
+        &mut self,
+        chunk: &[&GraphRecord],
+        edge_index: &mut Option<BTreeMap<String, Vec<::aletheiadb::EdgeId>>>,
+    ) -> Vec<AdapterResult<WriteOutcome>> {
+        match self.write_chunk_bulk_pass(chunk, edge_index) {
+            ChunkPass::Done(results) => results,
+            ChunkPass::SplitAt(slot) => {
+                let mut results = self.write_chunk_bulk(&chunk[..slot], edge_index);
+                let single = write_and_verify(chunk[slot], self);
+                if matches!(single, Ok(WriteOutcome::Inserted)) {
+                    self.note_bulk_edge_write(edge_index, chunk[slot]);
+                }
+                results.push(single);
+                results.extend(self.write_chunk_bulk(&chunk[slot + 1..], edge_index));
+                results
+            }
+        }
+    }
+
+    /// One classification/commit pass over a chunk; reports
+    /// [`ChunkPass::SplitAt`] instead of a result vector when an edge in
+    /// the chunk must be written per-record (nothing from the partial
+    /// pass is committed in that case).
+    #[allow(clippy::too_many_lines)]
+    fn write_chunk_bulk_pass(
+        &mut self,
+        chunk: &[&GraphRecord],
+        edge_index: &mut Option<BTreeMap<String, Vec<::aletheiadb::EdgeId>>>,
+    ) -> ChunkPass {
+        // The active-tombstone snapshot is exact for the whole chunk: chunk
+        // records have unique IDs, and a chunk write can only add a
+        // tombstone for an ID outside this call's inputs (in-call targets
+        // are interference records), which no chunk classification consults.
+        let Ok(deleted) = self.active_deleted_ids() else {
+            return ChunkPass::Done(self.per_record_chunk(chunk, edge_index));
+        };
+
+        let mut items: Vec<BulkChunkItem> = Vec::with_capacity(chunk.len());
+        let mut chunk_node_writes: BTreeMap<&str, &GraphRecord> = BTreeMap::new();
+        for &record in chunk {
+            if let Err(error) = validate_adapter_record_version(record) {
+                items.push(BulkChunkItem::Failed(error));
+                continue;
+            }
+            match record {
+                GraphRecord::Node { .. } => match self.expected_record_state(record) {
+                    Err(error) => items.push(BulkChunkItem::Failed(error)),
+                    Ok(state) => {
+                        if state == ExpectedRecordState::Matched && !deleted.contains(record.id()) {
+                            #[cfg(feature = "embeddings")]
+                            if let Err(error) = self.backfill_embedding_for_matched_node(record) {
+                                items.push(BulkChunkItem::Failed(error));
+                                continue;
+                            }
+                            items.push(BulkChunkItem::Unchanged);
+                        } else {
+                            let prepared = self.prepare_node_write(record);
+                            chunk_node_writes.insert(record.id(), record);
+                            items.push(BulkChunkItem::Write(Some(PreparedWrite::Node {
+                                record_id: record.id().to_owned(),
+                                label: prepared.label,
+                                properties: prepared.properties,
+                            })));
+                        }
+                    }
+                },
+                GraphRecord::Edge {
+                    source,
+                    target,
+                    temporal,
+                    ..
+                } => {
+                    if edge_index.is_none() {
+                        match self.build_edge_index() {
+                            Ok(index) => *edge_index = Some(index),
+                            Err(_) => {
+                                return ChunkPass::Done(self.per_record_chunk(chunk, edge_index));
+                            }
+                        }
+                    }
+                    let index = edge_index.as_ref().expect("edge index available");
+                    match self.classify_edge_with_index(record, index) {
+                        Err(error) => items.push(BulkChunkItem::Failed(error)),
+                        Ok(state) => {
+                            if state == ExpectedRecordState::Matched
+                                && !deleted.contains(record.id())
+                            {
+                                items.push(BulkChunkItem::Unchanged);
+                            } else {
+                                let source_ref = match self.bulk_endpoint_ref(
+                                    record,
+                                    source,
+                                    temporal.as_ref(),
+                                    "source",
+                                    &chunk_node_writes,
+                                ) {
+                                    BulkEndpoint::Resolved(endpoint_ref) => endpoint_ref,
+                                    BulkEndpoint::PerRecord => {
+                                        return ChunkPass::SplitAt(items.len());
+                                    }
+                                    BulkEndpoint::Failed(error) => {
+                                        items.push(BulkChunkItem::Failed(error));
+                                        continue;
+                                    }
+                                };
+                                let target_ref = match self.bulk_endpoint_ref(
+                                    record,
+                                    target,
+                                    temporal.as_ref(),
+                                    "target",
+                                    &chunk_node_writes,
+                                ) {
+                                    BulkEndpoint::Resolved(endpoint_ref) => endpoint_ref,
+                                    BulkEndpoint::PerRecord => {
+                                        return ChunkPass::SplitAt(items.len());
+                                    }
+                                    BulkEndpoint::Failed(error) => {
+                                        items.push(BulkChunkItem::Failed(error));
+                                        continue;
+                                    }
+                                };
+                                let prepared = self.prepare_edge_write(record);
+                                items.push(BulkChunkItem::Write(Some(PreparedWrite::Edge {
+                                    label: prepared.label,
+                                    properties: prepared.properties,
+                                    seq: prepared.seq,
+                                    source: source_ref,
+                                    target: target_ref,
+                                })));
+                            }
+                        }
+                    }
+                }
+                GraphRecord::Tombstone { .. } => match self.expected_record_state(record) {
+                    Err(error) => items.push(BulkChunkItem::Failed(error)),
+                    Ok(state) => {
+                        // Mirrors the per-record guard exactly: a matched
+                        // tombstone is a no-op only while it is not stale,
+                        // and a staleness read error fails the record.
+                        let needs_write = if state == ExpectedRecordState::Matched {
+                            match self.stored_tombstone_is_stale(record.id()) {
+                                Ok(is_stale) => is_stale,
+                                Err(error) => {
+                                    items.push(BulkChunkItem::Failed(error));
+                                    continue;
+                                }
+                            }
+                        } else {
+                            true
+                        };
+                        if needs_write {
+                            let prepared = self.prepare_tombstone_write(record);
+                            items.push(BulkChunkItem::Write(Some(PreparedWrite::Tombstone {
+                                properties: prepared.properties,
+                                seq: prepared.seq,
+                            })));
+                        } else {
+                            items.push(BulkChunkItem::Unchanged);
+                        }
+                    }
+                },
+            }
+        }
+
+        // Commit every prepared write in one transaction.
+        let mut ops: Vec<(usize, PreparedWrite)> = Vec::new();
+        for (slot, item) in items.iter_mut().enumerate() {
+            if let BulkChunkItem::Write(prepared) = item
+                && let Some(prepared) = prepared.take()
+            {
+                ops.push((slot, prepared));
+            }
+        }
+        let mut created: BTreeMap<usize, CreatedWrite> = BTreeMap::new();
+        let mut tx_failed = false;
+        if !ops.is_empty() {
+            match self.commit_prepared(ops) {
+                Ok(writes) => {
+                    for (slot, write) in writes {
+                        if let CreatedWrite::Edge { edge_id, .. } = write
+                            && let Some(index) = edge_index.as_mut()
+                        {
+                            index
+                                .entry(chunk[slot].id().to_owned())
+                                .or_default()
+                                .push(edge_id);
+                        }
+                        created.insert(slot, write);
+                    }
+                }
+                Err(_) => tx_failed = true,
+            }
+        }
+
+        // Bookkeep and verify, composing each record's result exactly as
+        // the per-record path does.
+        let mut results: Vec<Option<AdapterResult<WriteOutcome>>> =
+            chunk.iter().map(|_| None).collect();
+        for (slot, item) in items.into_iter().enumerate() {
+            let record = chunk[slot];
+            match item {
+                BulkChunkItem::Failed(error) => results[slot] = Some(Err(error)),
+                BulkChunkItem::Unchanged => {
+                    results[slot] = Some(if self.record_handles.contains_key(record.id()) {
+                        self.verify_record(record).map(|()| WriteOutcome::Unchanged)
+                    } else {
+                        // With no handle, `verify_record` falls back to the
+                        // expected-state check — the very classification this
+                        // chunk just performed with a `Matched` outcome.
+                        Ok(WriteOutcome::Unchanged)
+                    });
+                }
+                BulkChunkItem::Write(_) => {
+                    if tx_failed {
+                        // The chunk transaction rolled back: redo this
+                        // record through the exact per-record path.
+                        let result = write_and_verify(record, self);
+                        if matches!(result, Ok(WriteOutcome::Inserted)) {
+                            self.note_bulk_edge_write(edge_index, record);
+                        }
+                        results[slot] = Some(result);
+                        continue;
+                    }
+                    let write = created
+                        .remove(&slot)
+                        .expect("every committed write returns a created handle");
+                    let bookkept = match write {
+                        CreatedWrite::Node(node_id) => self.bookkeep_node_write(record, node_id),
+                        CreatedWrite::Edge {
+                            edge_id,
+                            source,
+                            target,
+                            seq,
+                        } => self.bookkeep_edge_write(record, edge_id, source, target, seq),
+                        CreatedWrite::Tombstone { node_id, seq } => {
+                            self.bookkeep_tombstone_write(record, node_id, seq)
+                        }
+                    };
+                    results[slot] = Some(match bookkept {
+                        Ok(()) => self.verify_record(record).map(|()| WriteOutcome::Inserted),
+                        Err(error) => Err(error),
+                    });
+                }
+            }
+        }
+        ChunkPass::Done(
+            results
+                .into_iter()
+                .map(|result| result.expect("every chunk record is processed exactly once"))
+                .collect(),
+        )
     }
 
     fn read_handle(&self, record_id: &str, handle: StoredRecord) -> AdapterResult<GraphRecord> {
@@ -9477,5 +10323,450 @@ mod tests {
             reingest_report.failures
         );
         assert_eq!(reingest_report.succeeded, tree_batch.len());
+    }
+}
+
+#[cfg(test)]
+mod bulk_tests {
+    use super::*;
+    use crate::adapters::{DanglingCitationPolicy, ingest_records_with_policy};
+    use crate::ir::{EdgeLabel, LintSuppressionFacts, LintSuppressionScope, NodeKind};
+
+    fn b_node(id: &str, summary: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            None,
+            Some(id.to_owned()),
+            summary.to_owned(),
+        )
+    }
+
+    fn b_lint_node(id: &str) -> GraphRecord {
+        let mut record = GraphRecord::node(
+            id.to_owned(),
+            NodeKind::LintSuppression,
+            Some("src/lib.rs".to_owned()),
+            None,
+            Some("item".to_owned()),
+            "lint suppression".to_owned(),
+        );
+        if let GraphRecord::Node {
+            lint_suppression, ..
+        } = &mut record
+        {
+            *lint_suppression = Some(LintSuppressionFacts {
+                lints: vec!["dead_code".to_owned()],
+                scope: LintSuppressionScope::Item,
+                has_justification: false,
+                is_inner: false,
+            });
+        }
+        record
+    }
+
+    fn b_edge(id: &str, source: &str, target: &str) -> GraphRecord {
+        GraphRecord::Edge {
+            id: id.to_owned(),
+            schema_version: 1,
+            label: EdgeLabel::Calls,
+            source: source.to_owned(),
+            target: target.to_owned(),
+            confidence: None,
+            resolution: None,
+            frame_resolution: None,
+            frame_index: None,
+            basis: None,
+            call_site_spans: None,
+            is_exhaustive: None,
+            temporal: None,
+            summary: "edge".to_owned(),
+            producer: None,
+        }
+    }
+
+    fn b_tombstone(id: &str, deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: id.to_owned(),
+            schema_version: 1,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    /// Mixed fixture: plain nodes, a `LintSuppression` node (the F2 kind),
+    /// edges between batch nodes, and a tombstone for a node written by an
+    /// earlier phase (built by `fixture_phase_one`).
+    fn fixture_phase_two() -> Vec<GraphRecord> {
+        vec![
+            b_node("codegraph:v1:bulk-a", "a"),
+            b_node("codegraph:v1:bulk-b", "b"),
+            b_lint_node("codegraph:v1:bulk-lint"),
+            b_edge(
+                "codegraph:v1:bulk-e1",
+                "codegraph:v1:bulk-a",
+                "codegraph:v1:bulk-b",
+            ),
+            b_edge(
+                "codegraph:v1:bulk-e2",
+                "codegraph:v1:bulk-b",
+                "codegraph:v1:bulk-lint",
+            ),
+            b_tombstone("codegraph:v1:bulk-t1", "codegraph:v1:bulk-old"),
+        ]
+    }
+
+    fn sorted_records(sink: &EmbeddedAletheiaSink) -> Vec<GraphRecord> {
+        let mut records = sink.read_all_records().expect("read all records");
+        records.sort_by(|a, b| a.id().cmp(b.id()));
+        records
+    }
+
+    fn open_pair(temp: &tempfile::TempDir) -> (EmbeddedAletheiaSink, EmbeddedAletheiaSink) {
+        let mut per_record =
+            EmbeddedAletheiaSink::open(temp.path().join("per-record")).expect("open per-record");
+        per_record.set_bulk_writes(false, 1000);
+        let mut bulk = EmbeddedAletheiaSink::open(temp.path().join("bulk")).expect("open bulk");
+        bulk.set_bulk_writes(true, 2);
+        (per_record, bulk)
+    }
+
+    #[test]
+    fn bulk_matches_per_record_report_and_store() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (mut per_record, mut bulk) = open_pair(&temp);
+        let phase_one = vec![b_node("codegraph:v1:bulk-old", "old")];
+        let phase_two = fixture_phase_two();
+
+        for sink in [&mut per_record, &mut bulk] {
+            let first =
+                ingest_records_with_policy(&phase_one, sink, DanglingCitationPolicy::Quarantine);
+            assert!(first.is_success(), "{first:?}");
+        }
+
+        let report_a = ingest_records_with_policy(
+            &phase_two,
+            &mut per_record,
+            DanglingCitationPolicy::Quarantine,
+        );
+        let report_b =
+            ingest_records_with_policy(&phase_two, &mut bulk, DanglingCitationPolicy::Quarantine);
+        assert_eq!(report_a, report_b, "bulk and per-record reports must agree");
+        assert!(report_b.is_success(), "{report_b:?}");
+        assert_eq!(report_b.inserted, phase_two.len());
+        assert_eq!(
+            sorted_records(&per_record),
+            sorted_records(&bulk),
+            "bulk and per-record stores must hold identical records"
+        );
+    }
+
+    #[test]
+    fn bulk_bad_edge_in_chunk_fails_only_that_record() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (mut per_record, mut bulk) = open_pair(&temp);
+        // One chunk (batch size 2 splits it, but every record shares the run):
+        // a good edge and an edge whose target was never written.
+        let records = vec![
+            b_node("codegraph:v1:bad-a", "a"),
+            b_node("codegraph:v1:bad-b", "b"),
+            b_edge(
+                "codegraph:v1:bad-good",
+                "codegraph:v1:bad-a",
+                "codegraph:v1:bad-b",
+            ),
+            b_edge(
+                "codegraph:v1:bad-ghost",
+                "codegraph:v1:bad-a",
+                "codegraph:v1:bad-missing",
+            ),
+        ];
+
+        let report_a = ingest_records_with_policy(
+            &records,
+            &mut per_record,
+            DanglingCitationPolicy::Quarantine,
+        );
+        let report_b =
+            ingest_records_with_policy(&records, &mut bulk, DanglingCitationPolicy::Quarantine);
+        assert_eq!(report_a, report_b);
+        assert_eq!(report_b.attempted, 4);
+        assert_eq!(report_b.inserted, 3);
+        assert_eq!(report_b.failed, 1);
+        assert_eq!(report_b.failures[0].record_id, "codegraph:v1:bad-ghost");
+        assert!(
+            report_b.failures[0]
+                .message
+                .contains("has not been written"),
+            "{}",
+            report_b.failures[0].message
+        );
+        assert_eq!(sorted_records(&per_record), sorted_records(&bulk));
+    }
+
+    fn b_temporal(commit: &str) -> TemporalMetadata {
+        TemporalMetadata {
+            git_commit: commit.to_owned(),
+            git_parent_commits: Vec::new(),
+            valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            author_time: Some("2026-01-01T00:00:00Z".to_owned()),
+            observed_at: "2026-01-01T00:00:00Z".to_owned(),
+            valid_time_source: None,
+        }
+    }
+
+    fn b_temporal_node(id: &str, summary: &str, commit: &str) -> GraphRecord {
+        let mut record = b_node(id, summary);
+        if let GraphRecord::Node { temporal, .. } = &mut record {
+            *temporal = Some(b_temporal(commit));
+        }
+        record
+    }
+
+    fn b_temporal_edge(id: &str, source: &str, target: &str, commit: &str) -> GraphRecord {
+        let mut record = b_edge(id, source, target);
+        if let GraphRecord::Edge { temporal, .. } = &mut record {
+            *temporal = Some(b_temporal(commit));
+        }
+        record
+    }
+
+    /// The agent-memory / history shape: a temporal edge whose endpoints
+    /// are temporal nodes written by the SAME ingest. Endpoint resolution
+    /// is commit-keyed and order-sensitive, so the edge must resolve
+    /// against the post-write lookup exactly as the per-record path does.
+    #[test]
+    fn bulk_temporal_edge_to_same_ingest_temporal_nodes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (mut per_record, mut bulk) = open_pair(&temp);
+        let records = vec![
+            b_temporal_node("codegraph:v1:bulk-ta", "a", "c1"),
+            b_temporal_node("codegraph:v1:bulk-tb", "b", "c1"),
+            b_temporal_edge(
+                "codegraph:v1:bulk-tedge",
+                "codegraph:v1:bulk-ta",
+                "codegraph:v1:bulk-tb",
+                "c1",
+            ),
+        ];
+        let report_a = ingest_records_with_policy(
+            &records,
+            &mut per_record,
+            DanglingCitationPolicy::Quarantine,
+        );
+        let report_b =
+            ingest_records_with_policy(&records, &mut bulk, DanglingCitationPolicy::Quarantine);
+        assert_eq!(report_a, report_b, "bulk and per-record reports must agree");
+        assert!(report_b.is_success(), "{report_b:?}");
+        assert_eq!(report_b.inserted, records.len());
+        assert_eq!(
+            sorted_records(&per_record),
+            sorted_records(&bulk),
+            "bulk and per-record stores must hold identical records"
+        );
+    }
+
+    fn edge_source_node(sink: &EmbeddedAletheiaSink, edge_record_id: &str) -> ::aletheiadb::NodeId {
+        let Some(StoredRecord::Edge(edge_id)) = sink.record_handles.get(edge_record_id).copied()
+        else {
+            panic!("edge {edge_record_id} should have a stored handle");
+        };
+        sink.db
+            .get_edge_source(edge_id)
+            .expect("stored edge should have a source")
+    }
+
+    fn node_handle(sink: &EmbeddedAletheiaSink, record_id: &str) -> ::aletheiadb::NodeId {
+        let Some(StoredRecord::Node(node_id)) = sink.record_handles.get(record_id).copied() else {
+            panic!("node {record_id} should have a stored handle");
+        };
+        node_id
+    }
+
+    /// An edge to a node REWRITTEN by the same ingest must point at the
+    /// new physical version (the sequential path resolves after the
+    /// rewrite), not at the pre-chunk version the lookup still showed
+    /// during classification.
+    #[test]
+    fn bulk_edge_to_node_rewritten_in_same_ingest_points_at_new_version() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (mut per_record, mut bulk) = open_pair(&temp);
+        let phase_one = vec![
+            b_node("codegraph:v1:bulk-ra", "a v1"),
+            b_node("codegraph:v1:bulk-rb", "b"),
+        ];
+        for sink in [&mut per_record, &mut bulk] {
+            let first =
+                ingest_records_with_policy(&phase_one, sink, DanglingCitationPolicy::Quarantine);
+            assert!(first.is_success(), "{first:?}");
+        }
+        let phase_two = vec![
+            b_node("codegraph:v1:bulk-ra", "a v2"),
+            b_edge(
+                "codegraph:v1:bulk-redge",
+                "codegraph:v1:bulk-ra",
+                "codegraph:v1:bulk-rb",
+            ),
+        ];
+        let report_a = ingest_records_with_policy(
+            &phase_two,
+            &mut per_record,
+            DanglingCitationPolicy::Quarantine,
+        );
+        let report_b =
+            ingest_records_with_policy(&phase_two, &mut bulk, DanglingCitationPolicy::Quarantine);
+        assert_eq!(report_a, report_b, "bulk and per-record reports must agree");
+        assert!(report_b.is_success(), "{report_b:?}");
+        for (name, sink) in [("per-record", &per_record), ("bulk", &bulk)] {
+            assert_eq!(
+                edge_source_node(sink, "codegraph:v1:bulk-redge"),
+                node_handle(sink, "codegraph:v1:bulk-ra"),
+                "{name} sink: edge must point at the rewritten node version"
+            );
+        }
+        assert_eq!(
+            sorted_records(&per_record),
+            sorted_records(&bulk),
+            "bulk and per-record stores must hold identical records"
+        );
+    }
+
+    #[test]
+    fn bulk_reingest_reports_all_unchanged() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (mut per_record, mut bulk) = open_pair(&temp);
+        let records = fixture_phase_two();
+
+        for sink in [&mut per_record, &mut bulk] {
+            let first = ingest_records_with_policy(
+                &[b_node("codegraph:v1:bulk-old", "old")],
+                sink,
+                DanglingCitationPolicy::Quarantine,
+            );
+            assert!(first.is_success());
+            let report =
+                ingest_records_with_policy(&records, sink, DanglingCitationPolicy::Quarantine);
+            assert!(report.is_success(), "{report:?}");
+        }
+
+        let second_a = ingest_records_with_policy(
+            &records,
+            &mut per_record,
+            DanglingCitationPolicy::Quarantine,
+        );
+        let second_b =
+            ingest_records_with_policy(&records, &mut bulk, DanglingCitationPolicy::Quarantine);
+        assert_eq!(second_a, second_b);
+        assert_eq!(second_b.inserted, 0);
+        assert_eq!(second_b.unchanged, records.len());
+        assert_eq!(second_b.failed, 0);
+    }
+
+    #[test]
+    fn bulk_duplicate_ids_match_per_record() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (mut per_record, mut bulk) = open_pair(&temp);
+        // Same stable ID twice in one batch (superseding write), plus an edge.
+        let records = vec![
+            b_node("codegraph:v1:dup-x", "version one"),
+            b_node("codegraph:v1:dup-x", "version two"),
+            b_node("codegraph:v1:dup-y", "y"),
+            b_edge(
+                "codegraph:v1:dup-e",
+                "codegraph:v1:dup-x",
+                "codegraph:v1:dup-y",
+            ),
+        ];
+
+        let report_a = ingest_records_with_policy(
+            &records,
+            &mut per_record,
+            DanglingCitationPolicy::Quarantine,
+        );
+        let report_b =
+            ingest_records_with_policy(&records, &mut bulk, DanglingCitationPolicy::Quarantine);
+        assert_eq!(report_a, report_b);
+        assert!(report_b.is_success(), "{report_b:?}");
+        assert_eq!(sorted_records(&per_record), sorted_records(&bulk));
+        // The current view serves the second version.
+        let current = bulk
+            .read_back("codegraph:v1:dup-x")
+            .expect("read back")
+            .expect("record present");
+        if let GraphRecord::Node { summary, .. } = current {
+            assert_eq!(summary, "version two");
+        } else {
+            panic!("expected node record");
+        }
+    }
+
+    #[test]
+    fn bulk_tombstone_and_revival_across_ingests_match_per_record() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (mut per_record, mut bulk) = open_pair(&temp);
+        let node = b_node("codegraph:v1:rev-x", "x");
+        let tombstone = b_tombstone("codegraph:v1:rev-t", "codegraph:v1:rev-x");
+
+        for sink in [&mut per_record, &mut bulk] {
+            let write = ingest_records_with_policy(
+                std::slice::from_ref(&node),
+                sink,
+                DanglingCitationPolicy::Quarantine,
+            );
+            assert!(write.is_success(), "{write:?}");
+            let delete = ingest_records_with_policy(
+                std::slice::from_ref(&tombstone),
+                sink,
+                DanglingCitationPolicy::Quarantine,
+            );
+            assert!(delete.is_success(), "{delete:?}");
+            // Revival: the byte-identical node is re-emitted after its
+            // tombstone; it must land as a fresh write in both paths.
+            let revive = ingest_records_with_policy(
+                std::slice::from_ref(&node),
+                sink,
+                DanglingCitationPolicy::Quarantine,
+            );
+            assert!(revive.is_success(), "{revive:?}");
+            assert_eq!(revive.inserted, 1, "revival is a fresh write: {revive:?}");
+        }
+        assert_eq!(sorted_records(&per_record), sorted_records(&bulk));
+        assert!(
+            bulk.read_back("codegraph:v1:rev-x")
+                .expect("read back")
+                .is_some(),
+            "revived node must be readable"
+        );
+    }
+
+    #[test]
+    fn bulk_chunk_commit_rolls_back_on_tx_error() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let sink = EmbeddedAletheiaSink::open(temp.path().join("rollback")).expect("open");
+        // A prepared edge whose endpoints are bogus physical IDs must fail
+        // inside the transaction and leave the store untouched (the driver
+        // then falls back to per-record writes for the chunk).
+        let bogus = ::aletheiadb::NodeId::new(999_999).expect("node id");
+        let ops = vec![(
+            0_usize,
+            PreparedWrite::Edge {
+                label: "CALLS".to_owned(),
+                properties: ::aletheiadb::PropertyMapBuilder::new()
+                    .insert("codegraph_id", "codegraph:v1:rollback-e")
+                    .build(),
+                seq: 1,
+                source: EndpointRef::Known(bogus),
+                target: EndpointRef::Known(bogus),
+            },
+        )];
+        let result = sink.commit_prepared(ops);
+        assert!(result.is_err(), "bogus endpoints must fail the transaction");
+        assert_eq!(
+            sink.db.get_all_node_ids().len(),
+            0,
+            "a rolled-back chunk writes nothing"
+        );
     }
 }
