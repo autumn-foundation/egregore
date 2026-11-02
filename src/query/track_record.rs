@@ -490,6 +490,22 @@ fn resolve_agent(
     None
 }
 
+/// Whether decision `(new_at, new_id)` is strictly later than the current
+/// `(old_at, old_id)`: by RFC 3339 INSTANT (text order disagrees with time
+/// order across differing offsets; an unparseable or absent stamp falls back to
+/// text order), then by record ID.
+fn decision_is_later(new_at: &str, new_id: &str, old_at: &str, old_id: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(new_at),
+        chrono::DateTime::parse_from_rfc3339(old_at),
+    ) {
+        (Ok(new), Ok(old)) => new.cmp(&old),
+        _ => new_at.cmp(old_at),
+    }
+    .then_with(|| new_id.cmp(old_id))
+        == std::cmp::Ordering::Greater
+}
+
 /// Compute the per-agent track record over `records`.
 ///
 /// `repo_id` is an optional repository id. When `Some`, code-domain records
@@ -678,12 +694,9 @@ pub fn agent_track_record(records: &[GraphRecord], repo_id: Option<&str>) -> Tra
         let entry = latest_decision
             .entry(candidate_id)
             .or_insert_with(|| (String::new(), String::new(), PromotionVerdict::Unknown));
-        // Latest by (decided_at, record_id); RFC3339 timestamps sort
-        // lexicographically. Strictly greater wins so the first-seen record
-        // wins exact ties deterministically.
-        let key = (decided_at.clone(), (*id).to_owned());
-        let current = (entry.0.clone(), entry.1.clone());
-        if key > current {
+        // Latest by (decided_at INSTANT, record_id); strictly greater wins so
+        // the first-seen record wins exact ties deterministically.
+        if decision_is_later(&decided_at, id, &entry.0, &entry.1) {
             *entry = (decided_at, (*id).to_owned(), verdict);
         }
     }
@@ -942,5 +955,37 @@ mod tests {
         let report = agent_track_record(&[], None);
         assert!(report.agents.is_empty());
         assert!(report.diagnostics.iter().any(|d| d.code == "no_agents"));
+    }
+
+    #[test]
+    fn decision_recency_compares_instants_across_offsets() {
+        // `00:30+01:00` is 23:30Z the day before: EARLIER than `00:00Z`.
+        assert!(decision_is_later(
+            "2026-01-01T00:00:00Z",
+            "a",
+            "2026-01-01T00:30:00+01:00",
+            "b"
+        ));
+        assert!(!decision_is_later(
+            "2026-01-01T00:30:00+01:00",
+            "b",
+            "2026-01-01T00:00:00Z",
+            "a"
+        ));
+        // Equal instants fall back to the record ID; identical stays put.
+        assert!(decision_is_later(
+            "2026-01-01T01:00:00+01:00",
+            "z",
+            "2026-01-01T00:00:00Z",
+            "a"
+        ));
+        assert!(!decision_is_later(
+            "2026-01-01T00:00:00Z",
+            "a",
+            "2026-01-01T00:00:00Z",
+            "a"
+        ));
+        // Unparseable stamps keep the text-order fallback.
+        assert!(decision_is_later("b", "x", "a", "x"));
     }
 }

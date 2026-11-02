@@ -615,6 +615,16 @@ fn refresh_preserves_non_codegraph_records() {
     let data_dir = temp.path().join("store");
     initial_ingest(&temp, &repo, &data_dir);
 
+    // Cite a record that really resolves in the store: ingest quarantines an
+    // observation whose evidence target does not (issue #241).
+    let evidence_target = fs::read_to_string(temp.path().join("initial.jsonl"))
+        .expect("initial graph")
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|row| row["record_type"] == "node" && row["kind"] == "File")
+        .and_then(|row| row["id"].as_str().map(str::to_owned))
+        .expect("scan must emit a File node");
+
     // Write and ingest an Observation into the store.
     let obs_path = temp.path().join("obs.jsonl");
     egregore()
@@ -634,7 +644,7 @@ fn refresh_preserves_non_codegraph_records() {
             "--evidence-domain",
             "codegraph",
             "--evidence-target",
-            "codegraph:v4:dummy",
+            &evidence_target,
             "--out",
         ])
         .arg(&obs_path)

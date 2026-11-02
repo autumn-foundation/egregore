@@ -9,6 +9,7 @@
 //! chunk must fail alone with the same message in both modes.
 
 #![allow(missing_docs, clippy::doc_markdown)]
+#![cfg(feature = "embedded-aletheiadb")]
 
 use std::fs;
 use std::sync::Mutex;

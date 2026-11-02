@@ -346,7 +346,7 @@ nodes, and URL matching. Bumps codegraph `SCHEMA_VERSION` 7→8 and
 
 Every code fact now records WHICH CARGO PACKAGE OWNS IT (issue #117). Every
 path-bearing code-graph node (`File`, `Module`, `Symbol`, `Import`, `Diagnostic`,
-`PanicRiskSite`, `DebtMarker`, `UnsafeSite`, `DependencyDeclaration`, `Change`) carries an
+`PanicRiskSite`, `DebtMarker`, `UnsafeSite`, `DependencyDeclaration`, `LintSuppression`, `Change`) carries an
 additive optional `crate_attribution`: the owning package NAME plus the
 repo-relative path of the owning `Cargo.toml`, or a closed-set reason no package
 owns it. Before this the graph was a flat pool of files — every fact had a
@@ -1423,14 +1423,23 @@ instead of deserializing the whole file. The index is content-addressed on the
 graph's BLAKE3 + byte length: a stale, corrupt, missing, or version-mismatched
 index is silently ignored and the lane transparently cold-scans, so results are
 BYTE-IDENTICAL with or without the index (a pure access-path optimization).
-`eg index` is the only writer (atomic `.idx.tmp` + rename, deterministic bytes),
-refuses (exit 2) any graph a cold load would reject, and never writes from a
-query path. Migrated lanes (`deps`, `context`/`symbol`, `at`/`locate`, `file`,
+Format v2 (issue #120) is a set of binary tables a query reads in place by
+binary search, with a cheap validity check (length, modification time, sampled
+blocks; the full BLAKE3 only when the time differs), so a lookup's index cost
+does not grow with the graph. `eg query drift` (unscoped) also uses it, and
+`eg audit query-budget` builds the index for its stores in setup and now gates
+at 10x records ≤ 2x latency (measured 0.95x).
+The producer commands write it: `eg scan`, `eg scan-history`, and `eg ingest`
+build `<graph>.idx` automatically after writing/validating the graph (opt out
+with `--no-index`; a failed auto-build prints a one-line stderr warning and never
+fails the scan/ingest), and `eg index` rebuilds it explicitly (atomic `.idx.tmp`
++ rename, deterministic bytes) and refuses (exit 2) any graph a cold load would
+reject. A query path never writes it; `eg init`/`eg refresh` build none. Migrated lanes (`deps`, `context`/`symbol`, `at`/`locate`, `file`,
 `who-imports`) take the fast path only for the plain current-state, unscoped
 invocation; `--repo`/`--at`/`--as-of`/`--repo-path` and every other `--graph`
 lane stay on the cold full-file scan. Composing with #457 (which made
 `deps`/`who-imports` HEAD-anchor by default over a history store), the index
-body carries a `has_temporal_history` flag (still format v1) set when the graph
+header carries a `has_temporal_history` flag set when the graph
 is a `scan-history`/corpus store (any temporal record or `Commit` node); the
 loader then falls back to the cold whole-file scan for the migrated lanes over
 such a store — the #457 HEAD-anchor gate needs global commit topology and every

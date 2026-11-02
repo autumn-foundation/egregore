@@ -47,7 +47,18 @@ fn source(report: &Value, name: &str) -> Value {
 // source); the dedicated CI step runs the same command.
 #[test]
 fn gate_passes_on_reference_corpus() {
-    let (code, report) = run_gate(&[]);
+    // The 2s budget is a product-latency promise gated by the dedicated CI
+    // step on the RELEASE binary. This test drives the debug test binary,
+    // where the embedded engine's index load and WAL replay run several
+    // times slower, so it keeps the mechanics honest with a relaxed budget
+    // and leaves the real budget to the release gate.
+    let budget_ms: f64 = if cfg!(debug_assertions) {
+        10_000.0
+    } else {
+        2_000.0
+    };
+    let budget_arg = budget_ms.to_string();
+    let (code, report) = run_gate(&["--budget-p50-ms", budget_arg.as_str()]);
     assert_eq!(code, 0, "gate should pass: {report}");
     assert_eq!(report["ok"], true);
     assert_eq!(report["corpus_name"], "query-latency-reference");
@@ -68,8 +79,8 @@ fn gate_passes_on_reference_corpus() {
     let p50 = graph["p50_ms"].as_f64().expect("graph p50");
     assert!(p50 > 0.0, "p50 should be a real measurement");
     assert!(
-        p50 <= 2000.0,
-        "graph p50 {p50}ms exceeds the 2s budget on the reference corpus"
+        p50 <= budget_ms,
+        "graph p50 {p50}ms exceeds the {budget_ms}ms budget on the reference corpus"
     );
     assert!(graph["p95_ms"].as_f64().expect("graph p95") >= p50);
 
@@ -90,8 +101,8 @@ fn gate_passes_on_reference_corpus() {
         assert_eq!(data_dir["pass"], true);
         let p50 = data_dir["p50_ms"].as_f64().expect("data_dir p50");
         assert!(
-            p50 <= 2000.0,
-            "data_dir p50 {p50}ms exceeds the 2s budget on the reference corpus"
+            p50 <= budget_ms,
+            "data_dir p50 {p50}ms exceeds the {budget_ms}ms budget on the reference corpus"
         );
     }
 }

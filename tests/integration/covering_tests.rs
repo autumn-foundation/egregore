@@ -761,6 +761,13 @@ mod daemon_path {
                     None,
                 )
                 .expect("tests_for_symbol succeeds");
+            // `snapshot` is the daemon's wall-clock read time (one-second
+            // granularity), so two calls straddling a second boundary differ
+            // there by design; determinism is about the ANSWER.
+            let mut result = result;
+            if let Some(object) = result.as_object_mut() {
+                object.remove("snapshot");
+            }
             rendered.push(serde_json::to_string(&result).expect("result serializes"));
         }
         for r in &rendered[1..] {

@@ -980,3 +980,113 @@ fn embed_uses_default_model_when_nothing_pinned() {
         "the vector-index identity must name the built-in default model"
     );
 }
+
+/// `eg query similar` must honor the config-pinned `data_dir` like the other
+/// store-backed query lanes: with `--data-dir` omitted it reaches the store
+/// lookup (here an absent semantic index) instead of failing in argument
+/// parsing for a "required" flag.
+#[cfg(feature = "embeddings")]
+#[test]
+fn query_similar_resolves_the_config_pinned_data_dir() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_config(temp.path(), "data_dir = \"pinned-store\"\n");
+    eg_in(temp.path())
+        .args(["query", "similar", "some::handle"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("required").not())
+        .stdout(predicate::str::contains("semantic_index_absent"));
+}
+
+/// With neither `--data-dir` nor a pinned `data_dir`, the failure names both
+/// ways to supply the store.
+#[cfg(feature = "embeddings")]
+#[test]
+fn query_similar_without_any_store_names_the_remedy() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    eg_in(temp.path())
+        .args(["query", "similar", "some::handle"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--data-dir"));
+}
+
+/// Issue #509: every store-backed semantic lane honors the pinned `data_dir`.
+/// Without it, clap would reject the omitted `--data-dir` as "required".
+#[cfg(feature = "embeddings")]
+#[test]
+fn semantic_lanes_resolve_the_config_pinned_data_dir() {
+    for lane in ["semantic", "semantic-context", "semantic-memory"] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_config(temp.path(), "data_dir = \"pinned-store\"\n");
+        eg_in(temp.path())
+            .args(["query", lane, "request timeout"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("required").not());
+    }
+}
+
+/// Issue #509: without a flag or a pin, the failure names both remedies.
+#[cfg(feature = "embeddings")]
+#[test]
+fn semantic_lanes_without_any_store_name_the_remedy() {
+    for lane in ["semantic", "semantic-context", "semantic-memory"] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        eg_in(temp.path())
+            .args(["query", lane, "request timeout"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("--data-dir"))
+            .stderr(predicate::str::contains("egregore.toml"));
+    }
+}
+
+/// Issue #509: `eg query cost` reads the pinned store like the other lanes.
+/// A cost row in the pinned store proves that store was the one read.
+#[test]
+#[cfg(feature = "embedded-aletheiadb")]
+fn query_cost_reads_config_data_dir() {
+    use aletheia_egregore::ir::{COST_USAGE_DERIVATION_TRANSCRIPT, GraphRecord, NodeKind};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_config(temp.path(), "data_dir = \"pinned-store\"\n");
+    let mut cost = GraphRecord::node(
+        "agent_memory:v1:pinned-cost".to_owned(),
+        NodeKind::CostUsage,
+        None,
+        None,
+        None,
+        "cost".to_owned(),
+    )
+    .with_domain("agent_memory", 1);
+    if let GraphRecord::Node { text, .. } = &mut cost {
+        *text = Some(
+            serde_json::json!({
+                "derivation": COST_USAGE_DERIVATION_TRANSCRIPT,
+                "prompt_tokens": 4242,
+            })
+            .to_string(),
+        );
+    }
+    let graph_path = temp.path().join("cost.jsonl");
+    std::fs::write(
+        &graph_path,
+        format!("{}\n", serde_json::to_string(&cost).expect("serialize")),
+    )
+    .expect("write graph");
+    eg_in(temp.path())
+        .arg("ingest")
+        .arg(&graph_path)
+        .args(["--adapter", "embedded"])
+        .assert()
+        .success();
+    assert!(temp.path().join("pinned-store").exists());
+    assert!(!temp.path().join(".egregore").exists());
+    eg_in(temp.path())
+        .args(["query", "cost", "--format", "text"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("agent_memory:v1:pinned-cost"))
+        .stdout(predicate::str::contains("prompt=4242"));
+}

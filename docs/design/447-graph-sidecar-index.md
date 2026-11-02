@@ -96,6 +96,9 @@ for v1.
 > automatically through the same build+write path (best-effort, warning
 > on failure, `--no-index` opt-out), and `eg index` remains the explicit
 > rebuild. Auto-build on *query* is still OFF — query lanes never write.
+> The on-disk layout described above is also superseded: format v2 (issue
+> #120) stores binary tables a query reads in place, with
+> `has_temporal_history` as a header flag rather than a serde body field.
 > See `docs/cli/index.md` for the current contract.
 
 ### Selector + hydration closure

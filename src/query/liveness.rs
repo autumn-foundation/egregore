@@ -100,11 +100,27 @@ impl<'a> Liveness<'a> {
     /// never reported deleted. A tombstone with NO later re-add still deletes its
     /// id (parity with the embedded read).
     pub fn deleted(&self, id: &str) -> bool {
-        !self.has_temporal.contains(id)
-            && self
-                .last_tomb
-                .get(id)
-                .is_some_and(|&ti| self.last_write.get(id).is_none_or(|&wi| ti > wi))
+        !self.has_temporal.contains(id) && self.tombstone_active(id)
+    }
+
+    /// True when `id`'s most recent write is a tombstone, WITHOUT the
+    /// bitemporal exemption of [`Liveness::deleted`]. For a caller that applies
+    /// its own temporal handling but still needs latest-write-wins for ordinary
+    /// tombstones: a tombstone followed by a later same-id write is stale.
+    pub fn tombstone_active(&self, id: &str) -> bool {
+        self.last_tomb
+            .get(id)
+            .is_some_and(|&ti| self.last_write.get(id).is_none_or(|&wi| ti > wi))
+    }
+
+    /// Every id whose tombstone is still active (see
+    /// [`Liveness::tombstone_active`]).
+    pub fn active_tombstoned_ids(&self) -> BTreeSet<&'a str> {
+        self.last_tomb
+            .keys()
+            .copied()
+            .filter(|id| self.tombstone_active(id))
+            .collect()
     }
 
     /// True when the record at append index `index` is the LATEST write of edge
