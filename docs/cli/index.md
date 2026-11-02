@@ -5,9 +5,9 @@ Build a **persistent sidecar index** next to a graph JSONL so targeted
 of deserializing every physical line of the file (issue #447).
 
 ```sh
-eg scan . --out graph.jsonl
-eg index graph.jsonl            # writes graph.jsonl.idx
+eg scan . --out graph.jsonl     # also writes graph.jsonl.idx automatically
 eg query deps my_symbol --graph graph.jsonl   # now seeks, not full-scans
+eg index graph.jsonl            # explicitly rebuild graph.jsonl.idx
 ```
 
 > **Pure access-path optimization.** The index never changes an answer. Every
@@ -24,19 +24,55 @@ once, where each record lives so a lane can seek to the bounded closure of
 records it needs.
 
 ```
-eg scan . --out graph.jsonl      # produce the graph
-eg index graph.jsonl             # build graph.jsonl.idx (idempotent, atomic)
+eg scan . --out graph.jsonl      # produce the graph AND graph.jsonl.idx
 eg query deps <symbol> --graph graph.jsonl        # fast path
 eg query context <symbol> --graph graph.jsonl
 eg query at <path>:<line> --graph graph.jsonl
 eg query locate <path>:<line> --graph graph.jsonl
 eg query file <path> --graph graph.jsonl
 eg query who-imports <module> --graph graph.jsonl
+eg index graph.jsonl             # explicitly rebuild (idempotent, atomic)
 ```
 
-`eg index` is the **only** writer of the sidecar index. Query lanes never write
-it; auto-build on query is off for v1. Re-run `eg index` after re-scanning to
-refresh the index.
+## Who writes the index
+
+The producer commands build the sidecar automatically, because they are
+the steps that create or validate the graph file:
+
+- `eg scan` and `eg scan-history` build `<out>.idx` right after writing
+  `<out>`. A `scan-history --resume-from` run that replays new commits
+  rebuilds it too; a zero-new-commit resume writes no graph and builds no
+  index. (A history graph's index records `has_temporal_history`; the
+  query loader still cold-scans history stores by design — see below.)
+- `eg ingest` (re)builds `<graph>.idx` for its input graph after a
+  successful ingest — every adapter, `dry-run` included (dry-run writes
+  no store, but the graph remains the queryable artifact and validating
+  it is what dry-run is for). This covers graphs produced elsewhere, or
+  whose sidecar went stale. It is the graph sidecar, distinct from the
+  embedded store's own indexes that ingest persists via
+  `persist_indexes`.
+- `eg index <graph>` rebuilds it explicitly (e.g. for a graph produced
+  by another tool, or after `--no-index`).
+- `eg init` and `eg refresh` build no sidecar: they produce no
+  user-facing graph JSONL. Init's internal scan stages write throwaway
+  temp-dir graphs that are only ingested in-process (and the history
+  graph is rewritten by snapshot alignment immediately after scanning),
+  and refresh maintains the embedded store in place.
+
+Query lanes never write the index; auto-build on query is off. Pass
+`--no-index` to `eg scan`, `eg scan-history`, or `eg ingest` to opt out
+(e.g. for a throwaway graph).
+
+### Failure semantics
+
+The index is a pure optimization, so an automatic build failure never
+fails a scan or ingest that otherwise succeeded (an ingest's store may
+already be persisted; failing there would invite a misleading retry).
+The producer prints a single-line `warning: failed to build sidecar
+index …` on stderr naming the remedy (`eg index <graph>`), and queries
+fall back to the cold scan until a build succeeds. The explicit
+`eg index` command is the opposite: a build failure there *is* the
+command's failure (exit 2, see below).
 
 ## Sidecar location and format
 

@@ -547,7 +547,15 @@ pub(crate) fn init_cmd(args: &InitArgs) -> Result<()> {
     warn_on_unconsumed_scope_pins();
 
     let data_dir = resolve_data_dir(args.data_dir.as_deref());
-    let scan_args = resolve_scan_args(args.repo_id_override.clone(), args.raw_literals);
+    let mut scan_args = resolve_scan_args(args.repo_id_override.clone(), args.raw_literals);
+    // Init's scan / scan-history stages write to throwaway temp-dir graphs
+    // that are only ever ingested in-process (never queried via `--graph`),
+    // and the history graph is rewritten by snapshot alignment right after
+    // its scan — so the producer-side sidecar build is opted out here: it
+    // would be discarded with the temp dir, and for history it would be
+    // stale on arrival. Init produces no user-facing graph JSONL, hence
+    // no sidecar.
+    scan_args.no_index = true;
     // The identity override may come from `egregore.toml` alone. Use the
     // RESOLVED value everywhere below (identity, idempotency probes, report) so
     // they agree with the identity the tree and history scans actually write.

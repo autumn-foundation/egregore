@@ -28,7 +28,8 @@ use crate::{
 /// # Errors
 ///
 /// Returns an error when the repository path is invalid, Git is unavailable, or
-/// a reachable Rust source blob cannot be parsed.
+/// a reachable source blob cannot be read. Blobs that cannot be decoded
+/// or parsed at all are skipped with a diagnostic, never an abort.
 pub fn scan_repository_history(repo_path: impl AsRef<Path>) -> Result<Graph> {
     scan_repository_history_with_override(repo_path, None)
 }
@@ -40,7 +41,8 @@ pub fn scan_repository_history(repo_path: impl AsRef<Path>) -> Result<Graph> {
 /// # Errors
 ///
 /// Returns an error when the repository path is invalid, Git is unavailable, or
-/// a reachable Rust source blob cannot be parsed.
+/// a reachable source blob cannot be read. Blobs that cannot be decoded
+/// or parsed at all are skipped with a diagnostic, never an abort.
 pub fn scan_repository_history_with_override(
     repo_path: impl AsRef<Path>,
     repo_id_override: Option<&str>,
@@ -59,8 +61,9 @@ pub fn scan_repository_history_with_override(
 /// # Errors
 ///
 /// Returns an error when the repository path is invalid, Git is unavailable, a
-/// reachable Rust source blob cannot be parsed, a range revision does not
-/// resolve, or the window selects no commits.
+/// reachable source blob cannot be read, a range revision does not
+/// resolve, or the window selects no commits. Blobs that cannot be decoded
+/// or parsed at all are skipped with a diagnostic, never an abort.
 pub fn scan_repository_history_with_window(
     repo_path: impl AsRef<Path>,
     repo_id_override: Option<&str>,
@@ -695,8 +698,10 @@ fn is_resume_stamp(record: &GraphRecord, repository_id: &str, tip_id: &str) -> b
 /// # Errors
 ///
 /// Returns an error when the repository path is invalid, Git is unavailable,
-/// a reachable Rust source blob cannot be parsed, the resume point belongs
+/// a reachable source blob cannot be read, the resume point belongs
 /// to another repository, or the stored tip is not an ancestor of `HEAD`.
+/// Blobs that cannot be decoded or parsed at all are skipped with a
+/// diagnostic, never an abort.
 pub fn scan_repository_history_resumed(
     repo_path: impl AsRef<Path>,
     repo_id_override: Option<&str>,
@@ -927,8 +932,9 @@ const fn record_git_commit(record: &GraphRecord) -> Option<&str> {
 ///
 /// # Errors
 ///
-/// Returns an error when a reachable Rust source blob cannot be parsed or a
-/// Git object command fails.
+/// Returns an error when a reachable source blob cannot be read or a
+/// Git object command fails. Blobs that cannot be decoded or parsed at
+/// all are skipped with a diagnostic, never an abort.
 fn replay_commit(
     repo_root: &Path,
     repository_id: &str,
@@ -1068,8 +1074,9 @@ fn replay_commit_changes(
 ///
 /// # Errors
 ///
-/// Returns an error when the `ls-tree` Git command fails, a reachable blob
-/// cannot be read, or a reachable Rust source blob cannot be parsed.
+/// Returns an error when the `ls-tree` Git command fails or a reachable
+/// blob cannot be read. Blobs that cannot be decoded or parsed at all are
+/// skipped with a diagnostic, never an abort.
 fn replay_commit_sources(
     repo_root: &Path,
     repository_id: &str,
@@ -1103,7 +1110,18 @@ fn replay_commit_sources(
             path: repo_root.join(path),
             repo_relative_path: path.clone(),
         };
-        let (records, facts) = scan_source_text_records(&source_file, source, repository_id)?;
+        // A wholly unparseable blob (the extractor's parse root is not the
+        // language's file root — e.g. a committed starter template) is
+        // skipped with the same deterministic diagnostic class as a
+        // non-UTF-8 blob, never an abort of the whole replay.
+        let (records, facts) = match scan_source_text_records(&source_file, source, repository_id) {
+            Ok(outcome) => outcome,
+            Err(CodegraphError::Parse { .. }) => {
+                replay_unparseable_diagnostic(repository_id, commit, path, graph);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if !facts.is_empty() {
             facts_by_file.insert(path.clone(), facts);
         }
@@ -1153,10 +1171,52 @@ fn replay_non_utf8_diagnostic(
     path: &str,
     graph: &mut Graph,
 ) {
+    replay_skip_diagnostic(
+        repository_id,
+        commit,
+        path,
+        graph,
+        "non_utf8_source",
+        "skipped source file: not valid UTF-8",
+    );
+}
+
+/// Pushes the deterministic `Diagnostic` for a committed blob that cannot
+/// be parsed at all (the extractor's parse root is not the language's file
+/// root — e.g. a committed starter template carrying `{{placeholder}}`
+/// tokens): the blob is skipped, not aborted, with the same fixed-summary
+/// discipline as the non-UTF-8 class.
+fn replay_unparseable_diagnostic(
+    repository_id: &str,
+    commit: &GitCommit,
+    path: &str,
+    graph: &mut Graph,
+) {
+    replay_skip_diagnostic(
+        repository_id,
+        commit,
+        path,
+        graph,
+        "unparseable_source",
+        "skipped source file: could not be parsed",
+    );
+}
+
+/// Shared body of the replay skip diagnostics: the ID keys on the failure
+/// class + repository + commit + path, the node's name is the class, and
+/// the summary is a fixed string — never raw bytes.
+fn replay_skip_diagnostic(
+    repository_id: &str,
+    commit: &GitCommit,
+    path: &str,
+    graph: &mut Graph,
+    class: &str,
+    summary: &str,
+) {
     let diag_id = stable_id(&[
         "node",
         "diagnostic",
-        "non_utf8_source",
+        class,
         repository_id,
         &commit.sha,
         path,
@@ -1167,8 +1227,8 @@ fn replay_non_utf8_diagnostic(
             NodeKind::Diagnostic,
             Some(path.to_owned()),
             None,
-            Some("non_utf8_source".to_owned()),
-            "skipped source file: not valid UTF-8".to_owned(),
+            Some(class.to_owned()),
+            summary.to_owned(),
         )
         .with_temporal(commit.temporal()),
     );

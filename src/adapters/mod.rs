@@ -243,6 +243,30 @@ pub trait GraphSink {
             }),
         }
     }
+
+    /// Writes a run of records in input order, verifying each one, and
+    /// returns exactly one result per record in the same order.
+    ///
+    /// The result for a record is the composition the ingest loop has always
+    /// applied: validate the record's schema version, write it, then verify
+    /// it — a failure at any step is that record's `Err`, and no later step
+    /// runs for it. The default implementation performs that composition
+    /// record by record. Transactional sinks override this to classify and
+    /// commit the run in batched transactions (the bulk JSONL write path)
+    /// while preserving this per-record result contract exactly, including
+    /// failure messages and inserted/unchanged accounting.
+    fn write_and_verify_records(
+        &mut self,
+        records: &[&GraphRecord],
+    ) -> Vec<AdapterResult<WriteOutcome>>
+    where
+        Self: Sized,
+    {
+        records
+            .iter()
+            .map(|record| write_and_verify(record, self))
+            .collect()
+    }
 }
 
 /// Summary of an ingest attempt.
@@ -613,32 +637,60 @@ pub fn ingest_records_with_policy<S: GraphSink>(
         return report;
     }
 
+    let ordered = ordered_records(records);
+    write_and_tally(&ordered, sink, &resolution, &diagnostic_for)
+}
+
+/// Writes the ordered records through the sink and tallies the ingest
+/// report. Quarantined records fail in place (at their exact positions in
+/// the failure stream); each maximal run of writable records goes to the
+/// sink as one [`GraphSink::write_and_verify_records`] call so a
+/// transactional sink can classify and commit it in batches, with the
+/// per-record result contract — and therefore this report — unchanged.
+fn write_and_tally<S: GraphSink>(
+    ordered: &[&GraphRecord],
+    sink: &mut S,
+    resolution: &CitationResolution<'_>,
+    diagnostic_for: &dyn Fn(&str) -> String,
+) -> IngestReport {
     let mut report = IngestReport::default();
-    for record in ordered_records(records) {
-        report.attempted += 1;
-        if resolution.quarantined.contains(record.id()) {
+    let mut position = 0;
+    while position < ordered.len() {
+        if resolution.quarantined.contains(ordered[position].id()) {
+            report.attempted += 1;
             report.failed += 1;
             report.failures.push(IngestFailure {
-                record_id: record.id().to_owned(),
-                message: diagnostic_for(record.id()),
+                record_id: ordered[position].id().to_owned(),
+                message: diagnostic_for(ordered[position].id()),
             });
+            position += 1;
             continue;
         }
-        match write_and_verify(record, sink) {
-            Ok(WriteOutcome::Inserted) => {
-                report.succeeded += 1;
-                report.inserted += 1;
-            }
-            Ok(WriteOutcome::Unchanged) => {
-                report.succeeded += 1;
-                report.unchanged += 1;
-            }
-            Err(error) => {
-                report.failed += 1;
-                report.failures.push(IngestFailure {
-                    record_id: record.id().to_owned(),
-                    message: error.to_string(),
-                });
+        let run_start = position;
+        while position < ordered.len() && !resolution.quarantined.contains(ordered[position].id()) {
+            position += 1;
+        }
+        let run = &ordered[run_start..position];
+        let results = sink.write_and_verify_records(run);
+        debug_assert_eq!(results.len(), run.len());
+        for (record, result) in run.iter().zip(results) {
+            report.attempted += 1;
+            match result {
+                Ok(WriteOutcome::Inserted) => {
+                    report.succeeded += 1;
+                    report.inserted += 1;
+                }
+                Ok(WriteOutcome::Unchanged) => {
+                    report.succeeded += 1;
+                    report.unchanged += 1;
+                }
+                Err(error) => {
+                    report.failed += 1;
+                    report.failures.push(IngestFailure {
+                        record_id: record.id().to_owned(),
+                        message: error.to_string(),
+                    });
+                }
             }
         }
     }
@@ -772,7 +824,7 @@ impl GraphSink for FakeSink {
     }
 }
 
-fn write_and_verify<S: GraphSink>(
+pub(crate) fn write_and_verify<S: GraphSink>(
     record: &GraphRecord,
     sink: &mut S,
 ) -> AdapterResult<WriteOutcome> {

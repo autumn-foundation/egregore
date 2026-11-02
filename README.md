@@ -135,6 +135,12 @@ egregore scan-history . --out history.graph.jsonl
 egregore ingest history.graph.jsonl --adapter embedded --data-dir .egregore
 ```
 
+`scan`, `scan-history`, and `ingest` each build the graph's sidecar index
+(`graph.jsonl.idx`, issue #447) automatically — targeted
+`eg query … --graph` lanes then seek instead of cold-scanning the whole
+JSONL. Pass `--no-index` to any of them to opt out, or rebuild explicitly
+with `eg index graph.jsonl`. See [docs/cli/index.md](docs/cli/index.md).
+
 To confirm what landed — totals plus per-domain, per-kind, and per-schema-version
 counts grouped by trust class — inspect the store directly, with no daemon
 (issue #125, the daemon-free analog of `eg inspect --daemon`):

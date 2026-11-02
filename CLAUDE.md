@@ -1429,14 +1429,17 @@ blocks; the full BLAKE3 only when the time differs), so a lookup's index cost
 does not grow with the graph. `eg query drift` (unscoped) also uses it, and
 `eg audit query-budget` builds the index for its stores in setup and now gates
 at 10x records ≤ 2x latency (measured 0.95x).
-`eg index` is the only writer (atomic `.idx.tmp` + rename, deterministic bytes),
-refuses (exit 2) any graph a cold load would reject, and never writes from a
-query path. Migrated lanes (`deps`, `context`/`symbol`, `at`/`locate`, `file`,
+The producer commands write it: `eg scan`, `eg scan-history`, and `eg ingest`
+build `<graph>.idx` automatically after writing/validating the graph (opt out
+with `--no-index`; a failed auto-build prints a one-line stderr warning and never
+fails the scan/ingest), and `eg index` rebuilds it explicitly (atomic `.idx.tmp`
++ rename, deterministic bytes) and refuses (exit 2) any graph a cold load would
+reject. A query path never writes it; `eg init`/`eg refresh` build none. Migrated lanes (`deps`, `context`/`symbol`, `at`/`locate`, `file`,
 `who-imports`) take the fast path only for the plain current-state, unscoped
 invocation; `--repo`/`--at`/`--as-of`/`--repo-path` and every other `--graph`
 lane stay on the cold full-file scan. Composing with #457 (which made
 `deps`/`who-imports` HEAD-anchor by default over a history store), the index
-body carries a `has_temporal_history` flag (still format v1) set when the graph
+header carries a `has_temporal_history` flag set when the graph
 is a `scan-history`/corpus store (any temporal record or `Commit` node); the
 loader then falls back to the cold whole-file scan for the migrated lanes over
 such a store — the #457 HEAD-anchor gate needs global commit topology and every

@@ -402,9 +402,10 @@ fn scan_repository_at_with_override_inner(
                     facts_by_file.insert(source_file.repo_relative_path.clone(), *facts);
                 }
             }
-            // A non-UTF-8 or unreadable file is skipped (issue #438): record its
-            // deterministic diagnostic and thread the skip into the coverage
-            // tally so `reconcile_scan_coverage` counts it UNINDEXED.
+            // A non-UTF-8, unreadable, or unparseable file is skipped
+            // (issue #438): record its deterministic diagnostic and thread
+            // the skip into the coverage tally so `reconcile_scan_coverage`
+            // counts it UNINDEXED.
             SourceFileScanOutcome::Skipped {
                 diagnostic,
                 repo_relative_path,
@@ -751,10 +752,12 @@ pub(crate) fn scan_coverage_records(
 
 /// Outcome of attempting to scan one discovered source file (issue #438).
 ///
-/// A file that cannot be decoded as UTF-8, or cannot be read at all, no longer
-/// aborts the whole scan: it becomes a [`SourceFileScanOutcome::Skipped`]
-/// carrying a deterministic `Diagnostic` node and the accounting the caller
-/// threads into scan coverage so the file is honestly counted UNINDEXED.
+/// A file that cannot be decoded as UTF-8, cannot be read at all, or cannot
+/// be parsed at all (its parse root is not the language's file root) no
+/// longer aborts the whole scan: it becomes a
+/// [`SourceFileScanOutcome::Skipped`] carrying a deterministic `Diagnostic`
+/// node and the accounting the caller threads into scan coverage so the
+/// file is honestly counted UNINDEXED.
 pub(crate) enum SourceFileScanOutcome {
     /// The file decoded and extracted normally. `facts` is boxed so the
     /// large [`FileFacts`] struct does not bloat the enum variant (the same
@@ -763,9 +766,10 @@ pub(crate) enum SourceFileScanOutcome {
         records: Vec<GraphRecord>,
         facts: Box<languages::cross_file::FileFacts>,
     },
-    /// The file was skipped (non-UTF-8 or unreadable). `diagnostic` names the
-    /// repo-relative path and the fixed decode/read-failure reason;
-    /// `repo_relative_path`/`extension` reconcile the skip into `ScanCoverage`.
+    /// The file was skipped (non-UTF-8, unreadable, or unparseable).
+    /// `diagnostic` names the repo-relative path and the fixed
+    /// decode/read/parse-failure reason; `repo_relative_path`/`extension`
+    /// reconcile the skip into `ScanCoverage`.
     /// The diagnostic node is boxed so the (common) `Extracted` variant is not
     /// bloated by the large `GraphRecord` node.
     Skipped {
@@ -860,7 +864,29 @@ pub(crate) fn scan_source_file_records(
             extension,
         });
     };
-    let (records, facts) = scan_source_text_records(source_file, source, repository_id)?;
+    // A wholly unparseable file (the extractor's parse root is not the
+    // language's file root — e.g. a Rust starter template carrying
+    // `{{crate_name}}` placeholders) is the third skip class, alongside
+    // unreadable and non-UTF-8 (issue #438): the extractor reports it as
+    // `CodegraphError::Parse`, and the scan skips it with the same
+    // deterministic diagnostic + coverage accounting instead of aborting
+    // the whole repo scan. Every other extraction error still propagates.
+    let (records, facts) = match scan_source_text_records(source_file, source, repository_id) {
+        Ok(outcome) => outcome,
+        Err(CodegraphError::Parse { .. }) => {
+            return Ok(SourceFileScanOutcome::Skipped {
+                diagnostic: Box::new(skipped_source_diagnostic(
+                    repository_id,
+                    &repo_relative_path,
+                    "unparseable_source",
+                    "skipped source file: could not be parsed",
+                )),
+                repo_relative_path,
+                extension,
+            });
+        }
+        Err(error) => return Err(error),
+    };
     Ok(SourceFileScanOutcome::Extracted {
         records,
         facts: Box::new(facts),
@@ -1086,6 +1112,57 @@ mod tests {
             }
             SourceFileScanOutcome::Extracted { .. } => {
                 panic!("an unreadable path must be Skipped, not Extracted")
+            }
+        }
+    }
+
+    /// A Rust file whose Tree-sitter parse root is `ERROR` (a wholly
+    /// unparseable file — here a starter-template `use {{crate_name}}::…`
+    /// inside a function body, delta-minimized from a real Autumn starter
+    /// template) yields a `Skipped` outcome carrying an `unparseable`
+    /// diagnostic rather than panicking (debug) or aborting the scan. This
+    /// is the scan-funnel half of the contract; the extractor half returns
+    /// `CodegraphError::Parse` for the same input.
+    #[test]
+    fn unparseable_source_file_is_skipped_not_aborted() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("bad.rs");
+        std::fs::write(
+            &path,
+            "async fn f() {\n    use {{crate_name}}::schema::comments;\n",
+        )
+        .expect("source should be written");
+        let source_file = SourceFile {
+            path,
+            repo_relative_path: "src/bad.rs".to_owned(),
+        };
+
+        let outcome = scan_source_file_records(&source_file, "repo:test").expect("must not abort");
+        match outcome {
+            SourceFileScanOutcome::Skipped {
+                diagnostic,
+                repo_relative_path,
+                ..
+            } => {
+                assert_eq!(repo_relative_path, "src/bad.rs");
+                let GraphRecord::Node {
+                    kind,
+                    name,
+                    summary,
+                    ..
+                } = diagnostic.as_ref()
+                else {
+                    panic!("skip diagnostic must be a node");
+                };
+                assert_eq!(*kind, NodeKind::Diagnostic);
+                assert_eq!(name.as_deref(), Some("unparseable_source"));
+                assert!(
+                    summary.contains("could not be parsed"),
+                    "expected an unparseable diagnostic, got: {summary}"
+                );
+            }
+            SourceFileScanOutcome::Extracted { .. } => {
+                panic!("an unparseable path must be Skipped, not Extracted")
             }
         }
     }

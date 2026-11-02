@@ -51,6 +51,12 @@ pub(crate) fn scan(repo_path: &Path, out: &Path, args: &ResolvedScanArgs) -> Res
         .context("failed to serialize graph JSONL")?;
     fs::write(out, jsonl)
         .with_context(|| format!("failed to write graph JSONL to {}", out.display()))?;
+    // Producer-side sidecar build (issue #447): the graph just written is
+    // the artifact targeted `--graph` queries will read, so build its
+    // `<out>.idx` here instead of leaving every query to cold-scan until
+    // someone remembers `eg index`. Best-effort (warning on failure) and
+    // suppressible with `--no-index`.
+    auto_build_sidecar_index_unless(out, args.no_index);
     Ok(())
 }
 
@@ -240,6 +246,9 @@ pub(crate) fn scan_history(
         .context("failed to serialize history graph JSONL")?;
     fs::write(out, jsonl)
         .with_context(|| format!("failed to write history graph JSONL to {}", out.display()))?;
+    // Producer-side sidecar build (issue #447), as in `scan` (a history
+    // index records `has_temporal_history`; see `scan`'s note).
+    auto_build_sidecar_index_unless(out, args.no_index);
     Ok(())
 }
 
@@ -357,6 +366,11 @@ fn scan_history_resumed(
     if outcome.processed > 0 {
         fs::write(out, jsonl)
             .with_context(|| format!("failed to write history graph JSONL to {}", out.display()))?;
+        // The graph was rewritten, so refresh its sidecar too (issue
+        // #447). The zero-new-commit path above writes nothing and builds
+        // nothing: `--out` — and any sidecar state — stays untouched,
+        // exactly like the graph itself.
+        auto_build_sidecar_index_unless(out, args.no_index);
     }
 
     let report = serde_json::json!({

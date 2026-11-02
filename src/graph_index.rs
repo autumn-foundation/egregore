@@ -14,7 +14,10 @@
 //! caller transparently fall back to the cold scan. A query checks validity
 //! cheaply first (length, modification time, sampled blocks) and reads the
 //! index in place, so its cost does not grow with the graph (issue #120).
-//! `eg index` is the only writer. This is a SEPARATE mechanism from the scan-time incremental cache
+//! Writers are the producer commands — `eg scan`, `eg scan-history`, and
+//! `eg ingest` build the sidecar automatically (unless `--no-index`), and
+//! `eg index` rebuilds it explicitly; query lanes never write it. This is a
+//! SEPARATE mechanism from the scan-time incremental cache
 //! (`crate::incremental`); it shares that module's versioned self-invalidation
 //! discipline but none of its code.
 
@@ -133,7 +136,9 @@ pub struct GraphIndexBody {
     /// supplied by a closure, so the loader falls back to a cold whole-file scan
     /// for a history store (see `load_records_from_jsonl_selected`). A plain
     /// current-tree `scan` graph carries no temporal records, so this stays
-    /// `false` and the #447 fast path applies.
+    /// `false` and the #447 fast path applies. Every writer (`eg scan` /
+    /// `eg scan-history` / `eg ingest` / `eg index`) always sets it, so every
+    /// index freshly built by this binary carries the correct value.
     pub has_temporal_history: bool,
 }
 
@@ -745,7 +750,8 @@ impl GraphIndex {
     }
 
     /// Writes the index to `index_path` atomically (`.tmp` + rename), so a reader
-    /// never observes a torn index. `eg index` is the only caller.
+    /// never observes a torn index. Called by the shared CLI build path
+    /// (`eg index` and the producer commands' automatic builds).
     ///
     /// # Errors
     ///

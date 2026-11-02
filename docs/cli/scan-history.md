@@ -16,6 +16,15 @@ reachable from `HEAD` — exactly as before #256, byte-for-byte.
 eg scan-history . --out history.jsonl
 ```
 
+After writing the JSONL, `eg scan-history` also builds the sidecar index
+`<out>.idx` (issue #447) — see [`index.md`](index.md). A history graph's
+index records `has_temporal_history`, so the query loader keeps its
+cold-scan fallback for history stores; the sidecar still certifies the
+graph's validity and freshness. A `--resume-from` run that replays new
+commits rebuilds the index; a zero-new-commit resume writes no graph and
+builds no index. The build is best-effort (a failure warns on stderr,
+never fails the replay); pass `--no-index` to skip it.
+
 Three window flags scope the replay to a subset of commits. At most one
 window form may be given:
 

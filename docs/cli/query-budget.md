@@ -163,8 +163,10 @@ index built in benchmark setup.
 
 ### What this gate does not show
 
-- `eg scan` and `eg ingest` build no index. Run `eg index` to get the fast
-  path. Without it, a lookup is a linear scan.
+- `eg scan`, `eg scan-history`, and `eg ingest` build `<graph>.idx` by
+  default (`--no-index` opts out). A graph made another way, or with
+  `--no-index`, needs `eg index` for the fast path. Without an index, a lookup
+  is a linear scan.
 - A history or corpus store (`scan-history`) always cold-scans. The benchmark
   corpus is a plain scan, so the gate does not cover that case.
 - The benchmark names are unique. A common name (`new`, `fmt`) matches many

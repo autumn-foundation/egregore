@@ -17,6 +17,13 @@ walked but not indexed.
 eg scan . --out graph.jsonl
 ```
 
+After writing the JSONL, `eg scan` also builds the sidecar index
+`<out>.idx` (issue #447) so targeted `eg query … --graph` lanes seek
+instead of cold-scanning the whole file — see
+[`index.md`](index.md). The build is best-effort: a failure prints a
+one-line warning on stderr and never fails the scan. Pass `--no-index`
+to skip it (e.g. for a throwaway graph).
+
 ## Scan coverage (issue #135)
 
 Before #135, files that were not indexed were silently dropped and nothing said
