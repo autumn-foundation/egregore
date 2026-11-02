@@ -11,6 +11,7 @@
 //! suppression reads back from the store with its payload intact.
 
 #![allow(missing_docs, clippy::doc_markdown)]
+#![cfg(feature = "embedded-aletheiadb")]
 
 use std::fs;
 

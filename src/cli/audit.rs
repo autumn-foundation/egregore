@@ -1610,6 +1610,30 @@ struct QueryBudgetStores {
 /// store path.
 type QueryArgv = Box<dyn Fn(&str) -> Vec<String>>;
 
+/// Gives scaled copy `copy` names and paths no other copy has.
+///
+/// Every copy scans the same source, so without this the 10x store would
+/// answer a by-name or by-path lookup with 10x the rows. Then the ratio would
+/// measure answer size, not how lookup cost grows with store size. Record IDs
+/// are already disjoint per copy and stay untouched.
+fn disjoin_copy_names(records: &mut [crate::ir::GraphRecord], copy: usize) {
+    for record in records {
+        if let crate::ir::GraphRecord::Node {
+            name,
+            repo_relative_path,
+            ..
+        } = record
+        {
+            if let Some(name) = name {
+                *name = format!("{name}__s{copy:02}");
+            }
+            if let Some(path) = repo_relative_path {
+                *path = format!("s{copy:02}/{path}");
+            }
+        }
+    }
+}
+
 /// Builds the 1x and scaled fixture stores in a temp dir (issue #120).
 ///
 /// Scans the fixture corpus `scale_factor` times with disjoint repository
@@ -1638,6 +1662,9 @@ fn build_query_budget_stores(
                     query_latency_exit("corpus_scan_error", &dir, &error.to_string())
                 });
         let mut records: Vec<crate::ir::GraphRecord> = graph.records().to_vec();
+        if copy > 0 {
+            disjoin_copy_names(&mut records, copy);
+        }
         records.extend(synthetic_drift_records(
             &records,
             &repo_tag,
@@ -1679,6 +1706,19 @@ fn build_query_budget_stores(
                 &error.to_string(),
             )
         });
+        // Setup, not timed: the sidecar index (`eg index`, issue #447) is the
+        // documented access path that keeps a targeted lookup from reading
+        // the whole store. Without it the lookup is a linear scan.
+        crate::graph_index::GraphIndex::build(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|index| {
+                index
+                    .write_atomic(&crate::graph_index::index_path_for(&path))
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap_or_else(|message| {
+                query_latency_exit("corpus_index_error", &path.display().to_string(), &message)
+            });
         path
     };
 

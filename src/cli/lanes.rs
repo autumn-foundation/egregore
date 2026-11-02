@@ -426,15 +426,6 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
         },
     ),
     (
-        "keygen",
-        LaneStatic {
-            store_mode: StoreMode::Structural,
-            trust_classes: &["other"],
-            citable_handles: false,
-            freshness: &[],
-        },
-    ),
-    (
         "lifeline",
         LaneStatic {
             store_mode: StoreMode::Structural,
@@ -621,6 +612,7 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
         },
     ),
     #[cfg(feature = "embeddings")]
+    #[cfg(feature = "embeddings")]
     (
         "semantic",
         LaneStatic {
@@ -630,6 +622,7 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
             freshness: &["ingest_snapshot"],
         },
     ),
+    #[cfg(feature = "embeddings")]
     #[cfg(feature = "embeddings")]
     (
         "semantic-context",
@@ -649,6 +642,7 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
         },
     ),
     #[cfg(feature = "embeddings")]
+    #[cfg(feature = "embeddings")]
     (
         "semantic-memory",
         LaneStatic {
@@ -658,6 +652,7 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
             freshness: &["ingest_snapshot", "store_live"],
         },
     ),
+    #[cfg(feature = "embeddings")]
     (
         "similar",
         LaneStatic {
@@ -688,6 +683,22 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
         LaneStatic {
             store_mode: StoreMode::Structural,
             trust_classes: &["agent_unverified", "project_state"],
+            citable_handles: true,
+            freshness: &["ingest_snapshot", "store_live"],
+        },
+    ),
+    (
+        "since",
+        LaneStatic {
+            store_mode: StoreMode::Structural,
+            trust_classes: &[
+                "source_derived",
+                "verification_evidence",
+                "agent_unverified",
+                "project_state",
+                "artifact",
+                "runtime_observation",
+            ],
             citable_handles: true,
             freshness: &["ingest_snapshot", "store_live"],
         },

@@ -273,7 +273,9 @@ fn tracked_changes(repo_root: &Path, staged_only: bool) -> Result<Vec<ChangedPat
     for (status, path, old_path) in parse_name_status(&status_out.stdout) {
         let path_status = match status {
             'A' => PathStatus::Added,
-            'M' => PathStatus::Modified,
+            // `T` (file type change, e.g. a regular file replaced by a symlink)
+            // is a modification of the path for brief purposes.
+            'M' | 'T' => PathStatus::Modified,
             'D' => PathStatus::Deleted,
             'R' => PathStatus::Renamed {
                 from: old_path.unwrap_or_default(),
@@ -421,13 +423,34 @@ fn parse_unified_hunks(text: &str) -> Vec<(String, Vec<LineRange>)> {
         .collect()
 }
 
+/// For an unquoted `a/<p> b/<p>` header with identical old/new paths, returns
+/// the new-side `b/<p>` (spaces inside `<p>` preserved); `None` when the two
+/// halves differ (a rename) or the header is not of that shape.
+fn equal_path_header_new_path(rest: &str) -> Option<&str> {
+    let middle = rest.len().checked_sub(1)? / 2;
+    if rest.len().is_multiple_of(2) || !rest.is_char_boundary(middle) {
+        return None;
+    }
+    let (old, new_with_space) = rest.split_at(middle);
+    let new = new_with_space.strip_prefix(' ')?;
+    (old.strip_prefix("a/")? == new.strip_prefix("b/")?).then_some(new)
+}
+
 /// Extracts the new-side path from a `diff --git <old> <new>` header line
 /// (the part after the `diff --git ` prefix). Handles quoted paths that
 /// contain spaces: git emits `"a/<old>" "b/<new>"` when quoting is on; with
 /// `core.quotePath=false` paths are literal and space-free.
 fn parse_diff_git_new_path(rest: &str) -> String {
     let path = rest.strip_prefix('"').map_or_else(
-        || rest.rsplit_once(' ').map_or(rest, |(_, b)| b),
+        || {
+            // Unquoted (`core.quotePath=false`) paths are literal and may
+            // contain spaces. For the common non-rename header the old and new
+            // paths are identical (`a/<p> b/<p>`), which is unambiguous even
+            // with spaces; only a rename header falls back to the last space.
+            equal_path_header_new_path(rest)
+                .or_else(|| rest.rsplit_once(' ').map(|(_, b)| b))
+                .unwrap_or(rest)
+        },
         |quoted| {
             // `"a/<old>" "b/<new>"` — split on the `" "b/` separator.
             quoted
@@ -463,6 +486,13 @@ fn parse_unified_hunk_ranges(text: &str) -> Vec<FileHunks> {
                 });
                 Some(files.len() - 1)
             });
+        } else if let Some(renamed_to) = line.strip_prefix("rename to ") {
+            // A rename header (`a/<old> b/<new>`) is ambiguous when either path
+            // contains spaces; git's own `rename to <new>` line is not, and is
+            // the literal new path name-status reports (quotePath=false).
+            if let Some(idx) = current {
+                renamed_to.clone_into(&mut files[idx].path);
+            }
         } else if line.strip_prefix("@@ ").is_some() {
             let Some(idx) = current else { continue };
             // Pass the full line: the header parser expects the `@@ ` prefix.
@@ -805,5 +835,55 @@ mod tests {
         );
         assert!(diff.paths[0].old_ranges.is_empty());
         assert_eq!(diff.paths[0].changed_lines, 0);
+    }
+
+    #[test]
+    fn diff_header_path_with_spaces_is_preserved() {
+        assert_eq!(
+            parse_diff_git_new_path("a/foo bar.rs b/foo bar.rs"),
+            "foo bar.rs"
+        );
+        assert_eq!(
+            parse_diff_git_new_path("a/dir one/x y.rs b/dir one/x y.rs"),
+            "dir one/x y.rs"
+        );
+        assert_eq!(parse_diff_git_new_path("a/plain.rs b/plain.rs"), "plain.rs");
+        // A rename keeps the last-space fallback.
+        assert_eq!(parse_diff_git_new_path("a/old.rs b/new.rs"), "new.rs");
+    }
+
+    #[test]
+    fn renamed_path_with_spaces_comes_from_the_rename_to_line() {
+        let diff = "diff --git a/old foo.rs b/new bar.rs\n\
+                    similarity index 90%\n\
+                    rename from old foo.rs\n\
+                    rename to new bar.rs\n\
+                    --- a/old foo.rs\n\
+                    +++ b/new bar.rs\n\
+                    @@ -1,0 +2,2 @@\n";
+        let files = parse_unified_hunk_ranges(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "new bar.rs");
+        assert_eq!(files[0].hunks.new.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn type_change_is_reported_as_a_modified_path() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "t@example.com"]);
+        git(root, &["config", "user.name", "t"]);
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").expect("write");
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "init"]);
+        // Replace the regular file with a symlink: git reports status `T`.
+        std::fs::remove_file(root.join("a.rs")).expect("rm");
+        std::os::unix::fs::symlink("elsewhere", root.join("a.rs")).expect("symlink");
+        let diff = working_tree_diff(root, false).expect("a type change must not abort");
+        assert_eq!(diff.paths.len(), 1);
+        assert_eq!(diff.paths[0].path, "a.rs");
+        assert_eq!(diff.paths[0].status, PathStatus::Modified);
     }
 }

@@ -54,7 +54,13 @@ fn scan_repo(root: &Path, out: &Path) {
 /// first File's repo-relative path.
 fn symbol_names_and_file(graph: &Path) -> (String, String, String) {
     let content = fs::read_to_string(graph).expect("graph readable");
-    let mut symbols: Vec<String> = Vec::new();
+    // Names seen per Symbol node: a name carried by several symbols is
+    // ambiguous and never resolves to a MENTIONS_SYMBOL edge, so only
+    // UNIQUE, qualified names are usable. Record order in the graph depends on hashed IDs
+    // (which depend on the temp-dir repo identity), so pick deterministically
+    // (sorted) instead of by file order.
+    let mut name_counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
     let mut file: Option<String> = None;
     for line in content.lines() {
         if line.trim().is_empty() {
@@ -64,10 +70,8 @@ fn symbol_names_and_file(graph: &Path) -> (String, String, String) {
         if v["type"] == "node" || v.get("kind").is_some() {
             match v["kind"].as_str() {
                 Some("Symbol") => {
-                    if let Some(name) = v["name"].as_str().map(str::to_owned)
-                        && !symbols.contains(&name)
-                    {
-                        symbols.push(name);
+                    if let Some(name) = v["name"].as_str().map(str::to_owned) {
+                        *name_counts.entry(name).or_default() += 1;
                     }
                 }
                 Some("File") if file.is_none() => {
@@ -77,7 +81,15 @@ fn symbol_names_and_file(graph: &Path) -> (String, String, String) {
             }
         }
     }
-    assert!(symbols.len() >= 2, "graph needs two symbols");
+    let mut symbols: Vec<String> = name_counts
+        .into_iter()
+        .filter_map(|(name, count)| {
+            // Only a qualified (`::`) name without spaces is a symbol literal
+            // the importer recognizes (`classify_literal`).
+            (count == 1 && name.contains("::") && !name.contains(' ')).then_some(name)
+        })
+        .collect();
+    assert!(symbols.len() >= 2, "graph needs two unique symbols");
     let second = symbols[1].clone();
     let first = symbols.remove(0);
     (first, second, file.expect("graph has a file"))
@@ -176,6 +188,42 @@ fn import_docs_unresolved_reference_diagnostic_exit_2_and_no_body_leak() {
     assert_eq!(read_records(&out).len(), 0);
 }
 
+/// A symlinked directory under a documented root must not be followed: it could
+/// import Markdown from outside the repository under a synthetic repo-relative
+/// path, or recurse forever through a link to an ancestor.
+#[cfg(unix)]
+#[test]
+fn import_docs_does_not_follow_symlinked_directories() {
+    let (tmp, root) = repo_with_docs(&[]);
+    let graph_path = root.join("graph.jsonl");
+    scan_repo(&root, &graph_path);
+    let (symbol_name, file_path) = first_symbol_and_file(&graph_path);
+
+    // An outside directory holding a doc that WOULD resolve if it were imported.
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(
+        outside.join("0002-outside.md"),
+        format!("---\ntitle: Outside\n---\n# Outside\n\nUses `{file_path}` and `{symbol_name}`.\n"),
+    )
+    .unwrap();
+    let adr = root.join("docs").join("adr");
+    fs::create_dir_all(&adr).unwrap();
+    std::os::unix::fs::symlink(&outside, adr.join("linked-outside")).unwrap();
+    // A link back to an ancestor: following it would never terminate.
+    std::os::unix::fs::symlink(&root, adr.join("loop")).unwrap();
+
+    let out = root.join("docs.jsonl");
+    let assert = import_docs(&root, &graph_path, &out);
+    let output = assert.get_output();
+    let records = read_records(&out);
+    assert!(
+        records.iter().all(|r| !r.to_string().contains("Outside")),
+        "outside docs must not be imported, got {records:?} (exit {:?})",
+        output.status.code()
+    );
+}
+
 #[test]
 fn import_docs_unknown_root_exit_2() {
     let (_tmp, root) = repo_with_docs(&[]);
@@ -211,6 +259,7 @@ fn import_docs_empty_document_diagnostic_exit_2() {
     assert!(stderr.contains("empty_document"), "stderr: {stderr}");
 }
 
+#[cfg(feature = "embedded-aletheiadb")]
 #[test]
 fn query_symbol_surfaces_design_doc_row() {
     let (_tmp, root) = repo_with_docs(&[]);

@@ -314,7 +314,8 @@ pub fn task_overlap_report(
 
     // ── Live Task nodes: latest version per stable ID ─────────────────────
     // The representative version is the one with the greatest
-    // `transaction_time` (RFC3339 strings compare lexicographically); a later
+    // `transaction_time` compared as RFC 3339 INSTANTS (text order is wrong across
+    // differing offsets); a later
     // read order breaks ties. Tombstoned IDs are out entirely.
     let mut node_versions: BTreeMap<&str, Vec<&GraphRecord>> = BTreeMap::new();
     for record in records {
@@ -342,11 +343,21 @@ pub fn task_overlap_report(
                     _ => "",
                 }
             }
-            // `max_by` returns the last maximum on ties, so read order breaks
-            // transaction_time ties.
+            // Compare as RFC 3339 INSTANTS: differing offsets make the text
+            // order disagree with the time order. An unparseable stamp falls
+            // back to text order. `max_by` returns the last maximum on ties,
+            // so read order breaks transaction_time ties.
             versions
                 .iter()
-                .max_by(|a, b| tx(a).cmp(tx(b)))
+                .max_by(|a, b| {
+                    match (
+                        chrono::DateTime::parse_from_rfc3339(tx(a)),
+                        chrono::DateTime::parse_from_rfc3339(tx(b)),
+                    ) {
+                        (Ok(left), Ok(right)) => left.cmp(&right),
+                        _ => tx(a).cmp(tx(b)),
+                    }
+                })
                 .map(|record| (*id, *record))
         })
         .collect();
@@ -1018,6 +1029,36 @@ mod tests {
             r.diagnostics.is_empty(),
             "t10 has a footprint and t9 is not in-flight"
         );
+    }
+
+    #[test]
+    fn transaction_time_compares_instants_not_text_across_offsets() {
+        // `2026-01-01T00:30:00+01:00` sorts AFTER `2026-01-01T00:00:00Z` as
+        // text, but is the EARLIER instant (23:30Z the day before). The
+        // latest version of task:t11 is therefore the `open` one.
+        let lines = [
+            task(
+                "task:t11",
+                "open",
+                json!({"transaction_time": "2026-01-01T00:00:00Z"}),
+            ),
+            task(
+                "task:t11",
+                "closed_completed",
+                json!({"transaction_time": "2026-01-01T00:30:00+01:00"}),
+            ),
+            task("task:t12", "open", json!({})),
+            node("sym:s", "Symbol", &json!({"repo_relative_path": "a.rs"})),
+            edge("e1", "MENTIONS_SYMBOL", "task:t11", "sym:s"),
+            edge("e2", "MENTIONS_SYMBOL", "task:t12", "sym:s"),
+        ];
+        let records: Vec<GraphRecord> = lines
+            .iter()
+            .map(|l| serde_json::from_str(l).expect("valid line"))
+            .collect();
+        let r = report(&records);
+        assert_eq!(r.counts.in_flight_tasks, 2, "t11's latest instant is open");
+        assert_eq!(r.pairs.len(), 1, "t11 and t12 share a symbol");
     }
 
     #[test]

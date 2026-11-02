@@ -406,6 +406,48 @@ fn init_second_run_is_already_current() {
     assert_eq!(third["status"], "rebuilt");
 }
 
+/// An identity override supplied ONLY through `egregore.toml` must drive init's
+/// identity, idempotency probe and report exactly like the scans do: a second
+/// unchanged run is `already_current`, not a rebuild under a mismatched
+/// auto-detected identity.
+#[test]
+fn init_honors_a_config_only_repo_id_override() {
+    let repo_temp = fixture_git_repo();
+    let repo = repo_temp.path();
+    let work_temp = tempfile::tempdir().expect("temp dir should be created");
+    fs::write(
+        work_temp.path().join("egregore.toml"),
+        "repo_id_override = \"cfg-only-identity\"\n",
+    )
+    .unwrap();
+    let store = work_temp.path().join("store");
+    let run = |store: &Path| {
+        let output = eg()
+            .current_dir(work_temp.path())
+            .arg("init")
+            .arg(repo)
+            .arg("--data-dir")
+            .arg(store)
+            .args(["--format", "json", "--no-embed"])
+            .output()
+            .expect("eg init should execute");
+        let code = output.status.code().unwrap_or(-1);
+        let report: Value =
+            serde_json::from_slice(&output.stdout).expect("stdout should be a JSON report");
+        (code, report)
+    };
+    let (code, first) = run(&store);
+    assert_eq!(code, 0);
+    assert_eq!(first["status"], "rebuilt");
+    assert_eq!(
+        first["repository"]["identity_source"], "operator_override",
+        "the report must name the configured identity, not an auto-detected one"
+    );
+    let (code, second) = run(&store);
+    assert_eq!(code, 3, "unchanged second init must be already_current");
+    assert_eq!(second["status"], "already_current");
+}
+
 // ── AC: --no-embed is loud, structural queries keep working ─────────────────
 
 /// Explicit `--no-embed` is loudly reported in the JSON report and the

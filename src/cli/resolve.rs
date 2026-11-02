@@ -226,7 +226,11 @@ pub(crate) fn query_resolve_cmd(
         (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
     };
 
-    let deleted = current_deleted_ids(&records);
+    // Latest-write-wins: a tombstone followed by a later same-id write is stale,
+    // so a re-ingested (revived) record resolves live over `--graph` exactly as
+    // it does over the embedded store. Temporal handling stays with the
+    // lane's own checks below.
+    let deleted = crate::query::liveness::Liveness::new(&records).active_tombstoned_ids();
     // Issue #472: targets of active repository-eviction tombstones are
     // suppressed from this lane, including their temporal snapshots. Ordinary
     // `forget` tombstones keep the issue #231 temporal exemption.

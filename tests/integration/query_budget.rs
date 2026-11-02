@@ -60,18 +60,11 @@ fn run_gate_quick(extra_args: &[&str]) -> (i32, Value) {
 // p50/p95, the ripgrep baseline is present or explicitly skipped, and the
 // cold symbol scaling ratio sits under the 2.0 ceiling.
 //
-// TRACKED RED (issue #120): this test is `#[ignore]`d because the scaling
-// assertion is violated on current trunk — measured 9.7-10.1x vs the 2.0x
-// ceiling (2026-09-30, Fly Sprite). The query path loads the whole store per
-// invocation, so time-to-first-answer scales linearly with record count;
-// the optimization slice (lazy load / indexing / caching — explicitly out
-// of scope for #120) must turn this green. Run with
-// `cargo test -- --ignored` to observe the RED. Do NOT delete this test and
-// do NOT raise the ceiling to fit the measurement: it is the regression
-// guard's end-state. The dedicated `query-budget` CI job runs the live gate
-// (not ignored) and is expected-red until the optimization slice lands.
+// The scaling gate (issue #120): 10x the records must cost at most 2x the
+// latency. It holds because the benchmark builds the sidecar index (`eg index`)
+// in setup and a targeted lookup reads that index in place. Do NOT raise the
+// ceiling to fit a measurement.
 #[test]
-#[ignore = "tracked RED: scaling assertion violated on trunk (~10x vs 2.0x ceiling); pending the optimization slice"]
 fn scaling_gate_passes_on_reference_corpus() {
     let (code, report) = run_gate(&[]);
     assert_eq!(code, 0, "gate should pass: {report}");

@@ -478,9 +478,24 @@ pub fn run_verifier(bin: &Path, args: &[String], timeout: Duration) -> std::io::
                         let _ = child.kill();
                     }
                 }
+                // Windows: `taskkill /T` follows parent-PID links. A grandchild
+                // whose parent already exited survives and keeps the pipes
+                // open. A Job Object would close that gap, but it needs
+                // `unsafe`, which this crate forbids.
                 #[cfg(not(unix))]
                 {
-                    let _ = child.kill();
+                    let (program, args) = tree_kill_command(child.id());
+                    let killed = Command::new(program)
+                        .args(&args)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+                    if !killed {
+                        let _ = child.kill();
+                    }
                 }
                 let _ = child.wait();
                 break (None, true);
@@ -1246,4 +1261,33 @@ pub fn capture_proof(config: &CaptureConfig) -> Result<ProofOutcome, ProofCaptur
         raw_stdout: run.stdout,
         raw_stderr: run.stderr,
     })
+}
+
+/// Program and arguments that end a whole process tree on Windows.
+///
+/// `child.kill()` ends only the direct child; a wrapper's children keep the
+/// pipes open and block the drain threads. `taskkill /T` ends the tree.
+#[cfg_attr(unix, allow(dead_code))]
+fn tree_kill_command(pid: u32) -> (&'static str, Vec<String>) {
+    (
+        "taskkill",
+        vec![
+            "/PID".to_owned(),
+            pid.to_string(),
+            "/T".to_owned(),
+            "/F".to_owned(),
+        ],
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tree_kill_command_targets_pid_with_tree_and_force_flags() {
+        let (program, args) = tree_kill_command(4242);
+        assert_eq!(program, "taskkill");
+        assert_eq!(args, ["/PID", "4242", "/T", "/F"]);
+    }
 }

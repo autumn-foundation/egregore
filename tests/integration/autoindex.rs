@@ -20,7 +20,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use aletheia_egregore::graph_index::GraphIndex;
+use aletheia_egregore::graph_index::LazyGraphIndex;
 use assert_cmd::Command as CargoCommand;
 
 fn egregore() -> CargoCommand {
@@ -42,7 +42,7 @@ fn assert_valid_index(graph: &Path) {
         "sidecar index should exist at {}",
         idx.display()
     );
-    GraphIndex::load_for(graph).unwrap_or_else(|error| {
+    LazyGraphIndex::open(graph).unwrap_or_else(|error| {
         panic!(
             "sidecar index for {} should validate against the current graph: {error}",
             graph.display()
@@ -248,9 +248,9 @@ fn scan_history_builds_valid_sidecar_by_default() {
     // A history graph's index records the temporal signal (the loader then
     // cold-scans by design, #457) — pin that the auto-built index is a real
     // history index, not a plain one.
-    let index = GraphIndex::load_for(&graph).expect("valid index");
+    let index = LazyGraphIndex::open(&graph).expect("valid index");
     assert!(
-        index.body.has_temporal_history,
+        index.has_temporal_history(),
         "auto-built history index must set has_temporal_history"
     );
 }
@@ -352,6 +352,8 @@ fn ingest_dry_run_rebuilds_sidecar() {
     assert_valid_index(&graph);
 }
 
+// `--adapter embedded` only exists when the embedded store is compiled in.
+#[cfg(feature = "embedded-aletheiadb")]
 #[test]
 fn ingest_embedded_rebuilds_sidecar() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -403,7 +405,7 @@ fn ingest_refreshes_stale_sidecar() {
     bytes.extend_from_slice(b"\n");
     fs::write(&graph, &bytes).expect("rewrite graph");
     assert!(
-        GraphIndex::load_for(&graph).is_err(),
+        LazyGraphIndex::open(&graph).is_err(),
         "fixture sidecar should be stale before ingest"
     );
 

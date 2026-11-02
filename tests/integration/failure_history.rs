@@ -761,9 +761,29 @@ fn query_failures_via_data_dir() {
     let fx = seed();
     let temp_db = tempfile::tempdir().expect("temp dir");
     let data_dir = temp_db.path().join("store");
+    // Ingest quarantines a record whose evidence citation resolves to nothing
+    // (issue #241), so the deliberately dangling AC6 link is dropped from the
+    // copy that goes into the store; the `--graph` tests keep exercising it.
+    let ingestable = temp_db.path().join("ingestable.graph.jsonl");
+    let dangling = format!("agent_memory:v1:{}", "0".repeat(64));
+    let lines: Vec<String> = fs::read_to_string(&fx.graph)
+        .expect("read fixture graph")
+        .lines()
+        .map(|line| {
+            let mut row: serde_json::Value = serde_json::from_str(line).expect("graph line");
+            if let Some(links) = row
+                .get_mut("evidence_links")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                links.retain(|l| l["target_record_id"] != dangling.as_str());
+            }
+            row.to_string()
+        })
+        .collect();
+    fs::write(&ingestable, lines.join("\n")).expect("write ingestable graph");
     egregore()
         .arg("ingest")
-        .arg(&fx.graph)
+        .arg(&ingestable)
         .args(["--adapter", "embedded", "--data-dir"])
         .arg(&data_dir)
         .assert()
